@@ -1,0 +1,23 @@
+[project]
+name = "agent-execution"
+version = "0.1.0"
+description = "Constrained coding-agent execution and optional durable Weft transport"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+agent-execution-worker = "agent_execution.worker_cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.9",
+  "ty>=0.0.71",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_execution"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

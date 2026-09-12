@@ -1,0 +1,7 @@
+{
+  "name": "agent-execution-omp-runtime",
+  "private": true,
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.1.15"
+  }
+}
