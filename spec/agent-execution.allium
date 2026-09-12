@@ -1,0 +1,438 @@
+-- allium: 3
+-- agent-execution.allium
+--
+-- Distilled from the agent_execution package (src/agent_execution).
+--
+-- Scope: the worker execution contract — dispatch admission, harness
+-- execution, evidence, the durable worker-result record — plus worker
+-- identity and the optional durable Weft transport.
+-- Excludes: OMP SDK and ctx internals (external systems), process-group
+-- mechanics, credential and clock helpers (infrastructure).
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- Weft owns durable jobs; this system observes and consumes, never mutates.
+external entity WeftJob {
+    job_id: String
+    status: draft | queued | pending_placement | starting | running | completed | failed | cancelled
+    model_call_id: String
+    carries_result: Boolean
+}
+
+-- The authenticated principal behind an actor role.
+external entity Session {
+    active: Boolean
+}
+
+-- The provider harness (today OMP) is outside this specification.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value WorkerIdentity {
+    package_version: String
+    protocol_version: Integer
+    source_digest: String
+}
+
+value CostEstimate {
+    worst_case_usd: Decimal
+    billing_mode: subscription | token_api | zero | unknown
+    basis: String
+}
+
+value ProbeObservation {
+    provider: String
+    observed: String
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Dispatch {
+    model_call_id: String
+    provider: omp | omp_packet
+    command_executable: String
+    ceiling_usd: Decimal?
+    deadline: Duration?
+    expected_protocol: Integer?
+    expected_source_digest: String?
+    expected_prompt_digest: String?
+    installed_identity: WorkerIdentity
+    payload_name: String?
+    payload_digest: String?
+    payload_name_is_safe: Boolean
+    harness_policy: read_only_no_shell | packet_only_no_tools
+    harness_selector: String
+    harness_exit_status: Integer?
+    harness_exceeded_deadline: Boolean
+    evidence_valid: Boolean
+    estimate: CostEstimate
+    selector_on_command_line: Boolean
+    prompt_on_command_line: Boolean
+    weft_may_own: Boolean
+    executed_locally: Boolean
+    result: WorkerResult?
+
+    invariant AdmissionFactsPresent {
+        -- set by admission before any harness starts
+        payload_name != null implies payload_name_is_safe != null
+    }
+}
+
+entity WorkerResult {
+    model_call_id: String
+    provider: omp | omp_packet
+    status: completed | preflight_failed | harness_failed | evidence_failed
+    identity: WorkerIdentity
+    prompt_digest: String
+    exit_status_recorded: Integer?
+    failure_detail: String
+    provider_may_have_run: Boolean
+    provider_session: String?
+
+    is_final: status in {completed, preflight_failed, harness_failed, evidence_failed}
+}
+
+entity RetrievalOutcome {
+    model_call_id: String
+    job: WeftJob
+    -- ingested: artifact consumed exactly once; lost: proven failed with no
+    -- artifact; unresolved: the job's live state explains the absence.
+    resolution: ingested | lost | unresolved
+    detail: String
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Exact conductor/worker compatibility version; equality, not minimum.
+    protocol_version: Integer = 1
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule ProtocolExpectationChecked {
+    when: d: Dispatch.checked
+    requires: d.expected_protocol != null
+    requires: d.expected_protocol != config.protocol_version
+
+    ensures:
+        let result = WorkerResult.created(
+            model_call_id: d.model_call_id,
+            provider: d.provider,
+            status: preflight_failed,
+            identity: d.installed_identity,
+            prompt_digest: d.payload_digest,
+            exit_status_recorded: null,
+            failure_detail: "protocol mismatch with the conductor",
+            provider_may_have_run: false,
+            provider_session: null
+        )
+        d.result = result
+}
+
+rule SourceDigestExpectationChecked {
+    when: d: Dispatch.checked
+    requires: d.expected_source_digest != null
+    requires: d.expected_source_digest != d.installed_identity.source_digest
+
+    ensures:
+        let result = WorkerResult.created(
+            model_call_id: d.model_call_id,
+            provider: d.provider,
+            status: preflight_failed,
+            identity: d.installed_identity,
+            prompt_digest: d.payload_digest,
+            exit_status_recorded: null,
+            failure_detail: "worker source mismatch against the conductor",
+            provider_may_have_run: false,
+            provider_session: null
+        )
+        d.result = result
+}
+
+rule PromptPayloadIngested {
+    when: d: Dispatch.checked
+    requires: d.payload_name != null
+    requires: d.payload_name_is_safe
+    requires: d.payload_digest = d.expected_prompt_digest
+
+    -- The prompt reaches the harness on stdin, never as command text.
+    ensures: d.prompt_on_command_line = false
+}
+
+rule ProviderAdmitted {
+    when: d: Dispatch.checked
+    requires: d.provider in {omp, omp_packet}
+    requires: d.command_executable = executable_for(d.provider)
+    requires:
+        (d.provider = omp and d.harness_policy = read_only_no_shell) or
+        (d.provider = omp_packet and d.harness_policy = packet_only_no_tools)
+
+    @guidance
+        -- The tool policy the harness is validated under is fixed per
+        -- provider variant; a disagreement is a preflight refusal.
+}
+
+rule CostCapRefused {
+    when: d: Dispatch.checked
+    requires: d.ceiling_usd != null
+    requires: d.estimate.worst_case_usd > d.ceiling_usd
+
+    ensures:
+        let result = WorkerResult.created(
+            model_call_id: d.model_call_id,
+            provider: d.provider,
+            status: preflight_failed,
+            identity: d.installed_identity,
+            prompt_digest: d.payload_digest,
+            exit_status_recorded: null,
+            failure_detail: "incremental cost exceeds the hard ceiling",
+            provider_may_have_run: false,
+            provider_session: null
+        )
+        d.result = result
+}
+
+rule HarnessDeadlineExceeded {
+    when: d: Dispatch.checked
+    requires: d.harness_exceeded_deadline
+
+    ensures:
+        let result = WorkerResult.created(
+            model_call_id: d.model_call_id,
+            provider: d.provider,
+            status: harness_failed,
+            identity: d.installed_identity,
+            prompt_digest: d.payload_digest,
+            exit_status_recorded: 124,
+            failure_detail: "harness timeout; output captured before the deadline is kept",
+            provider_may_have_run: true,
+            provider_session: null
+        )
+        d.result = result
+}
+
+rule HarnessFailureAttributed {
+    when: d: Dispatch.checked
+    requires: d.harness_exit_status != null
+    requires: d.harness_exit_status > 0
+    requires: d.result = null
+
+    ensures:
+        let result = WorkerResult.created(
+            model_call_id: d.model_call_id,
+            provider: d.provider,
+            status: harness_failed,
+            identity: d.installed_identity,
+            prompt_digest: d.payload_digest,
+            exit_status_recorded: d.harness_exit_status,
+            failure_detail: "the provider's own structured failure statement",
+            provider_may_have_run: true,
+            provider_session: null
+        )
+        d.result = result
+}
+
+rule EvidenceValidated {
+    when: d: Dispatch.checked
+    requires: d.harness_exit_status = 0
+    requires: d.result = null
+    requires: d.evidence_valid
+
+    ensures:
+        let result = WorkerResult.created(
+            model_call_id: d.model_call_id,
+            provider: d.provider,
+            status: completed,
+            identity: d.installed_identity,
+            prompt_digest: d.payload_digest,
+            exit_status_recorded: 0,
+            failure_detail: "",
+            provider_may_have_run: true,
+            provider_session: null
+        )
+        d.result = result
+}
+
+rule EvidenceRefused {
+    when: d: Dispatch.checked
+    requires: d.harness_exit_status = 0
+    requires: d.result = null
+    requires: d.evidence_valid = false
+
+    ensures:
+        let result = WorkerResult.created(
+            model_call_id: d.model_call_id,
+            provider: d.provider,
+            status: evidence_failed,
+            identity: d.installed_identity,
+            prompt_digest: d.payload_digest,
+            exit_status_recorded: 0,
+            failure_detail: "evidence missing or failing validation",
+            provider_may_have_run: true,
+            provider_session: null
+        )
+        d.result = result
+}
+
+rule ResultRecordedDurably {
+    when: r: WorkerResult.is_final
+
+    ensures: ResultPersisted(result: r)
+}
+
+rule SubmittedToWeftAtomically {
+    when: WeftReceiptAccepted(d)
+
+    ensures:
+        d.weft_may_own = true
+        d.executed_locally = false
+}
+
+rule LocalFallbackRefusedWhileWeftMayOwnJob {
+    when: WeftSubmissionTimedOut(d)
+
+    ensures:
+        d.weft_may_own = true
+        d.executed_locally = false
+}
+rule SurvivingJobDetached {
+    when: WeftSubmissionTimedOut(d)
+
+    ensures:
+        d.weft_may_own = true
+        d.executed_locally = false
+
+    @guidance
+        -- A durable job outliving its waiter is recorded as detached, never
+        -- failed; the job stays retrievable by its model call identity.
+}
+
+rule DurableResultRetrieved {
+    when: RetrievalRequested(model_call_id)
+    for job in WeftJobs where job.model_call_id = model_call_id:
+        ensures:
+            if job.carries_result:
+                RetrievalOutcome.created(
+                    model_call_id: model_call_id,
+                    job: job,
+                    resolution: ingested,
+                    detail: ""
+                )
+            else:
+                if job.status = failed:
+                    RetrievalOutcome.created(
+                        model_call_id: model_call_id,
+                        job: job,
+                        resolution: lost,
+                        detail: "proven failed with no result artifact"
+                    )
+                else:
+                    RetrievalOutcome.created(
+                        model_call_id: model_call_id,
+                        job: job,
+                        resolution: unresolved,
+                        detail: "job is still live"
+                    )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant EveryDispatchRecorded {
+    for d in Dispatches:
+        d.result != null implies d.result.is_final
+}
+
+invariant IdentityIsAttached {
+    for r in WorkerResults:
+        r.identity != null and r.prompt_digest != null
+}
+
+invariant ProviderRunHonesty {
+    -- provider_may_have_run is false only where nothing could have started.
+    for r in WorkerResults:
+        r.provider_may_have_run = false implies r.status = preflight_failed
+}
+
+invariant NoDoubleExecution {
+    for d in Dispatches:
+        d.weft_may_own implies not d.executed_locally
+}
+
+invariant PromptNeverCommandText {
+    for d in Dispatches:
+        d.prompt_on_command_line = false
+}
+
+invariant SelectorNeverTransportScannable {
+    for d in Dispatches:
+        d.selector_on_command_line = false
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor Conductor {
+    identified_by: Session where active
+}
+
+actor Operator {
+    identified_by: Session where active
+}
+
+actor WeftCoordinator {
+    identified_by: Session where active
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+
+surface WorkerCommand {
+    facing caller: Conductor
+    facing operator: Operator
+
+    provides:
+        IdentityReported()
+        DependenciesProbed(provider)
+        DispatchExecuted(dispatch)
+        OmpRuntimeProvisioned()
+
+    @guarantee DatabaseIncapability
+        -- The worker command surface reads no review state and holds no
+        -- conductor database access.
+}
+
+surface WeftTransport {
+    facing coordinator: WeftCoordinator
+
+    contracts:
+        fulfils DurableExecution
+
+    @guarantee AdmissionIsAtomic
+        -- Submission yields exactly one accepted receipt for this model
+        -- call, or provably no job, never an unknown plurality.
+}
+
+contract DurableExecution {
+    run: (dispatch) -> WorkerResult
+    retrieve: (model_call_id) -> WorkerResult | RetrievalOutcome
+
+    @invariant RetrieveIsIdempotent
+        -- Retrieval may repeat without duplicating the result beyond its
+        -- single recorded ingestion.
+}
