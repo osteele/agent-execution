@@ -72,6 +72,8 @@ entity Dispatch {
     harness_exceeded_deadline: Boolean
     evidence_valid: Boolean
     estimate: CostEstimate
+    -- True when the selector uses a flag that transport input inference scans.
+    -- A worker-owned selector flag may carry the value without staging a dataset.
     selector_on_command_line: Boolean
     prompt_on_command_line: Boolean
     weft_may_own: Boolean
@@ -424,8 +426,8 @@ surface WeftTransport {
         fulfils DurableExecution
 
     @guarantee AdmissionIsAtomic
-        -- Submission yields exactly one accepted receipt for this model
-        -- call, or provably no job, never an unknown plurality.
+        -- Only a validated rejection permits retry or local fallback.
+        -- Accepted and unknown submission outcomes both prohibit local execution.
 }
 
 contract DurableExecution {

@@ -96,7 +96,11 @@ class WeftRunReceipt:
         if raw.get("api_version") != WEFT_RECEIPT_VERSION:
             raise ValueError(f"unsupported Weft submission receipt: {raw.get('api_version')!r}")
         decision = raw.get("placement_decision")
-        if decision not in {"accepted_immediately", "deduplicated", "not_accepted"}:
+        if not isinstance(decision, str) or decision not in {
+            "accepted_immediately",
+            "deduplicated",
+            "not_accepted",
+        }:
             raise ValueError(f"invalid Weft placement decision: {decision!r}")
         accepted = raw.get("accepted_immediately")
         if not isinstance(accepted, bool):
@@ -174,6 +178,51 @@ class WeftRetrievalOutcome:
     job_status: str | None = None
 
 
+def _dispatched_options(record: dict[str, object]) -> dict[str, str]:
+    """Parse the single worker argv emitted by _remote_command."""
+    command = record.get("command")
+    if not isinstance(command, str):
+        raise ValueError("accepted command is missing")
+    # Reject shell composition instead of attributing another invocation's flags.
+    if any(part in command for part in ("\n", "\r", "$", "`")):
+        raise ValueError("accepted command contains shell composition")
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    argv = list(lexer)
+    if any(
+        token.startswith("#") or (token and all(char in "();<>|&" for char in token))
+        for token in argv
+    ):
+        raise ValueError("accepted command contains shell composition")
+    if argv[:2] != ["agent-execution-worker", "execute"] or "--" not in argv:
+        raise ValueError("accepted command is not a worker execution")
+    worker_args = argv[2 : argv.index("--")]
+    # Only flag/value pairs are emitted; values cannot impersonate worker flags.
+    allowed_flags = {
+        "--provider",
+        "--model-call-id",
+        "--harness-model",
+        "--max-cost-usd",
+        "--expect-protocol",
+        "--expect-source-sha256",
+        "--prompt-payload",
+        "--expect-prompt-sha256",
+        "--evidence-out",
+        "--timeout",
+        "--ctx-timeout",
+    }
+    if len(worker_args) % 2:
+        raise ValueError("accepted command has ambiguous worker arguments")
+    options: dict[str, str] = {}
+    for index in range(0, len(worker_args), 2):
+        flag, value = worker_args[index : index + 2]
+        if flag not in allowed_flags or flag in options or not value or value.startswith("--"):
+            raise ValueError("accepted command has ambiguous worker arguments")
+        options[flag] = value
+    return options
+
+
 def submitted_job_from_listing(raw: str, *, model_call_id: str) -> str | None:
     """Return the one Weft job whose recorded dispatch names this model call."""
     try:
@@ -182,7 +231,13 @@ def submitted_job_from_listing(raw: str, *, model_call_id: str) -> str | None:
         return None
     if isinstance(parsed, dict):
         envelope = cast(dict[str, object], parsed)
-        if envelope.get("kind") != "job_list" or envelope.get("version") != WEFT_JOB_LIST_VERSION:
+        version = envelope.get("version")
+        if (
+            envelope.get("kind") != "job_list"
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version != WEFT_JOB_LIST_VERSION
+        ):
             return None
         rows = envelope.get("jobs")
     else:
@@ -190,15 +245,17 @@ def submitted_job_from_listing(raw: str, *, model_call_id: str) -> str | None:
         rows = parsed
     if not isinstance(rows, list):
         return None
-    identifier = re.compile(rf"(?<![A-Za-z0-9]){re.escape(model_call_id)}(?![A-Za-z0-9])")
     matches: set[str] = set()
     for row in rows:
         if not isinstance(row, dict):
             continue
         entry = cast(dict[str, object], row)
-        haystack = f"{entry.get('description', '')} {entry.get('command', '')}"
+        try:
+            options = _dispatched_options(entry)
+        except ValueError:
+            continue
         job_id = entry.get("job_id")
-        if isinstance(job_id, str) and job_id and identifier.search(haystack):
+        if isinstance(job_id, str) and job_id and options.get("--model-call-id") == model_call_id:
             matches.add(job_id)
     return next(iter(matches)) if len(matches) == 1 else None
 
@@ -970,51 +1027,7 @@ class WeftCommandRunner:
 
     def _dispatched_source(self, record: dict[str, object]) -> str:
         """Recover a legacy pin from the accepted command, never the worker artifact."""
-        command = record.get("command")
-        if not isinstance(command, str):
-            raise ValueError("accepted command is missing")
-        # This is the single argv emitted by _remote_command, not arbitrary shell.
-        # Refuse shell composition rather than mistaking an argument in a different
-        # invocation for the worker's dispatch identity.
-        if any(part in command for part in ("\n", "\r", "$", "`")):
-            raise ValueError("accepted command contains shell composition")
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        argv = list(lexer)
-        if any(
-            token.startswith("#") or (token and all(char in "();<>|&" for char in token))
-            for token in argv
-        ):
-            raise ValueError("accepted command contains shell composition")
-        if argv[:2] != ["agent-execution-worker", "execute"] or "--" not in argv:
-            raise ValueError("accepted command is not a worker execution")
-        worker_args = argv[2 : argv.index("--")]
-
-        # _remote_command emits only these flag/value pairs. Do not search an
-        # arbitrary argv for identity-looking text that might be another option's
-        # value or a positional argument rather than an actual worker flag.
-        allowed_flags = {
-            "--provider",
-            "--model-call-id",
-            "--harness-model",
-            "--max-cost-usd",
-            "--expect-protocol",
-            "--expect-source-sha256",
-            "--prompt-payload",
-            "--expect-prompt-sha256",
-            "--evidence-out",
-            "--timeout",
-            "--ctx-timeout",
-        }
-        if len(worker_args) % 2:
-            raise ValueError("accepted command has ambiguous worker arguments")
-        options: dict[str, str] = {}
-        for index in range(0, len(worker_args), 2):
-            flag, value = worker_args[index : index + 2]
-            if flag not in allowed_flags or flag in options or not value or value.startswith("--"):
-                raise ValueError("accepted command has ambiguous worker arguments")
-            options[flag] = value
+        options = _dispatched_options(record)
 
         def one_value(flag: str) -> str:
             if flag not in options:
@@ -1280,10 +1293,8 @@ class WeftCommandRunner:
     def _probe_submitted_job(self, cwd: Path, deadline: float) -> str | None:
         """The job this assignment created, when its submission receipt would not parse.
 
-        The assignment id is the idempotency key and Weft records it verbatim in the
-        job description, so an unreadable receipt does not have to end the question.
-        Consulting it is what separates a fact about our reading from a fact about the
-        job (decision 0050), and the observation is one command away.
+        The exact worker flag identifies the dispatch. Descriptions and substring
+        matches are discovery hints, not proof that a job belongs to this call.
 
         Only presence answers. Exactly one match identifies the job; zero does not
         prove none was created, because a job may not be indexed the instant it is
@@ -1369,15 +1380,15 @@ class WeftCommandRunner:
         failure, not renewed ambiguity about whether the job exists.
         """
         self.last_execution = execution
-        wait_seconds = max(1, int(self._remaining(deadline)))
-        self._progress(
-            "waiting",
-            transport="weft",
-            host=execution["host"],
-            job_id=job_id,
-            wait_seconds=wait_seconds,
-        )
         try:
+            wait_seconds = max(1, int(self._remaining(deadline)))
+            self._progress(
+                "waiting",
+                transport="weft",
+                host=execution["host"],
+                job_id=job_id,
+                wait_seconds=wait_seconds,
+            )
             status = self._call(
                 [
                     self.executable,
@@ -1664,10 +1675,6 @@ class WeftCommandRunner:
 
         if receipt is None or submission is None:
             raise RuntimeError("Weft admission ended without a receipt")
-        if submission.exit_status != 0:
-            raise WeftExecutionAmbiguous(
-                f"Weft returned {submission.exit_status} after assigning {receipt.job_id}"
-            )
 
         admission = cast(
             dict[str, object],
@@ -1684,6 +1691,14 @@ class WeftCommandRunner:
         )
         execution = self._execution(receipt, transport="weft", admission=admission)
         self._attach_placement_diagnostic(execution, placement)
+        if submission.exit_status != 0:
+            existing = execution.get("diagnostics")
+            execution["diagnostics"] = {
+                **(existing if isinstance(existing, dict) else {}),
+                "submission_exit_status": submission.exit_status,
+                "submission_stdout": _tail(submission.stdout),
+                "submission_stderr": _tail(submission.stderr),
+            }
         self._processing(execution, state="pending", step="terminal_status")
         self.last_execution = execution
         self._progress(

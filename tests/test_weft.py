@@ -1,0 +1,454 @@
+"""Weft admission contracts using synthetic responses at the external CLI boundary."""
+
+from __future__ import annotations
+
+import hashlib
+import itertools
+import json
+import os
+import random
+import shlex
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from agent_execution.command import CommandResult
+from agent_execution.omp_execution import omp_transcript
+from agent_execution.weft import (
+    WeftAdmissionCancelled,
+    WeftCommandRunner,
+    WeftExecutionAmbiguous,
+    WeftExecutionDetached,
+    WeftPlacementRefused,
+    WeftRunReceipt,
+    submitted_job_from_listing,
+)
+from agent_execution.worker import WORKER_PROTOCOL_VERSION, HarnessOutcome, WorkerResult
+from tests.support.omp import omp_command, omp_output
+
+KEY = "model-call-7"
+SOURCE = "a" * 64
+
+
+def receipt(decision: str = "accepted_immediately", **changes: object) -> str:
+    value = {
+        "api_version": "weft.run.receipt.v1",
+        "job_id": "" if decision == "not_accepted" else "wj42",
+        "placement_decision": decision,
+        "selected_host": "studio",
+        "source_pin": "" if decision == "not_accepted" else "pin-42",
+        "accepted_immediately": decision == "accepted_immediately",
+        "deduplicated": decision == "deduplicated",
+        "idempotency_key": KEY,
+    }
+    return json.dumps({**value, **changes})
+
+
+def listing(*rows: dict[str, object], version: object = 1) -> str:
+    return json.dumps({"kind": "job_list", "version": version, "jobs": rows})
+
+
+def dispatch_command(key: str = KEY) -> str:
+    return shlex.join(
+        [
+            "agent-execution-worker",
+            "execute",
+            "--provider",
+            "omp",
+            "--model-call-id",
+            key,
+            "--expect-source-sha256",
+            SOURCE,
+            "--",
+            "omp",
+            "-p",
+            "-",
+        ]
+    )
+
+
+def worker_artifact(prompt: str = "review", *, packet: bool = False) -> str:
+    stdout = omp_output(
+        cwd="/remote/project",
+        prompt=prompt,
+        final="remote answer",
+        policy="packet-only-no-tools" if packet else "read-only-no-shell",
+    )
+    return WorkerResult(
+        model_call_id=KEY,
+        provider="omp-packet" if packet else "omp",
+        status="completed",
+        worker_version="0.1.0",
+        worker_protocol_version=WORKER_PROTOCOL_VERSION,
+        worker_source_sha256=SOURCE,
+        prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+        ctx_version="",
+        worker_cwd="/remote/project",
+        started_at=10,
+        completed_at=12,
+        model_call_started=True,
+        session_id="" if packet else "session-1",
+        harness=HarnessOutcome(0, stdout, ""),
+        omp_evidence=None if packet else omp_transcript(stdout),
+    ).to_json()
+
+
+class AdmissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.now = 0.0
+        self.submit_elapsed = 0.0
+        self.submissions: list[CommandResult | subprocess.TimeoutExpired] = []
+        self.calls: list[tuple[list[str], Path, float | None]] = []
+        self.payloads: list[str] = []
+        self.local_calls: list[list[str]] = []
+        self.cancel = False
+        self.hosts = CommandResult(
+            0,
+            json.dumps(
+                {
+                    "kind": "host_list",
+                    "version": 1,
+                    "hosts": [
+                        {
+                            "name": "studio",
+                            "capabilities": ["agent:omp", "tool:agent-execution"],
+                        }
+                    ],
+                }
+            ),
+            "",
+        )
+        self.jobs = listing()
+        self.status: CommandResult | subprocess.TimeoutExpired = CommandResult(0, "completed", "")
+        self.artifact = CommandResult(0, worker_artifact(), "")
+        self.runner = WeftCommandRunner(
+            host="studio",
+            agent="omp",
+            model_call_id=KEY,
+            fallback=self.fallback,
+            invoke=self.invoke,
+            clock=lambda: self.now,
+            sleep=self.sleep,
+            admission_wait=self.wait,
+            expected_source_sha256=SOURCE,
+        )
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def wait(self, seconds: float) -> bool:
+        self.sleep(seconds)
+        return self.cancel
+
+    def fallback(self, command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
+        self.local_calls.append(command)
+        return CommandResult(0, "local answer", "")
+
+    def invoke(self, command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
+        self.calls.append((command, cwd, timeout))
+        if command[1] == "host":
+            return self.hosts
+        if command[1] == "run":
+            payload = command[command.index("--payload") + 1].split("=", 1)[1]
+            self.payloads.append(Path(payload).read_text(encoding="utf-8"))
+            self.now += self.submit_elapsed
+            outcome = self.submissions.pop(0)
+            if isinstance(outcome, subprocess.TimeoutExpired):
+                raise outcome
+            return outcome
+        if command[1:3] == ["list", "jobs"]:
+            return CommandResult(0, self.jobs, "")
+        if command[1] == "status":
+            if isinstance(self.status, subprocess.TimeoutExpired):
+                raise self.status
+            return self.status
+        if command[1] == "artifact":
+            self.assertFalse(cwd.resolve().is_relative_to(self.root.resolve()))
+            return self.artifact
+        if command[1] == "log":
+            return CommandResult(0, "", "")
+        raise AssertionError(command)
+
+    def run_dispatch(
+        self,
+        *,
+        timeout: float | None = 30.0,
+        prompt: str = "review",
+        packet: bool = False,
+    ) -> CommandResult:
+        return self.runner(
+            omp_command(str(self.root), prompt=prompt, packet=packet),
+            self.root,
+            timeout,
+        )
+
+    def assert_remote(self, result: CommandResult) -> None:
+        self.assertEqual(result.exit_status, 0, result.stderr)
+        self.assertIn("remote answer", result.stdout)
+        self.assertEqual(self.local_calls, [])
+        self.assertIsNotNone(result.execution)
+        assert result.execution is not None
+        self.assertEqual(result.execution["job_id"], "wj42")
+
+    def test_accepted_receipt_survives_nonzero_submit_exit(self) -> None:
+        self.submissions = [CommandResult(-15, receipt(), "reader interrupted")]
+        self.assert_remote(self.run_dispatch())
+
+    def test_receipt_at_deadline_recovers_with_fresh_artifact_budget(self) -> None:
+        self.submit_elapsed = 30.0
+        self.submissions = [CommandResult(0, receipt(), "")]
+        self.assert_remote(self.run_dispatch())
+        self.assertFalse(any(command[1] == "status" for command, _, _ in self.calls))
+        artifact_budgets = [budget for command, _, budget in self.calls if command[1] == "artifact"]
+        self.assertEqual(artifact_budgets, [30.0])
+
+    def test_receipt_at_deadline_without_artifact_detaches(self) -> None:
+        self.submit_elapsed = 30.0
+        self.submissions = [CommandResult(0, receipt(), "")]
+        self.artifact = CommandResult(1, "", "not available")
+        with self.assertRaises(WeftExecutionDetached):
+            self.run_dispatch()
+        assert self.runner.last_execution is not None
+        self.assertEqual(self.runner.last_execution["job_id"], "wj42")
+        self.assertEqual(self.local_calls, [])
+
+    def test_malformed_receipt_types_still_probe_and_recover(self) -> None:
+        self.submissions = [CommandResult(0, receipt(placement_decision=[]), "")]
+        self.jobs = listing({"job_id": "wj42", "command": dispatch_command()})
+        self.assert_remote(self.run_dispatch())
+
+    def test_submission_timeout_preserves_exact_job_and_never_retries(self) -> None:
+        self.submissions = [subprocess.TimeoutExpired(["weft", "run"], 30)]
+        self.jobs = listing({"job_id": "wj42", "command": dispatch_command()})
+        with self.assertRaises(WeftExecutionDetached):
+            self.run_dispatch()
+        assert self.runner.last_execution is not None
+        self.assertEqual(self.runner.last_execution["job_id"], "wj42")
+        self.assertEqual(len(self.payloads), 1)
+        self.assertEqual(self.local_calls, [])
+
+    def test_description_mention_cannot_establish_dispatch_ownership(self) -> None:
+        self.submissions = [CommandResult(1, "not json", "")]
+        self.jobs = listing(
+            {
+                "job_id": "wj-other",
+                "description": f"investigate {KEY}",
+                "command": "echo report",
+            }
+        )
+        with self.assertRaises(WeftExecutionAmbiguous):
+            self.run_dispatch()
+        self.assertFalse(any(command[1] == "status" for command, _, _ in self.calls))
+        self.assertEqual(self.local_calls, [])
+
+    def test_rejection_retry_is_cancelled_before_next_submission(self) -> None:
+        self.submissions = [CommandResult(1, receipt("not_accepted"), "offline")]
+        self.cancel = True
+        with self.assertRaises(WeftAdmissionCancelled):
+            self.run_dispatch()
+        self.assertEqual(len(self.payloads), 1)
+        self.assertEqual(self.local_calls, [])
+
+    def test_admission_sequences_obey_no_double_execution(self) -> None:
+        # Exhaust the bounded event model. R retries; A owns remotely; U is unknown.
+        # The oracle is the first non-rejection, independently of production state.
+        counts = {"local": 0, "remote": 0, "unknown": 0}
+        for events in itertools.product("RAU", repeat=3):
+            with self.subTest(events=events):
+                self.calls.clear()
+                self.local_calls.clear()
+                self.payloads.clear()
+                self.now = 0
+                self.submissions = [
+                    CommandResult(
+                        0,
+                        {
+                            "R": receipt("not_accepted"),
+                            "A": receipt(),
+                            "U": "not json",
+                        }[event],
+                        "",
+                    )
+                    for event in events
+                ]
+                first = next((i for i, event in enumerate(events) if event != "R"), 3)
+                expected = (
+                    "local" if first == 3 else "remote" if events[first] == "A" else "unknown"
+                )
+                counts[expected] += 1
+                if expected == "unknown":
+                    with self.assertRaises(WeftExecutionAmbiguous):
+                        self.run_dispatch()
+                else:
+                    result = self.run_dispatch()
+                    if expected == "remote":
+                        self.assert_remote(result)
+                    else:
+                        self.assertEqual(result.stdout, "local answer")
+                self.assertEqual(len(self.local_calls), int(expected == "local"))
+                self.assertEqual(len(self.payloads), min(first + 1, 3))
+                keys = {
+                    command[command.index("--idempotency-key") + 1]
+                    for command, _, _ in self.calls
+                    if command[1] == "run"
+                }
+                self.assertEqual(keys, {KEY})
+        self.assertEqual(counts, {"local": 1, "remote": 13, "unknown": 13})
+
+    def test_deduplication_and_unbounded_harness_keep_remote_ownership(self) -> None:
+        self.submissions = [CommandResult(0, receipt("deduplicated"), "")]
+        self.assert_remote(self.run_dispatch(timeout=None))
+        self.assertTrue(
+            all(timeout is not None and 0 < timeout <= 900 for _, _, timeout in self.calls)
+        )
+
+    def test_known_placement_and_deployment_refusals_do_not_dispatch(self) -> None:
+        self.hosts = CommandResult(
+            0, json.dumps({"kind": "host_list", "version": 1, "hosts": []}), ""
+        )
+        with self.assertRaises(WeftPlacementRefused):
+            self.run_dispatch()
+        self.assertEqual(self.local_calls, [])
+        self.assertEqual(self.payloads, [])
+        self.hosts = CommandResult(1, "", "inventory unavailable")
+        self.runner.readiness = lambda host: ("mismatch", "protocol differs")
+        with self.assertRaises(WeftPlacementRefused):
+            self.run_dispatch()
+        self.assertEqual(self.payloads, [])
+
+    def test_unknown_placement_proceeds_to_atomic_admission(self) -> None:
+        self.hosts = CommandResult(1, "", "inventory unavailable")
+        self.submissions = [CommandResult(0, receipt(), "")]
+        self.assert_remote(self.run_dispatch())
+
+    def test_broken_watcher_recovers_or_detaches_without_fallback(self) -> None:
+        self.submissions = [CommandResult(0, receipt(), "")]
+        self.status = CommandResult(-15, "", "reader interrupted")
+        self.assert_remote(self.run_dispatch())
+        self.submissions = [CommandResult(0, receipt(), "")]
+        self.status = subprocess.TimeoutExpired(["weft", "status"], 30)
+        self.artifact = CommandResult(1, "", "not available")
+        with self.assertRaises(WeftExecutionDetached):
+            self.run_dispatch()
+        self.assertEqual(self.local_calls, [])
+
+    def test_packet_prompt_is_payload_only_and_model_flag_is_lifted(self) -> None:
+        prompt = "private 'brief'\n模型 --model another/model $(false)"
+        self.runner.agent = "omp-packet"
+        self.submissions = [CommandResult(0, receipt(), "")]
+        self.artifact = CommandResult(0, worker_artifact(prompt, packet=True), "")
+        self.assert_remote(self.run_dispatch(prompt=prompt, packet=True))
+        self.assertEqual(self.payloads, [prompt])
+        submitted = next(command for command, _, _ in self.calls if command[1] == "run")
+        self.assertNotIn(prompt, " ".join(submitted))
+        worker = shlex.split(submitted[-1])
+        self.assertNotIn("--model", worker)
+        self.assertIn("--harness-model", worker)
+        self.assertEqual(
+            worker[worker.index("--expect-prompt-sha256") + 1],
+            hashlib.sha256(prompt.encode()).hexdigest(),
+        )
+
+
+class ReceiptTests(unittest.TestCase):
+    def test_supported_decisions_round_trip(self) -> None:
+        for decision in ("accepted_immediately", "deduplicated", "not_accepted"):
+            parsed = WeftRunReceipt.parse(receipt(decision), idempotency_key=KEY)
+            self.assertEqual(
+                WeftRunReceipt.parse(json.dumps(parsed.to_dict()), idempotency_key=KEY),
+                parsed,
+            )
+
+    def test_malformed_receipts_raise_value_error(self) -> None:
+        invalid = [
+            receipt(placement_decision=[]),
+            receipt(placement_decision={}),
+            receipt(idempotency_key="another-call"),
+            receipt(accepted_immediately=1),
+            receipt(job_id=""),
+            receipt(source_pin=""),
+            receipt("not_accepted", job_id="wj42"),
+            receipt("not_accepted", deduplicated=True),
+            receipt("deduplicated", deduplicated=False),
+            receipt(deduplicated="false"),
+        ]
+        for raw in invalid:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                WeftRunReceipt.parse(raw, idempotency_key=KEY)
+
+    def test_generated_invalid_decisions_are_total(self) -> None:
+        seeds = (
+            [int(os.environ["WEFT_FUZZ_SEED"])] if "WEFT_FUZZ_SEED" in os.environ else range(100)
+        )
+        shapes: set[str] = set()
+        for seed in seeds:
+            rng = random.Random(seed)
+            for decision in (
+                None,
+                rng.randint(-100, 100),
+                rng.random(),
+                bool(seed % 2),
+                [rng.randint(0, 10)],
+                {"value": rng.randrange(10)},
+                f"unknown-{seed}",
+            ):
+                shapes.add(type(decision).__name__)
+                with (
+                    self.subTest(seed=seed, decision=decision),
+                    self.assertRaises(ValueError),
+                ):
+                    WeftRunReceipt.parse(receipt(placement_decision=decision), idempotency_key=KEY)
+        self.assertEqual(shapes, {"NoneType", "int", "float", "bool", "list", "dict", "str"})
+
+
+class JobAttributionTests(unittest.TestCase):
+    def test_exact_unique_worker_identity_is_required(self) -> None:
+        correct: dict[str, object] = {"job_id": "wj42", "command": dispatch_command()}
+        self.assertEqual(submitted_job_from_listing(listing(correct), model_call_id=KEY), "wj42")
+        self.assertEqual(
+            submitted_job_from_listing(listing(correct, correct), model_call_id=KEY),
+            "wj42",
+        )
+        invalid_commands = [
+            dispatch_command(KEY + "-retry"),
+            dispatch_command(KEY + "_other"),
+            dispatch_command(KEY + "0"),
+            "echo " + KEY,
+            dispatch_command("other") + " --model-call-id " + KEY,
+            dispatch_command().replace("--provider omp", "--provider omp --model-call-id other"),
+            dispatch_command() + "; echo side-effect",
+            "'unterminated",
+        ]
+        for command in invalid_commands:
+            with self.subTest(command=command):
+                self.assertIsNone(
+                    submitted_job_from_listing(
+                        listing(
+                            {
+                                "job_id": "wj-other",
+                                "command": command,
+                                "description": f"mentions {KEY}",
+                            }
+                        ),
+                        model_call_id=KEY,
+                    )
+                )
+        self.assertIsNone(
+            submitted_job_from_listing(
+                listing(
+                    correct,
+                    {
+                        "job_id": "wj43",
+                        "command": dispatch_command(),
+                    },
+                ),
+                model_call_id=KEY,
+            )
+        )
+        self.assertIsNone(
+            submitted_job_from_listing(listing(correct, version=True), model_call_id=KEY)
+        )
