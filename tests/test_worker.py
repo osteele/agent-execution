@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import stat
@@ -13,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from agent_execution.command import CommandResult
+from agent_execution.identity import worker_evidence_path
 from agent_execution.worker import (
     WORKER_PROTOCOL_VERSION,
     WorkerEvidence,
@@ -20,6 +22,7 @@ from agent_execution.worker import (
     codex_session_id,
     execute_worker,
 )
+from agent_execution.worker_cli import main
 from tests.support.omp import omp_command, omp_output
 
 
@@ -70,38 +73,89 @@ class WorkerResultTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.output = Path("outputs/agent-execution-worker-result.json")
+        self.output = Path(worker_evidence_path("model-call-7"))
         self.calls: list[list[str]] = []
 
     def which(self, executable: str) -> str | None:
         return {"ctx": "/tools/ctx", "codex": "/tools/codex"}.get(executable)
 
-    def write_preflight_result(
-        self, *, model_call_id: str = "result-write", output: Path | None = None
-    ) -> WorkerResult:
+    def write_preflight_result(self, *, model_call_id: str = "model-call-7") -> WorkerResult:
         return execute_worker(
             provider="unsupported",
             model_call_id=model_call_id,
             command=["unsupported"],
-            output=self.output if output is None else output,
             timeout=30.0,
             ctx_timeout=10.0,
             cwd=self.root,
         )
 
-    def test_result_output_must_be_strictly_inside_worker_root(self) -> None:
-        with self.assertRaisesRegex(
-            ValueError, "worker evidence output must stay inside its working directory"
-        ):
-            self.write_preflight_result(output=Path("."))
+    def test_result_identity_cannot_escape_protected_namespace(self) -> None:
+        for identity in ("", "..", "../other", "/tmp/result", "a/b", "a.b", "Foo", "x" * 129):
+            with self.subTest(identity=identity), self.assertRaises(ValueError):
+                self.write_preflight_result(model_call_id=identity)
+        self.assertFalse((self.root / ".agent-execution").exists())
 
-        outside = self.root.parent / f"{self.root.name}-outside.json"
-        self.addCleanup(outside.unlink, missing_ok=True)
-        with self.assertRaisesRegex(
-            ValueError, "worker evidence output must stay inside its working directory"
+    def test_cli_rejects_caller_selected_evidence_path(self) -> None:
+        with mock.patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit) as error:
+            main(
+                [
+                    "execute",
+                    "--provider",
+                    "unsupported",
+                    "--model-call-id",
+                    "cli-call",
+                    "--evidence-out",
+                    "outputs/other.json",
+                    "--",
+                    "unsupported",
+                ]
+            )
+        self.assertEqual(error.exception.code, 2)
+        self.assertFalse((self.root / "outputs").exists())
+
+    def test_cli_publishes_only_deterministic_evidence(self) -> None:
+        stdout = io.StringIO()
+        with (
+            mock.patch("agent_execution.worker.Path.cwd", return_value=self.root),
+            mock.patch("sys.stdout", new=stdout),
+            mock.patch("sys.stderr", new=io.StringIO()),
         ):
-            self.write_preflight_result(output=outside)
-        self.assertFalse(outside.exists())
+            status = main(
+                [
+                    "execute",
+                    "--provider",
+                    "unsupported",
+                    "--model-call-id",
+                    "cli-call",
+                    "--expect-protocol",
+                    "2",
+                    "--",
+                    "unsupported",
+                ]
+            )
+        self.assertEqual(status, 0)
+        path = ".agent-execution/results/cli-call.json"
+        summary = json.loads(stdout.getvalue())
+        self.assertEqual(summary["artifact_path"], path)
+        result = WorkerResult.parse((self.root / path).read_text())
+        self.assertEqual(result.model_call_id, "cli-call")
+        self.assertEqual(result.worker_protocol_version, 2)
+        self.assertFalse((self.root / "outputs").exists())
+
+    def test_symlink_cannot_redirect_evidence_into_writable_files(self) -> None:
+        outputs = self.root / "outputs"
+        outputs.mkdir()
+        (self.root / ".agent-execution").symlink_to(outputs, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.write_preflight_result()
+        self.assertEqual(list(outputs.iterdir()), [])
+
+    def test_results_for_distinct_calls_remain_independent(self) -> None:
+        first = self.write_preflight_result(model_call_id="first")
+        second = self.write_preflight_result(model_call_id="second")
+        for result in (first, second):
+            path = self.root / worker_evidence_path(result.model_call_id)
+            self.assertEqual(WorkerResult.parse(path.read_text()), result)
 
     def test_result_publication_syncs_file_and_directory_chain(self) -> None:
         events: list[str] = []
@@ -132,12 +186,12 @@ class WorkerResultTests(unittest.TestCase):
 
         destination = self.root / self.output
         self.assertEqual(staging_directories, [destination.parent.resolve()])
-        self.assertEqual(events, ["file", "replace", "directory", "directory"])
+        self.assertEqual(events, ["file", "replace", "directory", "directory", "directory"])
         self.assertEqual(WorkerResult.parse(destination.read_text()), result)
         self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
 
     def test_interrupted_result_replace_preserves_prior_complete_result(self) -> None:
-        previous = self.write_preflight_result(model_call_id="previous")
+        previous = self.write_preflight_result()
         destination = self.root / self.output
 
         with (
@@ -147,7 +201,7 @@ class WorkerResultTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(OSError, "replace interrupted"),
         ):
-            self.write_preflight_result(model_call_id="replacement")
+            self.write_preflight_result()
 
         self.assertEqual(WorkerResult.parse(destination.read_text()), previous)
         self.assertEqual(list(destination.parent.glob(f".{destination.name}.*.tmp")), [])
@@ -165,7 +219,6 @@ class WorkerResultTests(unittest.TestCase):
             provider="codex",
             model_call_id="model-call-7",
             command=["codex", "exec", "review"],
-            output=self.output,
             timeout=30.0,
             ctx_timeout=10.0,
             invoke=invoke,
@@ -198,7 +251,6 @@ class WorkerResultTests(unittest.TestCase):
                 provider="omp-packet",
                 model_call_id="openai-via-omp",
                 command=omp_command(str(self.root), selector=selector, packet=True),
-                output=self.output,
                 invoke=invoke,
                 timeout=30.0,
                 ctx_timeout=10.0,
@@ -210,8 +262,32 @@ class WorkerResultTests(unittest.TestCase):
         self.assertTrue(result.model_call_started)
         self.assertEqual(len(invoked), 1)
         self.assertNotIn("codex", invoked[0])
-        stored = WorkerResult.parse((self.root / self.output).read_text())
+        stored = WorkerResult.parse(
+            (self.root / worker_evidence_path(result.model_call_id)).read_text()
+        )
         self.assertEqual(stored, result)
+
+    def test_workspace_writer_refuses_unregistered_identity_before_harness(self) -> None:
+        with mock.patch("agent_execution.worker.require_omp_sdk", return_value=(self.root, "bun")):
+            result = execute_worker(
+                provider="omp",
+                model_call_id="writer-refused",
+                command=omp_command(
+                    str(self.root),
+                    selector="anthropic/claude-opus-5",
+                    writer=True,
+                ),
+                invoke=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("must not invoke unregistered writer")
+                ),
+                timeout=30.0,
+                ctx_timeout=10.0,
+                which=lambda name: None,
+                cwd=self.root,
+            )
+        self.assertEqual(result.status, "preflight_failed")
+        self.assertFalse(result.model_call_started)
+        self.assertIn("writer OMP selector", result.failure)
 
     def test_worker_refuses_metered_route_before_invoking_harness(self) -> None:
         def invoke(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
@@ -234,7 +310,6 @@ class WorkerResultTests(unittest.TestCase):
                     provider="omp-packet",
                     model_call_id="cost-cap-worker",
                     command=omp_command(str(self.root), selector="zai/glm-5.3-flash", packet=True),
-                    output=self.output,
                     timeout=30.0,
                     ctx_timeout=10.0,
                     invoke=invoke,
@@ -266,7 +341,6 @@ class WorkerResultTests(unittest.TestCase):
             provider="codex",
             model_call_id="model-call-7",
             command=["codex", "exec", "review"],
-            output=self.output,
             timeout=30.0,
             ctx_timeout=10.0,
             expect_protocol=expected,
@@ -326,7 +400,6 @@ class WorkerResultTests(unittest.TestCase):
                 provider="codex",
                 model_call_id="model-call-7",
                 command=["codex", "exec", "-"],
-                output=self.output,
                 timeout=30.0,
                 ctx_timeout=10.0,
                 expect_protocol=WORKER_PROTOCOL_VERSION,
@@ -358,7 +431,6 @@ class WorkerResultTests(unittest.TestCase):
                 provider="codex",
                 model_call_id="model-call-7",
                 command=["codex", "exec", "-"],
-                output=self.output,
                 timeout=30.0,
                 ctx_timeout=10.0,
                 expect_source_sha256="a" * 64,
@@ -399,7 +471,6 @@ class WorkerResultTests(unittest.TestCase):
                 provider="codex",
                 model_call_id="model-call-7",
                 command=["codex", "exec", "-"],
-                output=self.output,
                 timeout=30.0,
                 ctx_timeout=10.0,
                 expect_source_sha256=source_digest,
@@ -438,7 +509,6 @@ class WorkerResultTests(unittest.TestCase):
             provider="codex",
             model_call_id="model-call-7",
             command=["codex", "exec", "review"],
-            output=self.output,
             timeout=30.0,
             ctx_timeout=10.0,
             invoke=invoke,
@@ -470,7 +540,6 @@ class WorkerResultTests(unittest.TestCase):
             provider="codex",
             model_call_id="model-call-7",
             command=["codex", "exec", "review"],
-            output=self.output,
             timeout=30.0,
             ctx_timeout=10.0,
             invoke=invoke,
@@ -519,7 +588,6 @@ class WorkerResultTests(unittest.TestCase):
             provider="codex",
             model_call_id="model-call-7",
             command=["codex", "exec", "review"],
-            output=self.output,
             timeout=30.0,
             ctx_timeout=10.0,
             invoke=invoke,
@@ -575,7 +643,6 @@ class WorkerResultTests(unittest.TestCase):
                     provider="codex",
                     model_call_id="oversized-input",
                     command=["codex", "exec", "-"],
-                    output=self.output,
                     timeout=30.0,
                     ctx_timeout=10.0,
                     invoke=invoke,
@@ -584,7 +651,9 @@ class WorkerResultTests(unittest.TestCase):
                 )
 
                 self.assertEqual(exports, ["thread-oversized"])
-                stored = WorkerResult.parse((self.root / self.output).read_text())
+                stored = WorkerResult.parse(
+                    (self.root / worker_evidence_path(result.model_call_id)).read_text()
+                )
                 self.assertEqual(stored, result)
                 self.assertEqual(stored.status, "harness_failed")
                 self.assertTrue(stored.model_call_started)
@@ -620,7 +689,6 @@ class WorkerResultTests(unittest.TestCase):
             provider="codex",
             model_call_id="model-call-7",
             command=["codex", "exec", "review"],
-            output=self.output,
             timeout=30.0,
             ctx_timeout=10.0,
             invoke=invoke,
@@ -653,7 +721,6 @@ class WorkerResultTests(unittest.TestCase):
             provider="codex",
             model_call_id="model-call-7",
             command=["codex", "exec", "review"],
-            output=self.output,
             timeout=30.0,
             ctx_timeout=10.0,
             invoke=invoke,
@@ -706,7 +773,6 @@ class WorkerResultTests(unittest.TestCase):
                     provider="codex",
                     model_call_id="model-call-7",
                     command=["codex", "exec", "review"],
-                    output=self.output,
                     timeout=30.0,
                     ctx_timeout=10.0,
                     invoke=invoke,

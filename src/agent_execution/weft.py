@@ -21,7 +21,7 @@ from typing import Literal, cast
 
 from agent_execution.command import CommandResult, CommandRunner, ProgressCallback, run_command
 from agent_execution.costs import validate_max_cost_usd
-from agent_execution.identity import source_sha256
+from agent_execution.identity import source_sha256, worker_evidence_path
 from agent_execution.omp_execution import omp_transcript, validate_omp_command
 from agent_execution.weft_protocol import WEFT_HOST_LIST_COMMAND, parse_weft_host_capabilities
 from agent_execution.worker import (
@@ -329,6 +329,7 @@ class WeftCommandRunner:
         self.max_cost_usd = validate_max_cost_usd(max_cost_usd)
         self.prompt_sha256: str | None = None
         self.omp_selector: str | None = None
+        self.omp_policy: str | None = None
         self.last_execution: dict[str, object] | None = None
         self.submitter_session = submitter_session or f"agent-execution/v1/{model_call_id}"
 
@@ -472,8 +473,6 @@ class WeftCommandRunner:
                 WORKER_PROMPT_PAYLOAD,
                 "--expect-prompt-sha256",
                 self.prompt_sha256 or "",
-                "--evidence-out",
-                self.worker_result_path,
                 *(["--timeout", str(harness_timeout)] if harness_timeout is not None else []),
                 "--ctx-timeout",
                 str(ctx_timeout),
@@ -599,9 +598,15 @@ class WeftCommandRunner:
             "receipt": receipt.to_dict(),
             "admission": admission,
             "prompt_sha256": self.prompt_sha256,
-            **({"omp_selector": self.omp_selector} if self.omp_selector else {}),
+            **(
+                {"omp_selector": self.omp_selector, "omp_policy": self.omp_policy}
+                if self.omp_selector
+                else {}
+            ),
             "submitter_session": self.submitter_session,
             "expected_worker_source_sha256": self.expected_source_sha256,
+            "expected_worker_protocol_version": WORKER_PROTOCOL_VERSION,
+            "worker_result_path": self.worker_result_path,
         }
 
     @staticmethod
@@ -688,7 +693,17 @@ class WeftCommandRunner:
             prefix="agent-execution-artifact-", dir=scratch_root
         ) as temporary:
             return self._call(
-                [self.executable, "artifact", "cat", job_id, self.worker_result_path],
+                [
+                    self.executable,
+                    "artifact",
+                    "cat",
+                    job_id,
+                    str(
+                        (self.last_execution or {}).get(
+                            "worker_result_path", self.worker_result_path
+                        )
+                    ),
+                ],
                 Path(temporary),
                 deadline,
             )
@@ -792,19 +807,15 @@ class WeftCommandRunner:
                 f"invalid Weft worker result for {job_id}: {error}",
                 execution=execution,
             )
-        # Name the artifact this call actually wrote. `summary()` defaults to
-        # the historical fixed path, so the record read
-        # `outputs/agent-execution-worker-result.json` for every call while the
-        # per-call file sat beside it -- a field describing where the evidence
-        # is, pointing somewhere it is not.
-        summary = worker.summary(artifact_path=self.worker_result_path)
+        summary = worker.summary(artifact_path=str(execution["worker_result_path"]))
         summary["artifact_sha256"] = hashlib.sha256(artifact.stdout.encode()).hexdigest()
         execution["worker_result"] = summary
         execution["duration_seconds"] = worker.completed_at - worker.started_at
 
-        if worker.worker_protocol_version != WORKER_PROTOCOL_VERSION:
+        expected_protocol = execution.get("expected_worker_protocol_version")
+        if worker.worker_protocol_version != expected_protocol:
             detail = protocol_mismatch_detail(
-                WORKER_PROTOCOL_VERSION,
+                cast(int, expected_protocol),
                 worker.worker_protocol_version,
             )
             self._processing(
@@ -853,14 +864,36 @@ class WeftCommandRunner:
                 expected_selector = execution.get("omp_selector")
                 if not isinstance(expected_selector, str) or not expected_selector:
                     raise ValueError("OMP dispatch receipt lacks its exact inference selector")
+                # Before writer dispatch existed, receipts recorded only the
+                # selector. Absence retains that historical read-only contract;
+                # neither provider identity nor returned evidence grants writes.
+                expected_policy = execution.get(
+                    "omp_policy",
+                    ("read-only-no-shell" if self.agent == "omp" else "packet-only-no-tools")
+                    if expected_protocol == 1
+                    else None,
+                )
+                allowed_policies = (
+                    {"read-only-no-shell", "workspace-write-no-shell"}
+                    if self.agent == "omp"
+                    else {"packet-only-no-tools"}
+                )
+                if not isinstance(expected_policy, str) or expected_policy not in allowed_policies:
+                    raise ValueError("OMP dispatch receipt has an invalid tool policy")
                 omp_transcript(
                     worker.harness.stdout,
                     selector=expected_selector,
-                    policy="read-only-no-shell" if self.agent == "omp" else "packet-only-no-tools",
+                    policy=expected_policy,
                     cwd=worker.worker_cwd,
                     prompt_sha256=worker.prompt_sha256 or None,
                 )
             except ValueError as error:
+                self._processing(
+                    execution,
+                    state="not_marked",
+                    step="worker_result_validation",
+                    detail=str(error),
+                )
                 return CommandResult(
                     1, worker.harness.stdout, str(error), execution=execution, worker_result=worker
                 )
@@ -915,17 +948,8 @@ class WeftCommandRunner:
 
     @property
     def worker_result_path(self) -> str:
-        """Where this call's worker result lands, unique per model call.
-
-        Every offloaded review on one host runs in the same synced working
-        directory, so a fixed `outputs/agent-execution-worker-result.json` is a
-        shared mutable path: three concurrent reviews wrote and read one file
-        and all three returned an empty harness output under a `completed`
-        worker status -- a false success, silent, and only reproducible under
-        concurrency. Raw omp runs three at a time on this host without
-        trouble, so the contention was ours, not the harness's.
-        """
-        return f"outputs/agent-execution-worker-result-{self.model_call_id}.json"
+        """The protocol-2 location; never a caller-selected output."""
+        return worker_evidence_path(self.model_call_id)
 
     def record_observed_host(self, job_id: str, cwd: Path, execution: dict[str, object]) -> None:
         """Record where Weft actually ran a job, beside where we asked it to.
@@ -1028,21 +1052,75 @@ class WeftCommandRunner:
             )
         return record
 
-    def _dispatched_source(self, record: dict[str, object]) -> str:
-        """Recover a legacy pin from the accepted command, never the worker artifact."""
+    def _dispatched_contract(self, record: dict[str, object]) -> dict[str, object]:
+        """Recover expectations from Weft's retained command, never result claims."""
         options = parse_worker_command(record.get("command"))
-
-        def one_value(flag: str) -> str:
-            if flag not in options:
-                raise ValueError(f"accepted command must carry exactly one {flag}")
-            return options[flag]
-
-        if one_value("--model-call-id") != self.model_call_id:
+        if options.get("--model-call-id") != self.model_call_id:
             raise ValueError("accepted command names another model call")
-        expected = one_value("--expect-source-sha256")
+        if options.get("--provider") != self.agent:
+            raise ValueError("accepted command names another provider")
+        expected = options.get("--expect-source-sha256", "")
         if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
             raise ValueError("accepted command carries an invalid source hash")
-        return expected
+        protocol_text = options.get("--expect-protocol")
+        if protocol_text not in {"1", "2"}:
+            raise ValueError("accepted command lacks a supported protocol expectation")
+        protocol = int(protocol_text)
+        if protocol == 2 and "--evidence-out" in options:
+            raise ValueError("protocol 2 does not accept --evidence-out")
+        contract: dict[str, object] = {
+            "expected_worker_source_sha256": expected,
+            "expected_worker_protocol_version": protocol,
+            "worker_result_path": (
+                self.worker_result_path
+                if protocol == 2
+                else options.get("--evidence-out", "outputs/agent-execution-worker-result.json")
+            ),
+        }
+        if "--expect-prompt-sha256" in options:
+            contract["prompt_sha256"] = options["--expect-prompt-sha256"]
+        if self.agent in {"omp", "omp-packet"}:
+            argv = shlex.split(cast(str, record["command"]))
+            harness = argv[argv.index("--") + 1 :]
+            if "--harness-model" in options:
+                harness.extend(["--model", options["--harness-model"]])
+            invocation = validate_omp_command(harness, Path("."), historical=protocol == 1)
+            contract.update(omp_selector=invocation.selector, omp_policy=invocation.policy)
+        return contract
+
+    def _unknown_contract(
+        self, job_id: str, execution: dict[str, object]
+    ) -> WeftRetrievalOutcome | None:
+        unknown = self._unknown_source(job_id, execution)
+        if unknown is not None:
+            return unknown
+        protocol = execution.get("expected_worker_protocol_version")
+        path = execution.get("worker_result_path")
+        detail = ""
+        if type(protocol) is not int or protocol not in {1, 2}:
+            detail = "no supported dispatched worker protocol expectation"
+        elif protocol == 2 and path != self.worker_result_path:
+            detail = "protocol 2 evidence must use its deterministic protected path"
+        elif protocol == 1:
+            protected = False
+            if isinstance(path, str) and path and not Path(path).is_absolute():
+                parts = Path(path).parts
+                protected = ".." not in parts and (
+                    ".agent-execution" in (part.casefold() for part in parts)
+                    or re.fullmatch(
+                        r"agent-execution-worker-result(?:-.*)?\.json",
+                        Path(path).name,
+                        re.IGNORECASE,
+                    )
+                    is not None
+                )
+            if not protected:
+                detail = "legacy evidence path is not protected from writable tools"
+            elif execution.get("omp_policy") == "workspace-write-no-shell":
+                detail = "legacy writer evidence cannot establish an untampered result"
+        if detail:
+            return WeftRetrievalOutcome("unknown", f"Weft job {job_id}: {detail}")
+        return None
 
     @staticmethod
     def _unknown_source(job_id: str, execution: dict[str, object]) -> WeftRetrievalOutcome | None:
@@ -1083,7 +1161,7 @@ class WeftCommandRunner:
             return WeftRetrievalOutcome(
                 "unknown", f"Weft job {job_id} artifact {artifact_path} is unreadable: {error}"
             )
-        unknown = self._unknown_source(job_id, execution)
+        unknown = self._unknown_contract(job_id, execution)
         if unknown is not None:
             return unknown
         return self._command_result_from_worker(
@@ -1104,6 +1182,32 @@ class WeftCommandRunner:
         """Retrieve one accepted job without submitting or falling back locally."""
         self.last_execution = execution
         deadline = self.clock() + timeout
+        required = (
+            "expected_worker_source_sha256",
+            "expected_worker_protocol_version",
+            "worker_result_path",
+        )
+        if any(execution.get(key) in (None, "") for key in required):
+            record = self._inspect_job(job_id, cwd, deadline)
+            if isinstance(record, WeftRetrievalOutcome):
+                return record
+            try:
+                recovered = self._dispatched_contract(record)
+                for key, value in recovered.items():
+                    if (
+                        key in execution
+                        and execution[key] not in (None, "")
+                        and execution[key] != value
+                    ):
+                        raise ValueError(f"accepted command disagrees with retained {key}")
+                execution.update(recovered)
+            except ValueError as error:
+                return WeftRetrievalOutcome(
+                    "unknown", f"Weft job {job_id} dispatch expectation is unknown: {error}"
+                )
+        unknown = self._unknown_contract(job_id, execution)
+        if unknown is not None:
+            return unknown
         artifact: CommandResult | None = None
         artifact_detail = ""
         try:
@@ -1111,22 +1215,6 @@ class WeftCommandRunner:
         except (WeftExecutionAmbiguous, WeftExecutionDetached, OSError) as error:
             artifact_detail = str(error)
         if artifact is not None and artifact.exit_status == 0:
-            # Source identity gates the worker artifact, not observations of
-            # whether its job is still running or has already failed.
-            if execution.get("expected_worker_source_sha256") in (None, ""):
-                record = self._inspect_job(job_id, cwd, deadline)
-                if isinstance(record, WeftRetrievalOutcome):
-                    return record
-                try:
-                    expected = self._dispatched_source(record)
-                except ValueError as error:
-                    return WeftRetrievalOutcome(
-                        "unknown", f"Weft job {job_id} dispatch expectation is unknown: {error}"
-                    )
-                execution["expected_worker_source_sha256"] = expected
-            unknown = self._unknown_source(job_id, execution)
-            if unknown is not None:
-                return unknown
             return self._command_result_from_worker(
                 job_id=job_id,
                 cwd=cwd,
@@ -1349,8 +1437,14 @@ class WeftCommandRunner:
             "job_id": job_id,
             "admission": admission,
             "prompt_sha256": self.prompt_sha256,
-            **({"omp_selector": self.omp_selector} if self.omp_selector else {}),
+            **(
+                {"omp_selector": self.omp_selector, "omp_policy": self.omp_policy}
+                if self.omp_selector
+                else {}
+            ),
             "expected_worker_source_sha256": self.expected_source_sha256,
+            "expected_worker_protocol_version": WORKER_PROTOCOL_VERSION,
+            "worker_result_path": self.worker_result_path,
             "diagnostics": diagnostics,
         }
         self._attach_placement_diagnostic(execution, placement)
@@ -1364,6 +1458,10 @@ class WeftCommandRunner:
             admission=admission,
             submitter_session=self.submitter_session,
             expected_worker_source_sha256=execution["expected_worker_source_sha256"],
+            expected_worker_protocol_version=execution["expected_worker_protocol_version"],
+            worker_result_path=execution["worker_result_path"],
+            omp_selector=self.omp_selector,
+            omp_policy=self.omp_policy,
             survives_process_exit=True,
         )
         return execution
@@ -1493,7 +1591,9 @@ class WeftCommandRunner:
         prompt = command[self._prompt_index(command)]
         self.prompt_sha256 = hashlib.sha256(prompt.encode()).hexdigest()
         if self.agent in {"omp", "omp-packet"}:
-            self.omp_selector = validate_omp_command(command, cwd).selector
+            invocation = validate_omp_command(command, cwd)
+            self.omp_selector = invocation.selector
+            self.omp_policy = invocation.policy
         self.last_execution = None
         placement = self._placement_check(cwd, deadline)
         if placement["state"] == "unknown":
@@ -1557,6 +1657,13 @@ class WeftCommandRunner:
                     self.last_execution = {
                         "transport": "weft",
                         "host": self.host,
+                        "prompt_sha256": self.prompt_sha256,
+                        **(
+                            {"omp_selector": self.omp_selector, "omp_policy": self.omp_policy}
+                            if self.omp_selector
+                            else {}
+                        ),
+                        "expected_worker_source_sha256": self.expected_source_sha256,
                         "diagnostics": {"submission_error": str(error)},
                         "processing": {
                             "state": "unknown",
@@ -1621,6 +1728,13 @@ class WeftCommandRunner:
                 self.last_execution = {
                     "transport": "weft",
                     "host": self.host,
+                    "prompt_sha256": self.prompt_sha256,
+                    **(
+                        {"omp_selector": self.omp_selector, "omp_policy": self.omp_policy}
+                        if self.omp_selector
+                        else {}
+                    ),
+                    "expected_worker_source_sha256": self.expected_source_sha256,
                     "diagnostics": {
                         "unreadable_receipt": str(error),
                         "receipt_stdout": _tail(submission.stdout),
@@ -1714,6 +1828,10 @@ class WeftCommandRunner:
             admission=admission,
             submitter_session=self.submitter_session,
             expected_worker_source_sha256=execution["expected_worker_source_sha256"],
+            expected_worker_protocol_version=execution["expected_worker_protocol_version"],
+            worker_result_path=execution["worker_result_path"],
+            omp_selector=self.omp_selector,
+            omp_policy=self.omp_policy,
             survives_process_exit=True,
         )
         return self._await_accepted_job(

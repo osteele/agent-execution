@@ -5,7 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 
-from agent_execution.omp_execution import OMP_EXECUTION_SCHEMA, OMP_READ_TOOLS, OMP_SDK_VERSION
+from agent_execution.omp_execution import (
+    OMP_EXECUTION_SCHEMA,
+    OMP_READ_TOOLS,
+    OMP_SDK_VERSION,
+    OMP_WRITE_TOOLS,
+)
 
 
 def omp_events(
@@ -26,7 +31,11 @@ def omp_events(
             "harness": "omp",
             "selector": selector,
             "tool_policy": policy,
-            "tools": list(OMP_READ_TOOLS) if policy == "read-only-no-shell" else [],
+            "tools": list(OMP_WRITE_TOOLS)
+            if policy == "workspace-write-no-shell"
+            else list(OMP_READ_TOOLS)
+            if policy == "read-only-no-shell"
+            else [],
             "session_id": "session-1",
             "cwd": cwd,
             "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
@@ -128,6 +137,7 @@ def omp_command(
     *,
     selector: str = "anthropic/claude-opus-5",
     packet: bool = False,
+    writer: bool = False,
     prompt: str = "review",
 ) -> list[str]:
     command = [
@@ -139,11 +149,17 @@ def omp_command(
         "--cwd",
         cwd,
         "--execution-tool-policy",
-        "packet-only-no-tools" if packet else "read-only-no-shell",
+        "packet-only-no-tools"
+        if packet
+        else "workspace-write-no-shell"
+        if writer
+        else "read-only-no-shell",
         "--model",
         selector,
     ]
     if packet:
+        if writer:
+            raise ValueError("packet and writer are mutually exclusive")
         command.extend(
             [
                 "--no-session",

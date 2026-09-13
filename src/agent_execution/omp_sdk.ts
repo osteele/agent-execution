@@ -1,13 +1,28 @@
 /** Restricted OMP SDK execution. Never imports configuration or tools from the reviewed tree. */
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, realpath, stat, readdir } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { chmod, lstat, open, readFile, realpath, readdir, rename, rm, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type * as OmpSdk from "@oh-my-pi/pi-coding-agent";
 
 export const SDK_VERSION = "18.1.15";
-export const TOOLS = ["execution_read", "execution_glob", "execution_grep"];
+export const READ_TOOLS = ["execution_read", "execution_glob", "execution_grep"];
+export const WRITE_TOOLS = [...READ_TOOLS, "execution_write", "execution_edit"];
+export const TOOLS = READ_TOOLS;
 const MAX_BYTES = 512 * 1024;
+const FORBIDDEN_METADATA = new Set([
+	".git",
+	".jj",
+	".hg",
+	".svn",
+	".omp",
+	".agent-execution",
+	".agent-review",
+	".agents",
+	".codex",
+	".claude",
+	".gemini",
+]);
 
 class UnsupportedTextFile extends Error {}
 
@@ -17,25 +32,64 @@ function writeOutput(line: string): Promise<void> {
 	return promise;
 }
 
+function rejectUnsafePath(value: string, forbidMetadata: boolean): void {
+	if (
+		!value ||
+		value.includes("\0") ||
+		isAbsolute(value) ||
+		/^[a-z][a-z0-9+.-]*:\/\//i.test(value)
+	) {
+		throw new Error(
+			"Only relative filesystem paths inside the execution snapshot are permitted",
+		);
+	}
+	for (const part of value.split(/[\\/]+/)) {
+		if (part === "..") throw new Error("Path traversal is not permitted");
+		if (forbidMetadata && FORBIDDEN_METADATA.has(part.toLowerCase()))
+			throw new Error("VCS and harness metadata paths are not editable");
+		if (
+			forbidMetadata &&
+			/^agent-execution-worker-result(?:-.*)?\.json$/i.test(part)
+		)
+			throw new Error("Legacy worker evidence paths are not editable");
+	}
+}
+
+async function safeSnapshotPath(
+	root: string,
+	value: string,
+	{ mustExist, forbidMetadata = false }: { mustExist: boolean; forbidMetadata?: boolean },
+): Promise<string> {
+	rejectUnsafePath(value, forbidMetadata);
+	const rootReal = await realpath(root);
+	const candidate = resolve(rootReal, value);
+	const rel = relative(rootReal, candidate);
+	if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+		throw new Error("Path escapes the execution snapshot");
+	}
+	const parts = rel ? rel.split(sep) : [];
+	let cursor = rootReal;
+	for (let index = 0; index < parts.length; index++) {
+		cursor = join(cursor, parts[index]);
+		try {
+			const info = await lstat(cursor);
+			if (info.isSymbolicLink()) throw new Error("Symlink paths are not permitted");
+			if (index < parts.length - 1 && !info.isDirectory())
+				throw new Error("Path parent is not a directory");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			if (mustExist || index < parts.length - 1)
+				throw new Error("Path parent does not exist safely");
+		}
+	}
+	return candidate;
+}
+
 export async function confinedPath(
 	root: string,
 	value: string,
 ): Promise<string> {
-	if (
-		!value ||
-		value.includes("\0") ||
-		/^[a-z][a-z0-9+.-]*:\/\//i.test(value)
-	) {
-		throw new Error(
-			"Only filesystem paths inside the execution snapshot are permitted",
-		);
-	}
-	const candidate = await realpath(resolve(root, value));
-	const rel = relative(root, candidate);
-	if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-		throw new Error("Path escapes the execution snapshot");
-	}
-	return candidate;
+	return safeSnapshotPath(root, value, { mustExist: true });
 }
 
 async function textFile(
@@ -86,11 +140,124 @@ async function files(root: string, base: string): Promise<string[]> {
 	return found.sort();
 }
 
-export function readTools(z: typeof OmpSdk.z, root: string) {
-	const response = (text: string, paths: string[]) => ({
+function response(text: string, paths: string[]) {
+	return {
 		content: [{ type: "text" as const, text }],
 		details: { paths },
-	});
+	};
+}
+
+async function assertSafeParent(root: string, path: string): Promise<void> {
+	const rootReal = await realpath(root);
+	const parent = dirname(path);
+	const parentInfo = await lstat(parent);
+	if (parentInfo.isSymbolicLink() || !parentInfo.isDirectory())
+		throw new Error("Write parent is not a safe directory");
+	const parentReal = await realpath(parent);
+	const rel = relative(rootReal, parentReal);
+	if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel))
+		throw new Error("Write parent escapes the execution snapshot");
+}
+
+async function atomicTextReplace(
+	root: string,
+	path: string,
+	text: string,
+	mode: number = 0o600,
+): Promise<void> {
+	const encoded = new TextEncoder().encode(text);
+	if (encoded.length > MAX_BYTES) throw new Error("Write exceeds 512 KiB");
+	const permissions = mode & 0o777;
+	await assertSafeParent(root, path);
+	const temporary = join(dirname(path), `.agent-execution-write-${process.pid}-${randomUUID()}`);
+	let handle;
+	try {
+		handle = await open(temporary, "wx", permissions);
+		await handle.writeFile(encoded);
+		await handle.close();
+		handle = undefined;
+		await chmod(temporary, permissions);
+		await assertSafeParent(root, path);
+		await rename(temporary, path);
+	} finally {
+		if (handle) await handle.close();
+		await rm(temporary, { force: true });
+	}
+}
+
+export function writeTools(z: typeof OmpSdk.z, root: string) {
+	return [
+		...readTools(z, root),
+		{
+			name: "execution_write",
+			label: "Write snapshot",
+			description:
+				"Replace or create one UTF-8 file inside the execution snapshot. Relative paths only; symlinks, traversal, URLs and VCS metadata are refused.",
+			parameters: z.object({
+				path: z.string(),
+				content: z.string(),
+			}),
+			async execute(_id: string, args: { path: string; content: string }) {
+				const path = await safeSnapshotPath(root, args.path, {
+					mustExist: false,
+					forbidMetadata: true,
+				});
+				let before = "";
+				let mode = 0o600;
+				try {
+					const info = await lstat(path);
+					if (info.isSymbolicLink() || !info.isFile())
+						throw new Error("Write target must be a plain file");
+					mode = info.mode;
+					before = await readFile(path, "utf8");
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				}
+				if (before === args.content)
+					throw new Error("Write would not change file bytes");
+				await atomicTextReplace(root, path, args.content, mode);
+				return response(`wrote ${path}`, [path]);
+			},
+		},
+		{
+			name: "execution_edit",
+			label: "Edit snapshot",
+			description:
+				"Replace exactly one matching UTF-8 span inside an existing snapshot file. Ambiguous, missing, no-op, symlink and metadata edits are refused.",
+			parameters: z.object({
+				path: z.string(),
+				old_text: z.string().min(1),
+				new_text: z.string(),
+			}),
+			async execute(
+				_id: string,
+				args: { path: string; old_text: string; new_text: string },
+			) {
+				const path = await safeSnapshotPath(root, args.path, {
+					mustExist: true,
+					forbidMetadata: true,
+				});
+				const info = await lstat(path);
+				if (info.isSymbolicLink() || !info.isFile())
+					throw new Error("Edit target must be a plain file");
+				const before = await readFile(path, "utf8");
+				const first = before.indexOf(args.old_text);
+				if (first === -1) throw new Error("Edit match was not found");
+				if (before.indexOf(args.old_text, first + args.old_text.length) !== -1)
+					throw new Error("Edit match is ambiguous");
+				const after =
+					before.slice(0, first) +
+					args.new_text +
+					before.slice(first + args.old_text.length);
+				if (after === before) throw new Error("Edit would not change file bytes");
+				await atomicTextReplace(root, path, after, info.mode);
+				return response(`edited ${path}`, [path]);
+			},
+		},
+	];
+}
+
+export function readTools(z: typeof OmpSdk.z, root: string) {
 	return [
 		{
 			name: "execution_read",
@@ -131,7 +298,7 @@ export function readTools(z: typeof OmpSdk.z, root: string) {
 			async execute(_id: string, args: { pattern: string; path?: string }) {
 				const base = await confinedPath(root, args.path ?? ".");
 				const matcher = new Bun.Glob(args.pattern);
-				const matches = (await files(root, base)).filter((path) =>
+				const matches = (await files(root, args.path ?? ".")).filter((path) =>
 					matcher.match(relative(base, path)),
 				);
 				if (matches.length > 2000)
@@ -149,14 +316,14 @@ export function readTools(z: typeof OmpSdk.z, root: string) {
 				const base = await confinedPath(root, args.path);
 				const inputs = (await stat(base)).isFile()
 					? [base]
-					: await files(root, base);
+					: await files(root, args.path);
 				const matches: string[] = [];
 				const readPaths: string[] = [];
 				const skipped: string[] = [];
 				for (const path of inputs) {
 					let file;
 					try {
-						file = await textFile(root, path);
+						file = await textFile(root, relative(root, path));
 					} catch (error) {
 						if (!(error instanceof UnsupportedTextFile)) throw error;
 						skipped.push(`${path}: ${error.message}`);
@@ -188,9 +355,12 @@ async function main(): Promise<void> {
 	if (
 		!sdkRoot ||
 		!selector ||
-		!["read-only-no-shell", "packet-only-no-tools", "--auth-status"].includes(
-			policy,
-		)
+		![
+			"read-only-no-shell",
+			"packet-only-no-tools",
+			"workspace-write-no-shell",
+			"--auth-status",
+		].includes(policy)
 	) {
 		throw new Error("Invalid restricted OMP invocation");
 	}
@@ -276,7 +446,12 @@ async function main(): Promise<void> {
 		const model = registry.find(provider, modelId);
 		if (!model || model.provider !== provider || model.id !== modelId)
 			throw new Error(`Unavailable exact OMP model: ${selector}`);
-		const allowed = policy === "read-only-no-shell" ? TOOLS : [];
+		const allowed =
+			policy === "read-only-no-shell"
+				? READ_TOOLS
+				: policy === "workspace-write-no-shell"
+					? WRITE_TOOLS
+					: [];
 		const manager = sdk.SessionManager.inMemory(cwd);
 		const { session } = await sdk.createAgentSession({
 			cwd,
@@ -314,7 +489,12 @@ async function main(): Promise<void> {
 			restrictToolNames: true,
 			allowRestrictedCustomTools: true,
 			toolNames: allowed,
-			customTools: policy === "read-only-no-shell" ? readTools(sdk.z, cwd) : [],
+			customTools:
+				policy === "read-only-no-shell"
+					? readTools(sdk.z, cwd)
+					: policy === "workspace-write-no-shell"
+						? writeTools(sdk.z, cwd)
+						: [],
 			enableMCP: false,
 			enableLsp: false,
 			enableIrc: false,

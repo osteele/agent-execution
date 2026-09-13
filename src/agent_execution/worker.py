@@ -23,7 +23,7 @@ from typing import cast
 from agent_execution import __version__
 from agent_execution.command import CommandResult, CommandRunner
 from agent_execution.costs import estimate_execution_cost, require_cost_cap, validate_max_cost_usd
-from agent_execution.identity import source_sha256
+from agent_execution.identity import source_sha256, worker_evidence_path
 from agent_execution.omp_execution import (
     omp_transcript,
     require_omp_sdk,
@@ -36,13 +36,12 @@ from agent_execution.worker_transcript import validate_ctx_transcript
 
 WORKER_IDENTITY_SCHEMA = "agent-execution.worker-identity/v1"
 WORKER_RESULT_SCHEMA = "agent-execution.worker-result/v1"
-WORKER_RESULT_PATH = Path("outputs/agent-execution-worker-result.json")
 WORKER_PROJECT = "agent-execution"
-WORKER_PROTOCOL_VERSION = 1
+WORKER_PROTOCOL_VERSION = 2
 """Exact compatibility version for the shared worker/conductor contract.
 
-Version 1 retains restricted SDK confinement, prompt/source identity and native
-evidence validation from the extracted runtime. Consumers compare for equality.
+Version 2 fixes evidence beneath the model-inaccessible .agent-execution namespace.
+Version 1 artifacts remain parseable for historical read-only retrieval.
 """
 #: New execution excludes native Codex; historical evidence remains parseable.
 SUPPORTED_WORKER_PROVIDERS = frozenset({"omp", "omp-packet"})
@@ -439,7 +438,6 @@ class WorkerResult:
                     raise ValueError("grounded OMP result lacks native evidence")
                 transcript = validate_omp_transcript(
                     result.omp_evidence,
-                    policy="read-only-no-shell",
                     cwd=result.worker_cwd,
                     prompt_sha256=result.prompt_sha256 or None,
                 )
@@ -522,7 +520,9 @@ class WorkerResult:
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
 
-    def summary(self, *, artifact_path: str = str(WORKER_RESULT_PATH)) -> dict[str, object]:
+    def summary(self, *, artifact_path: str | None = None) -> dict[str, object]:
+        if artifact_path is None and self.worker_protocol_version == 2:
+            artifact_path = worker_evidence_path(self.model_call_id)
         encoded = self.to_json().encode()
         summary: dict[str, object] = {
             "schema_version": self.schema_version,
@@ -613,7 +613,11 @@ def _fsync_directory(path: Path) -> None:
 def _write_result(path: Path, result: WorkerResult, *, cwd: Path) -> None:
     """Atomically publish a result and sync its file and directory entries."""
     root = cwd.resolve()
-    destination = path.resolve() if path.is_absolute() else (root / path).resolve()
+    destination = root / path
+    for part in (*reversed(destination.parents), destination):
+        if part != root and root in part.parents and part.is_symlink():
+            raise ValueError("worker evidence output cannot traverse symlinks")
+    destination = destination.resolve()
     if destination == root or root not in destination.parents:
         raise ValueError("worker evidence output must stay inside its working directory")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -685,7 +689,6 @@ def execute_worker(
     provider: str,
     model_call_id: str,
     command: list[str],
-    output: Path,
     timeout: float | None,
     ctx_timeout: float,
     expect_protocol: int | None = None,
@@ -700,9 +703,10 @@ def execute_worker(
     clock: Clock = time.time,
     cwd: Path | None = None,
 ) -> WorkerResult:
-    """Run one harness and export its exact ctx session into ``output``."""
+    """Run one harness and publish evidence at its deterministic protected path."""
     started_at = clock()
     working_directory = (cwd or Path.cwd()).resolve()
+    output = Path(worker_evidence_path(model_call_id))
     empty_harness = HarnessOutcome(None, "", "")
     worker_source_sha256 = installed_source_sha256()
     worker_identity = installed_worker_identity(source_sha256=worker_source_sha256)
@@ -818,8 +822,12 @@ def execute_worker(
         try:
             logical_command = [*command, *(["--model", harness_model] if harness_model else [])]
             omp_invocation = validate_omp_command(logical_command, working_directory)
-            expected_policy = "read-only-no-shell" if provider == "omp" else "packet-only-no-tools"
-            if omp_invocation.policy != expected_policy:
+            expected_policies = (
+                {"read-only-no-shell", "workspace-write-no-shell"}
+                if provider == "omp"
+                else {"packet-only-no-tools"}
+            )
+            if omp_invocation.policy not in expected_policies:
                 raise ValueError("OMP adapter identity disagrees with command tool policy")
             require_omp_sdk()
         except ValueError as error:

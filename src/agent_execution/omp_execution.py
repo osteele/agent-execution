@@ -58,8 +58,16 @@ OMP_TOKEN_BILLING_KEYS = (
     "OPENAI_API_KEY",
 )
 OMP_READ_TOOLS = ("execution_read", "execution_glob", "execution_grep")
+OMP_WRITE_TOOLS = (*OMP_READ_TOOLS, "execution_write", "execution_edit")
 _PACKET = "packet-only-no-tools"
 _GROUNDED = "read-only-no-shell"
+_WRITER = "workspace-write-no-shell"
+OMP_WRITER_SELECTORS = frozenset(
+    {
+        "kimi-code/k3",
+        GROUNDED_OMP_SELECTORS_BY_PROVIDER["openai-codex"],
+    }
+)
 
 
 def omp_sdk_root(*, environment: Mapping[str, str] | None = None) -> Path:
@@ -119,8 +127,10 @@ class OmpInvocation:
     system_prompt: str
 
 
-def validate_omp_command(command: list[str], cwd: Path) -> OmpInvocation:
-    """Accept only our exact command grammar, never arbitrary OMP overrides."""
+def validate_omp_command(
+    command: list[str], cwd: Path, *, historical: bool = False
+) -> OmpInvocation:
+    """Validate exact grammar; historical retrieval may name retired read-only models."""
     if not command or Path(command[0]).name != "omp":
         raise ValueError("OMP execution requires the omp harness identity")
     values: dict[str, str] = {}
@@ -160,20 +170,24 @@ def validate_omp_command(command: list[str], cwd: Path) -> OmpInvocation:
     if "--cwd" not in values or (cwd / values["--cwd"]).resolve() != cwd.resolve():
         raise ValueError("OMP command cwd differs from execution snapshot")
     policy = values.get("--execution-tool-policy", "")
-    if policy not in {_PACKET, _GROUNDED}:
+    if policy not in {_PACKET, _GROUNDED, _WRITER}:
         raise ValueError("OMP command lacks its enforced tool policy")
     selector = values.get("--model", "")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", selector):
         raise ValueError("OMP requires an exact provider/model selector")
-    if policy == _GROUNDED and selector not in GROUNDED_OMP_SELECTORS:
+    grounded_selectors = GROUNDED_OMP_TRANSCRIPT_SELECTORS if historical else GROUNDED_OMP_SELECTORS
+    if policy == _GROUNDED and selector not in grounded_selectors:
         permitted = ", ".join(GROUNDED_OMP_SELECTORS_BY_PROVIDER.values())
         raise ValueError(f"grounded OMP selector must be registered: {permitted}")
+    if policy == _WRITER and selector not in OMP_WRITER_SELECTORS:
+        permitted = ", ".join(sorted(OMP_WRITER_SELECTORS))
+        raise ValueError(f"writer OMP selector must be registered: {permitted}")
     if policy == _PACKET and booleans != boolean_flags:
         raise ValueError(
             "packet OMP must disable tools, session, extensions, skills, rules and LSP"
         )
-    if policy == _GROUNDED and booleans:
-        raise ValueError("grounded OMP cannot masquerade as packet-only execution")
+    if policy in {_GROUNDED, _WRITER} and booleans:
+        raise ValueError("tool-enabled OMP cannot masquerade as packet-only execution")
     return OmpInvocation(selector, policy, prompt, values.get("--system-prompt", ""))
 
 
@@ -255,11 +269,19 @@ def omp_transcript(
         r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", selected
     ):
         raise ValueError("OMP execution lacks exact selector")
-    if not isinstance(selected_policy, str) or selected_policy not in {_PACKET, _GROUNDED}:
+    if not isinstance(selected_policy, str) or selected_policy not in {_PACKET, _GROUNDED, _WRITER}:
         raise ValueError("OMP execution has unknown policy")
     if selected_policy == _GROUNDED and selected not in GROUNDED_OMP_TRANSCRIPT_SELECTORS:
         raise ValueError("OMP grounded inference identity was never registered")
-    expected_tools = list(OMP_READ_TOOLS) if selected_policy == _GROUNDED else []
+    if selected_policy == _WRITER and selected not in OMP_WRITER_SELECTORS:
+        raise ValueError("OMP writer inference identity was never registered")
+    expected_tools = (
+        list(OMP_READ_TOOLS)
+        if selected_policy == _GROUNDED
+        else list(OMP_WRITE_TOOLS)
+        if selected_policy == _WRITER
+        else []
+    )
     if header.get("tools") != expected_tools:
         raise ValueError("OMP tool allowlist attestation mismatch")
     for key, expected in (
@@ -363,19 +385,19 @@ def omp_transcript(
             if "isError" in event and not isinstance(event["isError"], bool):
                 raise ValueError("OMP tool result error flag is malformed")
             if not event.get("isError", False):
-                details = _object(result.get("details"), "read evidence")
+                details = _object(result.get("details"), "tool evidence")
                 paths = details.get("paths")
                 if not isinstance(paths, list) or any(
                     not isinstance(path, str) or not Path(path).is_absolute() for path in paths
                 ):
-                    raise ValueError("OMP read evidence lacks absolute paths")
+                    raise ValueError("OMP tool evidence lacks absolute paths")
                 root = Path(str(header.get("cwd")))
                 if any(
                     ".." in Path(path).parts
                     or (Path(path) != root and root not in Path(path).parents)
                     for path in paths
                 ):
-                    raise ValueError("OMP read evidence escapes snapshot")
+                    raise ValueError("OMP tool evidence escapes snapshot")
             ended[call_id] = event
         elif kind == "agent_end":
             agent_end = True
@@ -473,6 +495,8 @@ def _exec_sdk() -> None:
     _, root, bun, selector, policy, system_prompt = sys.argv[1:]
     if policy == _GROUNDED and selector not in GROUNDED_OMP_SELECTORS:
         raise SystemExit("grounded OMP selector is not registered")
+    if policy == _WRITER and selector not in OMP_WRITER_SELECTORS:
+        raise SystemExit("writer OMP selector is not registered")
     environment = omp_launch_environment()
     snapshot_cwd = os.getcwd()
     # Bun reads bunfig.toml before our code runs: bootstrap only in the trusted
