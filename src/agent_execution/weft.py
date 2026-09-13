@@ -705,9 +705,11 @@ class WeftCommandRunner:
                 self.sleep(min(delay, remaining))
             try:
                 artifact = self._artifact(job_id, cwd, deadline)
-            except (WeftExecutionAmbiguous, WeftExecutionDetached, OSError) as error:
+            except (WeftExecutionAmbiguous, WeftExecutionDetached) as error:
                 artifact = CommandResult(2, "", str(error))
                 break
+            except OSError as error:
+                artifact = CommandResult(2, "", str(error))
             if artifact.exit_status == 0:
                 return artifact
         return artifact
@@ -1106,7 +1108,7 @@ class WeftCommandRunner:
         artifact: CommandResult | None = None
         artifact_detail = ""
         try:
-            artifact = self._artifact(job_id, cwd, deadline)
+            artifact = self._worker_result(job_id, cwd, deadline)
         except (WeftExecutionAmbiguous, WeftExecutionDetached, OSError) as error:
             artifact_detail = str(error)
         if artifact is not None and artifact.exit_status == 0:
