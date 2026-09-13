@@ -976,16 +976,21 @@ class WeftCommandRunner:
             execution["host_observation"] = observation
             return
         version = payload.get("version")
-        if version != WEFT_JOB_LIST_VERSION:
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or version != WEFT_JOB_LIST_VERSION
+        ):
             observation["unobserved"] = f"listing version {version!r}"
             execution["host_observation"] = observation
             return
         rows = payload.get("jobs")
         rows = rows if isinstance(rows, list) else []
         for row in rows:
-            if not isinstance(row, dict) or str(row.get("job_id") or "") != job_id:
+            if not isinstance(row, dict) or row.get("job_id") != job_id:
                 continue
-            host = str(row.get("host") or "").strip()
+            host_value = row.get("host")
+            host = host_value.strip() if isinstance(host_value, str) else ""
             if host:
                 observation["observed_host"] = host
                 requested = str(execution.get("host") or "").strip()

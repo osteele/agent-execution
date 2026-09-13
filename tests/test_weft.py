@@ -162,6 +162,8 @@ class AdmissionTests(unittest.TestCase):
             return outcome
         if command[1:3] == ["list", "jobs"]:
             return CommandResult(0, self.jobs, "")
+        if command[1:3] == ["job", "list"]:
+            return CommandResult(0, self.jobs, "")
         if command[1] == "status":
             if isinstance(self.status, subprocess.TimeoutExpired):
                 raise self.status
@@ -324,6 +326,45 @@ class AdmissionTests(unittest.TestCase):
         self.hosts = CommandResult(1, "", "inventory unavailable")
         self.submissions = [CommandResult(0, receipt(), "")]
         self.assert_remote(self.run_dispatch())
+
+    def test_observed_host_requires_exact_integer_listing_version(self) -> None:
+        row: dict[str, object] = {"job_id": "wj42", "host": "wi7777"}
+        self.jobs = listing(row)
+        execution: dict[str, object] = {"host": "studio"}
+        self.runner.record_observed_host("wj42", self.root, execution)
+        observation = execution["host_observation"]
+        self.assertIsInstance(observation, dict)
+        assert isinstance(observation, dict)
+        self.assertEqual(observation["observed_host"], "wi7777")
+        self.assertEqual(observation["differs_from_requested"], "studio")
+
+        for version in (True, 1.0):
+            with self.subTest(version=version):
+                self.jobs = listing(row, version=version)
+                execution = {"host": "studio"}
+                self.runner.record_observed_host("wj42", self.root, execution)
+                observation = execution["host_observation"]
+                self.assertIsInstance(observation, dict)
+                assert isinstance(observation, dict)
+                self.assertEqual(observation["unobserved"], f"listing version {version!r}")
+                self.assertNotIn("observed_host", observation)
+
+    def test_observed_host_requires_string_job_and_host_fields(self) -> None:
+        cases: tuple[tuple[dict[str, object], str, str], ...] = (
+            ({"job_id": 42, "host": "studio"}, "42", "job not in listing window"),
+            ({"job_id": "wj42", "host": 42}, "wj42", "row carries no host"),
+            ({"job_id": "wj42", "host": ["studio"]}, "wj42", "row carries no host"),
+        )
+        for row, job_id, reason in cases:
+            with self.subTest(row=row):
+                self.jobs = listing(row)
+                execution: dict[str, object] = {"host": "studio"}
+                self.runner.record_observed_host(job_id, self.root, execution)
+                observation = execution["host_observation"]
+                self.assertIsInstance(observation, dict)
+                assert isinstance(observation, dict)
+                self.assertEqual(observation["unobserved"], reason)
+                self.assertNotIn("observed_host", observation)
 
     def test_broken_watcher_recovers_or_detaches_without_fallback(self) -> None:
         self.submissions = [CommandResult(0, receipt(), "")]
