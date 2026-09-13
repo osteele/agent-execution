@@ -18,7 +18,6 @@ from agent_execution.worker import (
     codex_session_id,
     execute_worker,
 )
-
 from tests.support.omp import omp_command, omp_output
 
 
@@ -462,7 +461,13 @@ class WorkerResultTests(unittest.TestCase):
             with self.subTest(export_timeout=export_timeout):
                 exports: list[str] = []
 
-                def invoke(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
+                def invoke(
+                    command: list[str],
+                    cwd: Path,
+                    timeout: float | None,
+                    exports: list[str] = exports,
+                    export_timeout: bool = export_timeout,
+                ) -> CommandResult:
                     if command == ["/tools/ctx", "--version"]:
                         return CommandResult(0, "ctx 1.0.2\n", "")
                     if command[0] == "/tools/codex":

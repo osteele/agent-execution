@@ -532,8 +532,10 @@ class WeftCommandRunner:
 
         scope = "any inventory host" if self.host == WEFT_AUTO_HOST else f"host {self.host!r}"
         details = [
-            f"Weft cannot place this dispatch: {scope} does not declare every required "
-            f"capability ({', '.join(required)})"
+            (
+                f"Weft cannot place this dispatch: {scope} does not declare every required "
+                f"capability ({', '.join(required)})"
+            )
         ]
         if not candidates:
             details.append(

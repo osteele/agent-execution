@@ -18,6 +18,10 @@ dev = [
 [tool.ruff]
 line-length = 100
 
+[tool.ruff.lint]
+# Public parsers use ValueError uniformly, so TypeError migration is rejected.
+ignore = ["TRY004"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_execution"]
 

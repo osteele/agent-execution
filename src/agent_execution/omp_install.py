@@ -21,6 +21,7 @@ def _check_sdk(root: Path, bun: str) -> None:
     result = subprocess.run(
         [bun, "-e", 'await import("@oh-my-pi/pi-coding-agent");'],
         cwd=root,
+        check=False,
         capture_output=True,
         text=True,
         timeout=60,
@@ -58,8 +59,9 @@ def install_omp_runtime() -> None:
             result = subprocess.run(
                 [bun, "install", "--frozen-lockfile", "--ignore-scripts"],
                 cwd=stage,
-                capture_output=True,
                 text=True,
+                capture_output=True,
+                check=False,
                 timeout=300,
             )
             if result.returncode:

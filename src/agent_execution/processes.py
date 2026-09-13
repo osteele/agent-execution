@@ -433,7 +433,7 @@ class guard_live_groups:
     processes that would otherwise outlive this interpreter.
     """
 
-    def __enter__(self) -> guard_live_groups:
+    def __enter__(self) -> guard_live_groups:  # noqa: PYI034
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
@@ -483,7 +483,7 @@ def run_in_process_group(
             *launch_command,
         ]
     try:
-        process = subprocess.Popen(  # noqa: S603 - command is built from pinned adapter names
+        process = subprocess.Popen(
             launch_command,
             cwd=cwd,
             stdin=subprocess.PIPE,

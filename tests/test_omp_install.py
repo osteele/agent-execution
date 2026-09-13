@@ -26,12 +26,14 @@ class OmpRuntimeInstallTests(unittest.TestCase):
             )
             bun.chmod(0o755)
             root = directory / "runtime"
-            with mock.patch.dict(
-                os.environ,
-                {"PATH": str(tools), "AGENT_EXECUTION_OMP_SDK_ROOT": str(root)},
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"PATH": str(tools), "AGENT_EXECUTION_OMP_SDK_ROOT": str(root)},
+                ),
+                self.assertRaisesRegex(ValueError, "native dependency missing"),
             ):
-                with self.assertRaisesRegex(ValueError, "native dependency missing"):
-                    install_omp_runtime()
+                install_omp_runtime()
             self.assertFalse(root.exists())
             self.assertEqual(list(directory.glob(".runtime-*")), [])
 
@@ -45,7 +47,7 @@ class OmpRuntimeInstallTests(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, {"AGENT_EXECUTION_OMP_SDK_ROOT": str(root)}),
                 mock.patch("agent_execution.omp_install.shutil.which", return_value=sys.executable),
+                self.assertRaisesRegex(ValueError, "refusing to replace"),
             ):
-                with self.assertRaisesRegex(ValueError, "refusing to replace"):
-                    install_omp_runtime()
+                install_omp_runtime()
             self.assertEqual((root / "bun.lock").read_text(), "existing lockfile\n")
