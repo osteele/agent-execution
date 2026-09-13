@@ -178,9 +178,8 @@ class WeftRetrievalOutcome:
     job_status: str | None = None
 
 
-def _dispatched_options(record: dict[str, object]) -> dict[str, str]:
+def parse_worker_command(command: object) -> dict[str, str]:
     """Parse the single worker argv emitted by _remote_command."""
-    command = record.get("command")
     if not isinstance(command, str):
         raise ValueError("accepted command is missing")
     # Reject shell composition instead of attributing another invocation's flags.
@@ -251,7 +250,7 @@ def submitted_job_from_listing(raw: str, *, model_call_id: str) -> str | None:
             continue
         entry = cast(dict[str, object], row)
         try:
-            options = _dispatched_options(entry)
+            options = parse_worker_command(entry.get("command"))
         except ValueError:
             continue
         job_id = entry.get("job_id")
@@ -1031,7 +1030,7 @@ class WeftCommandRunner:
 
     def _dispatched_source(self, record: dict[str, object]) -> str:
         """Recover a legacy pin from the accepted command, never the worker artifact."""
-        options = _dispatched_options(record)
+        options = parse_worker_command(record.get("command"))
 
         def one_value(flag: str) -> str:
             if flag not in options:
