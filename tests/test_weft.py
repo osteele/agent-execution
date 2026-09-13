@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from agent_execution.command import CommandResult
+from agent_execution.identity import worker_evidence_path
 from agent_execution.omp_execution import omp_transcript
 from agent_execution.weft import (
     WeftAdmissionCancelled,
@@ -60,27 +61,41 @@ def dispatch_command(key: str = KEY) -> str:
             key,
             "--expect-source-sha256",
             SOURCE,
+            "--expect-protocol",
+            str(WORKER_PROTOCOL_VERSION),
+            "--expect-prompt-sha256",
+            hashlib.sha256(b"review").hexdigest(),
             "--",
-            "omp",
-            "-p",
-            "-",
+            *omp_command(".", prompt="-"),
         ]
     )
 
 
-def worker_artifact(prompt: str = "review", *, packet: bool = False) -> str:
+def worker_artifact(
+    prompt: str = "review",
+    *,
+    packet: bool = False,
+    writer: bool = False,
+    selector: str = "anthropic/claude-opus-5",
+    protocol: int = WORKER_PROTOCOL_VERSION,
+) -> str:
     stdout = omp_output(
         cwd="/remote/project",
+        selector=selector,
         prompt=prompt,
         final="remote answer",
-        policy="packet-only-no-tools" if packet else "read-only-no-shell",
+        policy="packet-only-no-tools"
+        if packet
+        else "workspace-write-no-shell"
+        if writer
+        else "read-only-no-shell",
     )
     return WorkerResult(
         model_call_id=KEY,
         provider="omp-packet" if packet else "omp",
         status="completed",
         worker_version="0.1.0",
-        worker_protocol_version=WORKER_PROTOCOL_VERSION,
+        worker_protocol_version=protocol,
         worker_source_sha256=SOURCE,
         prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
         ctx_version="",
@@ -173,6 +188,8 @@ class AdmissionTests(unittest.TestCase):
             return self.artifact
         if command[1] == "log":
             return CommandResult(0, "", "")
+        if command[1:3] == ["job", "mark-processed"]:
+            return CommandResult(0, "", "")
         raise AssertionError(command)
 
     def run_dispatch(
@@ -199,6 +216,78 @@ class AdmissionTests(unittest.TestCase):
     def test_accepted_receipt_survives_nonzero_submit_exit(self) -> None:
         self.submissions = [CommandResult(-15, receipt(), "reader interrupted")]
         self.assert_remote(self.run_dispatch())
+
+    def test_protocol_two_publishes_and_retrieves_the_protected_call_path(self) -> None:
+        self.submissions = [CommandResult(0, receipt(), "")]
+        result = self.run_dispatch()
+        self.assert_remote(result)
+        submitted = next(argv for argv, _, _ in self.calls if argv[1] == "run")
+        self.assertEqual(
+            submitted[submitted.index("--produces") + 1],
+            ".agent-execution/results/model-call-7.json",
+        )
+        remote = shlex.split(submitted[-1])
+        self.assertNotIn("--evidence-out", remote)
+        self.assertEqual(remote[remote.index("--expect-protocol") + 1], "2")
+        artifact = next(argv for argv, _, _ in self.calls if argv[1] == "artifact")
+        self.assertEqual(artifact[-1], worker_evidence_path(KEY))
+        assert result.execution is not None
+        self.assertEqual(result.execution["expected_worker_protocol_version"], 2)
+        summary = result.execution["worker_result"]
+        assert isinstance(summary, dict)
+        self.assertEqual(summary["artifact_path"], artifact[-1])
+
+    def test_writer_dispatch_receipt_survives_retrieval_and_recovery(self) -> None:
+        for route in ("receipt", "probe", "submission_timeout", "lost_watcher"):
+            with self.subTest(route=route):
+                self.calls.clear()
+                self.submissions = [
+                    subprocess.TimeoutExpired(["weft", "run"], 30)
+                    if route == "submission_timeout"
+                    else CommandResult(0, "unreadable" if route == "probe" else receipt(), "")
+                ]
+                self.status = CommandResult(
+                    -15 if route == "lost_watcher" else 0, "", "watcher interrupted"
+                )
+                self.artifact = CommandResult(
+                    0,
+                    worker_artifact(writer=True, selector="openai-codex/gpt-6-astra"),
+                    "",
+                )
+
+                def invoke(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
+                    if command[1:3] == ["list", "jobs"]:
+                        submitted = next(argv for argv, _, _ in self.calls if argv[1] == "run")
+                        self.jobs = listing({"job_id": "wj42", "command": submitted[-1]})
+                    return self.invoke(command, cwd, timeout)
+
+                self.runner.invoke = invoke
+                command = omp_command(
+                    str(self.root), writer=True, selector="openai-codex/gpt-6-astra"
+                )
+                if route == "submission_timeout":
+                    with self.assertRaises(WeftExecutionDetached):
+                        self.runner(command, self.root, 30.0)
+                else:
+                    self.assert_remote(self.runner(command, self.root, 30.0))
+                assert self.runner.last_execution is not None
+                execution = json.loads(json.dumps(self.runner.last_execution))
+                # A new consumer must use only the durable dispatch receipt,
+                # not the original runner's in-memory invocation policy.
+                consumer = WeftCommandRunner(
+                    host="studio",
+                    agent="omp",
+                    model_call_id=KEY,
+                    fallback=None,
+                    invoke=self.invoke,
+                    clock=lambda: self.now,
+                    sleep=self.sleep,
+                )
+                result = consumer.retrieve(job_id="wj42", cwd=self.root, execution=execution)
+                assert isinstance(result, CommandResult)
+                self.assert_remote(result)
+                result.mark_consumed()
+                self.assertTrue(execution["processed"])
 
     def test_receipt_at_deadline_recovers_with_fresh_artifact_budget(self) -> None:
         self.submit_elapsed = 30.0

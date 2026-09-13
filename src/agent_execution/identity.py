@@ -9,7 +9,19 @@ The SDK version and runtime installation are checked separately before execution
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
+
+
+def worker_evidence_path(model_call_id: str) -> str:
+    """Return the protocol-2 evidence location in the model-inaccessible namespace."""
+    if not isinstance(model_call_id, str) or not re.fullmatch(
+        r"[a-z0-9][a-z0-9_-]{0,127}", model_call_id
+    ):
+        raise ValueError(
+            "model call identity must be 1–128 lowercase ASCII letters, digits, _ or -"
+        )
+    return f".agent-execution/results/{model_call_id}.json"
 
 
 def source_sha256(package_root: Path | None = None) -> str:

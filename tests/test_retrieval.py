@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from agent_execution.command import CommandResult
+from agent_execution.identity import worker_evidence_path
 from agent_execution.weft import (
     WeftCommandRunner,
     WeftJobFailure,
@@ -43,7 +44,7 @@ def native_artifact(*, prompt: str = "review") -> str:
         provider="codex",
         status="completed",
         worker_version="0.1.0",
-        worker_protocol_version=WORKER_PROTOCOL_VERSION,
+        worker_protocol_version=1,
         worker_source_sha256=SOURCE,
         prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
         ctx_version="ctx-1",
@@ -75,6 +76,9 @@ class RetrievalTests(unittest.TestCase):
             "transport": "weft",
             "host": "studio",
             "expected_worker_source_sha256": SOURCE,
+            "expected_worker_protocol_version": WORKER_PROTOCOL_VERSION,
+            "worker_result_path": worker_evidence_path(KEY),
+            "omp_policy": "read-only-no-shell",
             "prompt_sha256": hashlib.sha256(b"review").hexdigest(),
             "omp_selector": "anthropic/claude-opus-5",
         }
@@ -129,6 +133,7 @@ class RetrievalTests(unittest.TestCase):
         result = self.retrieve()
         self.assertIsInstance(result, CommandResult)
         assert isinstance(result, CommandResult)
+        self.assertEqual(result.exit_status, 0, result.stderr)
         self.assertEqual(result.stdout, omp_output(cwd="/remote/project", final="remote answer"))
         self.assertEqual(self.processing()["state"], "pending")
         self.assertNotIn("processed", self.execution)
@@ -220,7 +225,7 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(self.execution["expected_worker_source_sha256"], SOURCE)
         self.assertEqual(
             [command[1:3] for command, _, _ in self.calls],
-            [["artifact", "cat"], ["job", "inspect"]],
+            [["job", "inspect"], ["artifact", "cat"]],
         )
 
     def test_untrusted_legacy_pin_is_rejected(self) -> None:
@@ -230,6 +235,90 @@ class RetrievalTests(unittest.TestCase):
         self.assertIsInstance(outcome, WeftRetrievalOutcome)
         assert isinstance(outcome, WeftRetrievalOutcome)
         self.assertEqual(outcome.status, "unknown")
+
+    def test_historical_read_only_paths_follow_the_accepted_protocol(self) -> None:
+        for path in (
+            "outputs/agent-execution-worker-result.json",
+            f"outputs/agent-execution-worker-result-{KEY}.json",
+        ):
+            with self.subTest(path=path):
+                self.calls.clear()
+                self.execution = {}
+                command = dispatch_command().replace("--expect-protocol 2", "--expect-protocol 1")
+                command = command.replace(" -- ", f" --evidence-out {path} -- ", 1)
+                self.inspect = CommandResult(0, inspect_record(command=command), "")
+                self.artifact_calls = [CommandResult(0, worker_artifact(protocol=1), "")]
+                result = self.retrieve()
+                assert isinstance(result, CommandResult)
+                self.assertEqual(result.exit_status, 0, result.stderr)
+                self.assertEqual(self.execution["expected_worker_protocol_version"], 1)
+                self.assertEqual(self.calls[-1][0][-1], path)
+                summary = self.execution["worker_result"]
+                assert isinstance(summary, dict)
+                self.assertEqual(summary["artifact_path"], path)
+
+    def test_retired_selector_recovers_without_authorizing_new_execution(self) -> None:
+        selector = "anthropic/claude-opus-4-6"
+        path = f"outputs/agent-execution-worker-result-{KEY}.json"
+        self.execution.pop("expected_worker_protocol_version")
+        self.execution.pop("worker_result_path")
+        self.execution["omp_selector"] = selector
+        command = dispatch_command().replace("--expect-protocol 2", "--expect-protocol 1")
+        command = command.replace("anthropic/claude-opus-5", selector)
+        command = command.replace(" -- ", f" --evidence-out {path} -- ", 1)
+        self.inspect = CommandResult(0, inspect_record(command=command), "")
+        self.artifact_calls = [CommandResult(0, worker_artifact(protocol=1, selector=selector), "")]
+        result = self.retrieve()
+        self.assertIsInstance(result, CommandResult)
+        assert isinstance(result, CommandResult)
+        self.assertEqual(result.exit_status, 0, result.stderr)
+        self.assertEqual(self.calls[-1][0][-1], path)
+        from agent_execution.omp_execution import validate_omp_command
+        from tests.support.omp import omp_command
+
+        with self.assertRaises(ValueError):
+            validate_omp_command(omp_command(".", selector=selector), Path("."))
+
+    def test_result_cannot_downgrade_the_retained_protocol(self) -> None:
+        self.artifact_calls = [CommandResult(0, worker_artifact(protocol=1), "")]
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        self.assertEqual(result.exit_status, 1)
+        self.assertEqual(self.processing()["step"], "worker_protocol_validation")
+        self.assertEqual(self.execution["expected_worker_protocol_version"], 2)
+
+    def test_result_claims_cannot_supply_missing_dispatch_protocol(self) -> None:
+        del self.execution["expected_worker_protocol_version"]
+        self.inspect = CommandResult(
+            0, inspect_record(command=dispatch_command().replace("--expect-protocol 2 ", "")), ""
+        )
+        outcome = self.retrieve()
+        assert isinstance(outcome, WeftRetrievalOutcome)
+        self.assertEqual(outcome.status, "unknown")
+        self.assertEqual([argv[1:3] for argv, _, _ in self.calls], [["job", "inspect"]])
+
+    def test_unprotected_legacy_paths_and_legacy_writer_results_are_unknown(self) -> None:
+        for path, policy in (
+            ("outputs/custom.json", "read-only-no-shell"),
+            (f"outputs/agent-execution-worker-result-{KEY}.json", "workspace-write-no-shell"),
+        ):
+            with self.subTest(path=path, policy=policy):
+                self.execution.update(
+                    expected_worker_protocol_version=1, worker_result_path=path, omp_policy=policy
+                )
+                outcome = self.retrieve()
+                assert isinstance(outcome, WeftRetrievalOutcome)
+                self.assertEqual(outcome.status, "unknown")
+                self.assertEqual(self.calls, [])
+
+    def test_protocol_two_rejects_accepted_caller_selected_path(self) -> None:
+        self.execution = {}
+        command = dispatch_command().replace(" -- ", " --evidence-out outputs/custom.json -- ", 1)
+        self.inspect = CommandResult(0, inspect_record(command=command), "")
+        outcome = self.retrieve()
+        assert isinstance(outcome, WeftRetrievalOutcome)
+        self.assertEqual(outcome.status, "unknown")
+        self.assertIn("does not accept --evidence-out", outcome.detail)
 
     def test_file_ingestion_uses_the_same_contract(self) -> None:
         artifact = self.root / "artifact.json"
@@ -250,8 +339,68 @@ class RetrievalTests(unittest.TestCase):
         self.assertIsInstance(result, CommandResult)
         self.assertEqual(self.calls, [])
 
+    def test_writer_file_ingestion_requires_explicit_dispatch_authority(self) -> None:
+        artifact = self.root / "writer-artifact.json"
+        artifact.write_text(
+            worker_artifact(writer=True, selector="openai-codex/gpt-6-astra"),
+            encoding="utf-8",
+        )
+        self.execution["omp_selector"] = "openai-codex/gpt-6-astra"
+        # Historical receipts do not grant writes, even for a writer-capable
+        # provider returning a valid writer transcript.
+        refused = self.runner.retrieve_from_file(
+            job_id=JOB,
+            cwd=self.root,
+            execution=self.execution,
+            artifact_path=artifact,
+        )
+        assert isinstance(refused, CommandResult)
+        self.assertEqual(refused.exit_status, 1)
+        refused.mark_consumed()
+        self.assertEqual(self.calls, [])
+
+        self.execution["omp_policy"] = "workspace-write-no-shell"
+        accepted = self.runner.retrieve_from_file(
+            job_id=JOB,
+            cwd=self.root,
+            execution=self.execution,
+            artifact_path=artifact,
+        )
+        assert isinstance(accepted, CommandResult)
+        self.assertEqual(accepted.exit_status, 0, accepted.stderr)
+        self.assertIn("remote answer", accepted.stdout)
+        accepted.mark_consumed()
+        self.assertTrue(self.execution["processed"])
+
+    def test_recorded_policy_mismatches_refuse_consumption(self) -> None:
+        self.execution["omp_selector"] = "openai-codex/gpt-6-astra"
+        for writer, policy in (
+            (True, "read-only-no-shell"),
+            (False, "workspace-write-no-shell"),
+            (False, None),
+        ):
+            with self.subTest(writer=writer, policy=policy):
+                self.execution["omp_policy"] = policy
+                self.artifact_calls = [
+                    CommandResult(
+                        0,
+                        worker_artifact(writer=writer, selector="openai-codex/gpt-6-astra"),
+                        "",
+                    )
+                ]
+                result = self.retrieve()
+                assert isinstance(result, CommandResult)
+                self.assertEqual(result.exit_status, 1)
+                self.assertEqual(self.processing()["state"], "not_marked")
+                result.mark_consumed()
+                self.assertEqual(self.mark, [CommandResult(0, "", "")])
+
     def test_native_file_ingestion_still_refuses_new_execution(self) -> None:
-        execution: dict[str, object] = {"expected_worker_source_sha256": SOURCE}
+        execution: dict[str, object] = {
+            "expected_worker_source_sha256": SOURCE,
+            "expected_worker_protocol_version": 1,
+            "worker_result_path": f"outputs/agent-execution-worker-result-{KEY}.json",
+        }
         artifact = self.root / "artifact.json"
         artifact.write_text(native_artifact())
         self.runner = WeftCommandRunner(

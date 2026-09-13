@@ -1,10 +1,13 @@
 import { afterEach, expect, test } from "bun:test";
 import {
+	chmod,
+	link,
 	mkdtemp,
 	mkdir,
 	readFile,
 	realpath,
 	rm,
+	stat,
 	symlink,
 	writeFile,
 } from "node:fs/promises";
@@ -15,6 +18,7 @@ import {
 	confinedPath,
 	readTools,
 	SDK_VERSION,
+	writeTools,
 } from "../src/agent_execution/omp_sdk";
 
 const temporary: string[] = [];
@@ -87,3 +91,192 @@ test("read, glob and literal search expose served paths but neither execute nor 
 		"first\nneedle\nlast\n",
 	);
 });
+
+test("workspace-write tools change snapshot bytes and refuse ambiguous edits", async () => {
+	const root = await snapshot();
+	const sdkRoot =
+		process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
+		join(homedir(), ".local/share/agent-execution/omp-sdk", SDK_VERSION);
+	const sdk = await import(
+		pathToFileURL(
+			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
+		).href,
+	);
+	const tools = writeTools(sdk.z, root);
+	const write = tools.find((tool) => tool.name === "execution_write")!;
+	const edit = tools.find((tool) => tool.name === "execution_edit")!;
+	const written = await write.execute("write-1", {
+		path: "created.txt",
+		content: "alpha\n",
+	});
+	expect(written.details.paths).toEqual([join(root, "created.txt")]);
+	expect(await readFile(join(root, "created.txt"), "utf8")).toBe("alpha\n");
+	await edit.execute("edit-1", {
+		path: "created.txt",
+		old_text: "alpha",
+		new_text: "beta",
+	});
+	expect(await readFile(join(root, "created.txt"), "utf8")).toBe("beta\n");
+	await write.execute("write-2", {
+		path: "source.txt",
+		content: "same\nsame\n",
+	});
+	await expect(
+		edit.execute("ambiguous", {
+			path: "source.txt",
+			old_text: "same",
+			new_text: "changed",
+		}),
+	).rejects.toThrow("ambiguous");
+});
+
+test("workspace-write tools refuse escapes symlinks and metadata", async () => {
+	const root = await snapshot();
+	const metadataPaths = [".omp/config", ".OmP/config", ".GiT/config"];
+	for (const path of metadataPaths) {
+		await mkdir(join(root, path.split("/")[0]), { recursive: true });
+		await writeFile(join(root, path), "metadata\n");
+	}
+	const sdkRoot =
+		process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
+		join(homedir(), ".local/share/agent-execution/omp-sdk", SDK_VERSION);
+	const sdk = await import(
+		pathToFileURL(
+			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
+		).href,
+	);
+	const tools = writeTools(sdk.z, root);
+	const write = tools.find((tool) => tool.name === "execution_write")!;
+	const edit = tools.find((tool) => tool.name === "execution_edit")!;
+	for (const path of [
+		"../secret.txt",
+		"escape",
+		".git/config",
+		".omp/config",
+		".OmP/config",
+		".GiT/config",
+		"./.omp/config",
+		".omp/../source.txt",
+		"https://example.org/source",
+		"/tmp/outside",
+		"source.txt\0",
+	]) {
+		await expect(
+			write.execute(`blocked-${path}`, { path, content: "changed\n" }),
+		).rejects.toThrow();
+	}
+	for (const path of metadataPaths) {
+		await expect(
+			edit.execute(`blocked-edit-${path}`, {
+				path,
+				old_text: "metadata",
+				new_text: "changed",
+			}),
+		).rejects.toThrow();
+		expect(await readFile(join(root, path), "utf8")).toBe("metadata\n");
+	}
+	expect(await readFile(join(root, "source.txt"), "utf8")).toBe(
+		"first\nneedle\nlast\n",
+	);
+	expect(await readFile(join(root, ".omp", "config"), "utf8")).toBe(
+		"metadata\n",
+	);
+});
+
+test("a writer cannot overwrite another call's authoritative result", async () => {
+	const root = await snapshot();
+	const evidence = [
+		".agent-execution/results/other-call.json",
+		".Agent-Execution/results/other-call.json",
+		"outputs/agent-execution-worker-result-other-call.json",
+		"outputs/AGENT-EXECUTION-WORKER-RESULT.json",
+	];
+	for (const path of evidence) {
+		await mkdir(join(root, path.substring(0, path.lastIndexOf("/"))), { recursive: true });
+		await writeFile(join(root, path), '{"model_call_id":"other-call","status":"completed"}');
+	}
+	const sdkRoot =
+		process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
+		join(homedir(), ".local/share/agent-execution/omp-sdk", SDK_VERSION);
+	// SDK location is selected by the runtime environment, not a project dependency.
+	const sdk = await import(
+		pathToFileURL(
+			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
+		).href,
+	);
+	const tools = writeTools(sdk.z, root);
+	const write = tools.find((tool) => tool.name === "execution_write")!;
+	const edit = tools.find((tool) => tool.name === "execution_edit")!;
+	for (const path of evidence) {
+		const before = await readFile(join(root, path), "utf8");
+		await expect(
+			write.execute("writer-overwrite", { path, content: '{"status":"completed","forged":true}' }),
+		).rejects.toThrow();
+		await expect(
+			edit.execute("writer-edit", { path, old_text: "completed", new_text: "forged" }),
+		).rejects.toThrow();
+		expect(await readFile(join(root, path), "utf8")).toBe(before);
+	}
+	await write.execute("ordinary-output", { path: "outputs/report.json", content: '{"report":true}' });
+	expect(await readFile(join(root, "outputs/report.json"), "utf8")).toBe('{"report":true}');
+});
+
+test("workspace-write replacement does not mutate outside hardlink targets", async () => {
+	const parent = await realpath(await mkdtemp(join(tmpdir(), "omp-policy-")));
+	temporary.push(parent);
+	const root = join(parent, "snapshot");
+	await mkdir(root);
+	await writeFile(join(parent, "shared.txt"), "outside\n");
+	await link(join(parent, "shared.txt"), join(root, "linked.txt"));
+	const sdkRoot =
+		process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
+		join(homedir(), ".local/share/agent-execution/omp-sdk", SDK_VERSION);
+	const sdk = await import(
+		pathToFileURL(
+			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
+		).href,
+	);
+	const write = writeTools(sdk.z, root).find(
+		(tool) => tool.name === "execution_write",
+	)!;
+	await write.execute("replace-hardlink", {
+		path: "linked.txt",
+		content: "inside\n",
+	});
+	expect(await readFile(join(root, "linked.txt"), "utf8")).toBe("inside\n");
+	expect(await readFile(join(parent, "shared.txt"), "utf8")).toBe("outside\n");
+});
+
+
+test("workspace-write replacement preserves existing executable mode", async () => {
+	const root = await snapshot();
+	const script = join(root, "run.sh");
+	await writeFile(script, "#!/bin/sh\necho old\n");
+	await chmod(script, 0o755);
+	const sdkRoot =
+		process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
+		join(homedir(), ".local/share/agent-execution/omp-sdk", SDK_VERSION);
+	const sdk = await import(
+		pathToFileURL(
+			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
+		).href,
+	);
+	const tools = writeTools(sdk.z, root);
+	const write = tools.find((tool) => tool.name === "execution_write")!;
+	const edit = tools.find((tool) => tool.name === "execution_edit")!;
+	const beforeMode = (await stat(script)).mode & 0o777;
+
+	await write.execute("replace-executable", {
+		path: "run.sh",
+		content: "#!/bin/sh\necho new\n",
+	});
+	expect((await stat(script)).mode & 0o777).toBe(beforeMode);
+	await edit.execute("edit-executable", {
+		path: "run.sh",
+		old_text: "new",
+		new_text: "newer",
+	});
+	expect(await readFile(script, "utf8")).toBe("#!/bin/sh\necho newer\n");
+	expect((await stat(script)).mode & 0o777).toBe(beforeMode);
+});
+

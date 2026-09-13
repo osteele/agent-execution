@@ -13,11 +13,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from agent_execution.credentials import observe_credential_basis
+from agent_execution.identity import worker_evidence_path
 from agent_execution.omp_execution import require_omp_sdk
 from agent_execution.processes import install_termination_guard
 from agent_execution.worker import (
     SUPPORTED_WORKER_PROVIDERS,
-    WORKER_RESULT_PATH,
     execute_worker,
     installed_worker_identity,
 )
@@ -40,7 +40,6 @@ def _parser() -> argparse.ArgumentParser:
     execute.add_argument("--model-call-id", required=True)
     # Kept off the harness command line on purpose; see execute_worker.
     execute.add_argument("--harness-model")
-    execute.add_argument("--evidence-out", type=Path, default=WORKER_RESULT_PATH)
     execute.add_argument("--timeout", type=float, help="Optional hard harness completion limit")
     execute.add_argument(
         "--max-cost-usd", type=float, help="Hard incremental execution cost ceiling"
@@ -135,7 +134,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_call_id=args.model_call_id,
             harness_model=args.harness_model,
             command=command,
-            output=args.evidence_out,
             timeout=args.timeout,
             ctx_timeout=args.ctx_timeout,
             max_cost_usd=args.max_cost_usd,
@@ -144,7 +142,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             prompt_payload=args.prompt_payload,
             expect_prompt_sha256=args.expect_prompt_sha256,
         )
-        print(json.dumps(result.summary(artifact_path=str(args.evidence_out)), sort_keys=True))
+        print(
+            json.dumps(
+                result.summary(artifact_path=worker_evidence_path(args.model_call_id)),
+                sort_keys=True,
+            )
+        )
         # The result envelope, not the process exit code, carries the execution
         # outcome so Weft can always retrieve a preflight or evidence failure.
         return 0

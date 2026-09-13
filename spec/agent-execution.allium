@@ -66,7 +66,7 @@ entity Dispatch {
     payload_name: String?
     payload_digest: String?
     payload_name_is_safe: Boolean
-    harness_policy: read_only_no_shell | packet_only_no_tools
+    harness_policy: read_only_no_shell | packet_only_no_tools | workspace_write_no_shell
     harness_selector: String
     harness_exit_status: Integer?
     harness_exceeded_deadline: Boolean
@@ -83,6 +83,22 @@ entity Dispatch {
     invariant AdmissionFactsPresent {
         -- set by admission before any harness starts
         payload_name != null implies payload_name_is_safe != null
+    }
+
+    invariant WorkspaceWriteIsConfined {
+        -- The additive writer policy exposes only owned SDK filesystem tools: read,
+        -- glob, grep, write, and edit. It refuses harness/VCS metadata writes,
+        -- preserves existing ordinary-file modes on replacement, and never enables
+        -- shell, extension discovery, skills, MCP, reviewed-tree configuration,
+        -- or unrestricted native CLI tools.
+        -- Protocol 2 worker results live only at
+        -- .agent-execution/results/<model-call-id>.json. Write/edit cannot modify
+        -- this namespace (case-insensitive) or legacy worker-result filenames.
+        -- New execution accepts no caller-selected evidence output location.
+        harness_policy = workspace_write_no_shell implies harness_selector in {
+            "kimi-code/k3",
+            "openai-codex/gpt-6-astra",
+        }
     }
 }
 
@@ -115,7 +131,10 @@ entity RetrievalOutcome {
 
 config {
     -- Exact conductor/worker compatibility version; equality, not minimum.
-    protocol_version: Integer = 1
+    -- Historical retrieval instead uses the retained accepted dispatch protocol.
+    -- Only protected legacy locations retain the read-only retrieval contract;
+    -- arbitrary legacy paths and protocol-1 writer evidence are unverifiable.
+    protocol_version: Integer = 2
 }
 
 ------------------------------------------------------------
