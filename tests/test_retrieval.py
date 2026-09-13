@@ -12,6 +12,7 @@ from pathlib import Path
 from agent_execution.command import CommandResult
 from agent_execution.identity import worker_evidence_path
 from agent_execution.weft import (
+    SUPPORTED_WORKER_PROTOCOL_VERSIONS,
     WeftCommandRunner,
     WeftJobFailure,
     WeftRetrievalOutcome,
@@ -58,6 +59,9 @@ def native_artifact(*, prompt: str = "review") -> str:
 
 
 class RetrievalTests(unittest.TestCase):
+    def test_supported_worker_protocol_versions_are_explicit(self) -> None:
+        self.assertEqual(SUPPORTED_WORKER_PROTOCOL_VERSIONS, frozenset({1, 2}))
+
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

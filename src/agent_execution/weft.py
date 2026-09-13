@@ -38,6 +38,7 @@ WEFT_INVENTORY_TAG = "inventory"
 WEFT_AUTO_HOST = "auto"
 WEFT_TOOL_CAPABILITY = "tool:agent-execution"
 WORKER_PROMPT_PAYLOAD = "execution-prompt"
+SUPPORTED_WORKER_PROTOCOL_VERSIONS = frozenset({1, 2})
 WEFT_LIVE_JOB_STATUSES = frozenset({"draft", "queued", "pending_placement", "starting", "running"})
 Clock = Callable[[], float]
 Sleeper = Callable[[float], None]
@@ -1068,9 +1069,11 @@ class WeftCommandRunner:
         if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
             raise ValueError("accepted command carries an invalid source hash")
         protocol_text = options.get("--expect-protocol")
-        if protocol_text not in {"1", "2"}:
+        if not isinstance(protocol_text, str) or not protocol_text.isdecimal():
             raise ValueError("accepted command lacks a supported protocol expectation")
         protocol = int(protocol_text)
+        if protocol not in SUPPORTED_WORKER_PROTOCOL_VERSIONS or protocol_text != str(protocol):
+            raise ValueError("accepted command lacks a supported protocol expectation")
         if protocol == 2 and "--evidence-out" in options:
             raise ValueError("protocol 2 does not accept --evidence-out")
         contract: dict[str, object] = {
@@ -1102,7 +1105,7 @@ class WeftCommandRunner:
         protocol = execution.get("expected_worker_protocol_version")
         path = execution.get("worker_result_path")
         detail = ""
-        if type(protocol) is not int or protocol not in {1, 2}:
+        if type(protocol) is not int or protocol not in SUPPORTED_WORKER_PROTOCOL_VERSIONS:
             detail = "no supported dispatched worker protocol expectation"
         elif protocol == 2 and path != self.worker_result_path:
             detail = "protocol 2 evidence must use its deterministic protected path"
