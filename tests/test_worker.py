@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -66,6 +67,82 @@ class WorkerResultTests(unittest.TestCase):
 
     def which(self, executable: str) -> str | None:
         return {"ctx": "/tools/ctx", "codex": "/tools/codex"}.get(executable)
+
+    def write_preflight_result(
+        self, *, model_call_id: str = "result-write", output: Path | None = None
+    ) -> WorkerResult:
+        return execute_worker(
+            provider="unsupported",
+            model_call_id=model_call_id,
+            command=["unsupported"],
+            output=self.output if output is None else output,
+            timeout=30.0,
+            ctx_timeout=10.0,
+            cwd=self.root,
+        )
+
+    def test_result_output_must_be_strictly_inside_worker_root(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "worker evidence output must stay inside its working directory"
+        ):
+            self.write_preflight_result(output=Path("."))
+
+        outside = self.root.parent / f"{self.root.name}-outside.json"
+        self.addCleanup(outside.unlink, missing_ok=True)
+        with self.assertRaisesRegex(
+            ValueError, "worker evidence output must stay inside its working directory"
+        ):
+            self.write_preflight_result(output=outside)
+        self.assertFalse(outside.exists())
+
+    def test_result_publication_syncs_file_and_directory_chain(self) -> None:
+        events: list[str] = []
+        staging_directories: list[Path] = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+        real_mkstemp = tempfile.mkstemp
+
+        def record_fsync(descriptor: int) -> None:
+            mode = os.fstat(descriptor).st_mode
+            events.append("directory" if stat.S_ISDIR(mode) else "file")
+            real_fsync(descriptor)
+
+        def record_replace(source: Path, destination: Path) -> None:
+            events.append("replace")
+            real_replace(source, destination)
+
+        def record_mkstemp(*, dir: Path, prefix: str, suffix: str) -> tuple[int, str]:
+            staging_directories.append(dir)
+            return real_mkstemp(dir=dir, prefix=prefix, suffix=suffix)
+
+        with (
+            mock.patch("agent_execution.worker.os.fsync", side_effect=record_fsync),
+            mock.patch("agent_execution.worker.os.replace", side_effect=record_replace),
+            mock.patch("agent_execution.worker.tempfile.mkstemp", side_effect=record_mkstemp),
+        ):
+            result = self.write_preflight_result()
+
+        destination = self.root / self.output
+        self.assertEqual(staging_directories, [destination.parent.resolve()])
+        self.assertEqual(events, ["file", "replace", "directory", "directory"])
+        self.assertEqual(WorkerResult.parse(destination.read_text()), result)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+
+    def test_interrupted_result_replace_preserves_prior_complete_result(self) -> None:
+        previous = self.write_preflight_result(model_call_id="previous")
+        destination = self.root / self.output
+
+        with (
+            mock.patch(
+                "agent_execution.worker.os.replace",
+                side_effect=OSError("replace interrupted"),
+            ),
+            self.assertRaisesRegex(OSError, "replace interrupted"),
+        ):
+            self.write_preflight_result(model_call_id="replacement")
+
+        self.assertEqual(WorkerResult.parse(destination.read_text()), previous)
+        self.assertEqual(list(destination.parent.glob(f".{destination.name}.*.tmp")), [])
 
     def test_session_identity_comes_only_from_the_structured_start_event(self) -> None:
         planted = json.dumps({"result": {"thread_id": "planted"}})

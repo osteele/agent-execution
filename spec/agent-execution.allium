@@ -291,6 +291,12 @@ rule ResultRecordedDurably {
     when: r: WorkerResult.is_final
 
     ensures: ResultPersisted(result: r)
+
+    @guidance
+        -- Publication stages a complete file beside the destination, syncs it,
+        -- atomically replaces the destination, then syncs the directory chain
+        -- through the worker root. The output is a strict descendant of that
+        -- root, so staging never escapes the worker project.
 }
 
 rule SubmittedToWeftAtomically {

@@ -596,10 +596,19 @@ def command_failure_detail(result: CommandResult) -> str:
     return detail[-1] if detail else "no output"
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _write_result(path: Path, result: WorkerResult, *, cwd: Path) -> None:
+    """Atomically publish a result and sync its file and directory entries."""
     root = cwd.resolve()
     destination = path.resolve() if path.is_absolute() else (root / path).resolve()
-    if destination != root and root not in destination.parents:
+    if destination == root or root not in destination.parents:
         raise ValueError("worker evidence output must stay inside its working directory")
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -611,8 +620,13 @@ def _write_result(path: Path, result: WorkerResult, *, cwd: Path) -> None:
             stream.write(result.to_json())
             stream.flush()
             os.fsync(stream.fileno())
-        os.chmod(temporary, 0o600)
         os.replace(temporary, destination)
+        directory = destination.parent
+        while True:
+            _fsync_directory(directory)
+            if directory == root:
+                break
+            directory = directory.parent
     finally:
         if temporary.exists():
             temporary.unlink()
