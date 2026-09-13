@@ -276,6 +276,15 @@ class HarnessOutcome:
         }
 
 
+def _validated_ctx_import_receipt(receipt: dict[str, object]) -> dict[str, object]:
+    version = receipt.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 2:
+        raise ValueError("unsupported ctx import receipt schema")
+    if receipt.get("outcome") not in {"success", "completed_with_rejections"}:
+        raise ValueError(f"ctx import did not complete: {receipt.get('outcome')!r}")
+    return receipt
+
+
 @dataclass(frozen=True)
 class WorkerEvidence:
     import_receipt: dict[str, object]
@@ -290,11 +299,8 @@ class WorkerEvidence:
         transcript = value.get("transcript")
         if not isinstance(receipt, dict) or not isinstance(transcript, dict):
             raise ValueError("worker evidence must contain object receipt and transcript fields")
-        normalized_receipt = cast(dict[str, object], receipt)
-        if normalized_receipt.get("schema_version") != 2:
-            raise ValueError("unsupported ctx import receipt schema")
         return cls(
-            import_receipt=normalized_receipt,
+            import_receipt=_validated_ctx_import_receipt(cast(dict[str, object], receipt)),
             transcript=cast(dict[str, object], transcript),
         )
 
@@ -1000,27 +1006,25 @@ def execute_worker(
         )
 
     try:
-        imported = _json_object(
-            invoke(
-                [
-                    ctx,
-                    "import",
-                    "--provider",
-                    provider,
-                    "--format",
-                    "json",
-                    "--progress",
-                    "none",
-                ],
-                working_directory,
-                ctx_timeout,
-            ),
-            label="ctx import",
+        imported = _validated_ctx_import_receipt(
+            _json_object(
+                invoke(
+                    [
+                        ctx,
+                        "import",
+                        "--provider",
+                        provider,
+                        "--format",
+                        "json",
+                        "--progress",
+                        "none",
+                    ],
+                    working_directory,
+                    ctx_timeout,
+                ),
+                label="ctx import",
+            )
         )
-        if imported.get("schema_version") != 2:
-            raise ValueError("unsupported ctx import receipt schema")
-        if imported.get("outcome") not in {"success", "completed_with_rejections"}:
-            raise ValueError(f"ctx import did not complete: {imported.get('outcome')!r}")
         transcript = _json_object(
             invoke(
                 [

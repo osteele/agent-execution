@@ -15,6 +15,7 @@ from unittest import mock
 from agent_execution.command import CommandResult
 from agent_execution.worker import (
     WORKER_PROTOCOL_VERSION,
+    WorkerEvidence,
     WorkerResult,
     codex_session_id,
     execute_worker,
@@ -50,6 +51,13 @@ def transcript(session_id: str = "thread-42", *, cwd: str = "/remote/project") -
             }
         ],
     }
+
+
+INVALID_CTX_IMPORT_RECEIPTS: tuple[tuple[dict[str, object], str], ...] = (
+    ({"schema_version": True, "outcome": "success"}, "unsupported"),
+    ({"schema_version": 2.0, "outcome": "success"}, "unsupported"),
+    ({"schema_version": 2, "outcome": "failed"}, "did not complete"),
+)
 
 
 # Legacy Codex execution tests below opt in individually, with injected runners
@@ -657,6 +665,59 @@ class WorkerResultTests(unittest.TestCase):
         self.assertEqual(result.status, "evidence_failed")
         self.assertIn("ctx evidence collection", result.failure)
         self.assertTrue((self.root / self.output).exists())
+
+    def test_worker_evidence_requires_a_successful_exact_ctx_import_receipt(self) -> None:
+        for receipt, message in INVALID_CTX_IMPORT_RECEIPTS:
+            with (
+                self.subTest(receipt=receipt),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                WorkerEvidence.from_dict({"import_receipt": receipt, "transcript": {}})
+
+    @mock.patch("agent_execution.worker.SUPPORTED_WORKER_PROVIDERS", frozenset({"codex"}))
+    def test_legacy_codex_refuses_invalid_import_receipt_before_export(self) -> None:
+        for receipt, message in INVALID_CTX_IMPORT_RECEIPTS:
+            with self.subTest(receipt=receipt):
+                exported = False
+
+                def invoke(
+                    command: list[str],
+                    cwd: Path,
+                    timeout: float | None,
+                    receipt: dict[str, object] = receipt,
+                ) -> CommandResult:
+                    nonlocal exported
+                    if command == ["/tools/ctx", "--version"]:
+                        return CommandResult(0, "ctx 1.0.2", "")
+                    if command[0] == "/tools/codex":
+                        return CommandResult(
+                            0,
+                            json.dumps({"type": "thread.started", "thread_id": "thread-42"}),
+                            "",
+                        )
+                    if command[1] == "import":
+                        return CommandResult(0, json.dumps(receipt), "")
+                    if command[1:3] == ["show", "session"]:
+                        exported = True
+                    raise AssertionError(command)
+
+                times = iter([10.0, 11.0, 12.0])
+                result = execute_worker(
+                    provider="codex",
+                    model_call_id="model-call-7",
+                    command=["codex", "exec", "review"],
+                    output=self.output,
+                    timeout=30.0,
+                    ctx_timeout=10.0,
+                    invoke=invoke,
+                    which=self.which,
+                    clock=lambda times=times: next(times),
+                    cwd=self.root,
+                )
+
+                self.assertEqual(result.status, "evidence_failed")
+                self.assertIn(message, result.failure)
+                self.assertFalse(exported)
 
     def test_worker_result_refuses_an_unknown_schema(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported worker result schema"):

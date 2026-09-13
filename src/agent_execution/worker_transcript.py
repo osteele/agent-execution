@@ -8,9 +8,19 @@ their databases. Consumers interpret the normalized calls after retrieval.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
+
+_UTC_RFC3339_MILLISECONDS = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}(?:Z|\+00:00)"
+)
+
+
+def _is_schema_version_1(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == 1
+
 
 _DETAIL_KEYS = (
     "file_path",
@@ -83,13 +93,13 @@ def _spell_out_utc_designator(value: str) -> str:
 def _timestamp(value: object) -> float:
     if not isinstance(value, str):
         raise ValueError("ctx tool-call event lacks a string occurred_at")
+    if _UTC_RFC3339_MILLISECONDS.fullmatch(value) is None:
+        raise ValueError("ctx tool-call event has an unparsable occurred_at")
     normalized = _spell_out_utc_designator(value)
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError as error:
         raise ValueError("ctx tool-call event has an unparsable occurred_at") from error
-    if parsed.tzinfo is None:
-        raise ValueError("ctx tool-call event has an unparsable occurred_at")
     return parsed.timestamp()
 
 
@@ -101,12 +111,14 @@ def validate_ctx_transcript(
     remote_cwd: str | None = None,
 ) -> ValidatedTranscript:
     """Validate and normalize ctx's versioned session JSON without local state."""
-    if raw.get("schema_version") != 1:
+    if not _is_schema_version_1(raw.get("schema_version")):
         raise ValueError(f"unsupported ctx session schema: {raw.get('schema_version')!r}")
     if raw.get("payload_type") != "session_transcript" or raw.get("target") != "session":
         raise ValueError("ctx session export has the wrong payload type")
     if raw.get("provider") != provider or raw.get("provider_session_id") != session_id:
         raise ValueError("ctx session export does not match the requested provider session")
+    if raw.get("format") != "json":
+        raise ValueError("ctx session export must use JSON format")
     mode = raw.get("mode")
     if mode in {"full", "lite"}:
         raise ValueError(
@@ -115,8 +127,8 @@ def validate_ctx_transcript(
         )
     if mode != "log":
         raise ValueError("ctx session export must use mode 'log' to carry tool_call events")
-    if raw.get("truncated") is not None:
-        raise ValueError("ctx session export is truncated")
+    if any(key in raw for key in ("truncated", "pagination", "has_more", "next_cursor")):
+        raise ValueError("ctx session export is incomplete or paged")
     events_raw = raw.get("events")
     if not isinstance(events_raw, list):
         raise ValueError("ctx session export events must be an array")
@@ -128,7 +140,8 @@ def validate_ctx_transcript(
         if not isinstance(event_raw, dict):
             raise ValueError("ctx session export contains a non-object event")
         event = cast(dict[str, object], event_raw)
-        if event.get("schema_version") not in {None, 1}:
+        event_schema = event.get("schema_version")
+        if event_schema is not None and not _is_schema_version_1(event_schema):
             raise ValueError("ctx session export contains an unsupported event schema")
         if event.get("provider") != provider or event.get("provider_session_id") != session_id:
             raise ValueError("ctx session export contains an event from another session")
