@@ -473,6 +473,29 @@ class RetrievalTests(unittest.TestCase):
         self.assertTrue(all(timeout is not None and timeout > 0 for timeout in artifact_timeouts))
         self.assertLessEqual(len(artifact_timeouts), 2)
 
+    def test_status_inspection_has_an_independent_deadline(self) -> None:
+        self.artifact_calls = [CommandResult(1, "", "not available")] * 4
+        invoke = self.runner.invoke
+
+        def delayed_artifact(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
+            result = invoke(command, cwd, timeout)
+            if command[1] == "artifact":
+                self.now += 30.0
+            return result
+
+        self.runner.invoke = delayed_artifact
+        outcome = self.retrieve(timeout=30.0)
+        self.assertIsInstance(outcome, WeftRetrievalOutcome)
+        assert isinstance(outcome, WeftRetrievalOutcome)
+        self.assertEqual(outcome.status, "unretrievable")
+        inspect_timeouts = [
+            timeout for command, _, timeout in self.calls if command[1:3] == ["job", "inspect"]
+        ]
+        self.assertEqual(len(inspect_timeouts), 1)
+        self.assertIsNotNone(inspect_timeouts[0])
+        assert inspect_timeouts[0] is not None
+        self.assertGreater(inspect_timeouts[0], 0)
+
     def test_transient_artifact_error_is_retryable(self) -> None:
         self.artifact_calls = [
             OSError("artifact raced publication"),

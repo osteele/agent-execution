@@ -1189,14 +1189,13 @@ class WeftCommandRunner:
     ) -> CommandResult | WeftJobFailure | WeftRetrievalOutcome:
         """Retrieve one accepted job without submitting or falling back locally."""
         self.last_execution = execution
-        deadline = self.clock() + timeout
         required = (
             "expected_worker_source_sha256",
             "expected_worker_protocol_version",
             "worker_result_path",
         )
         if any(execution.get(key) in (None, "") for key in required):
-            record = self._inspect_job(job_id, cwd, deadline)
+            record = self._inspect_job(job_id, cwd, self.clock() + timeout)
             if isinstance(record, WeftRetrievalOutcome):
                 return record
             try:
@@ -1219,7 +1218,7 @@ class WeftCommandRunner:
         artifact: CommandResult | None = None
         artifact_detail = ""
         try:
-            artifact = self._worker_result(job_id, cwd, deadline)
+            artifact = self._worker_result(job_id, cwd, self.clock() + timeout)
         except (WeftExecutionAmbiguous, WeftExecutionDetached, OSError) as error:
             artifact_detail = str(error)
         if artifact is not None and artifact.exit_status == 0:
@@ -1237,7 +1236,7 @@ class WeftCommandRunner:
         # identity-checked job record distinguishes work that has not run from a
         # finished job whose result cannot be read; an unreadable record establishes
         # neither under decision 0050.
-        record = self._inspect_job(job_id, cwd, deadline)
+        record = self._inspect_job(job_id, cwd, self.clock() + timeout)
         if isinstance(record, WeftRetrievalOutcome):
             return record
         raw_status = record.get("status")
@@ -1304,7 +1303,7 @@ class WeftCommandRunner:
         log_diagnostic: dict[str, object] = {"command": log_command}
         diagnostics["job_failure_log"] = log_diagnostic
         try:
-            logged = self._call(log_command, cwd, deadline)
+            logged = self._call(log_command, cwd, self.clock() + timeout)
         except (WeftExecutionAmbiguous, WeftExecutionDetached, OSError) as error:
             log_diagnostic["unobserved"] = str(error)
         else:
