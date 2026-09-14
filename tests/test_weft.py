@@ -237,6 +237,62 @@ class AdmissionTests(unittest.TestCase):
         assert isinstance(summary, dict)
         self.assertEqual(summary["artifact_path"], artifact[-1])
 
+    def test_tracked_result_survives_waiter_exit_and_later_completion(self) -> None:
+        self.submissions = [CommandResult(0, receipt(), "")]
+        self.status = subprocess.TimeoutExpired(["weft", "status"], 30)
+        completed = False
+        outputs: set[str] = set()
+
+        def invoke(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
+            if command[1] == "run":
+                # Weft DiscoverJobOutputsSince uses Outputs plus convention
+                # directories; Produces is a separate manifest/dependency list.
+                outputs.update(
+                    command[index + 1]
+                    for index, arg in enumerate(command[:-1])
+                    if arg == "--output"
+                )
+            if command[1:3] == ["artifact", "cat"]:
+                self.artifact = (
+                    CommandResult(0, worker_artifact(), "")
+                    if completed and command[-1] in outputs
+                    else CommandResult(1, "", "no tracked output")
+                )
+            if command[1:3] == ["job", "inspect"]:
+                self.calls.append((command, cwd, timeout))
+                return CommandResult(
+                    0,
+                    json.dumps({"id": "wj42", "status": "completed"}),
+                    "",
+                )
+            return self.invoke(command, cwd, timeout)
+
+        self.runner.invoke = invoke
+        with self.assertRaises(WeftExecutionDetached):
+            self.run_dispatch()
+        assert self.runner.last_execution is not None
+        execution = json.loads(json.dumps(self.runner.last_execution))
+
+        # The worker finishes after the original waiter is gone. Only declared
+        # tracked outputs are available at this synthetic external CLI boundary.
+        completed = True
+        consumer = WeftCommandRunner(
+            host="studio",
+            agent="omp",
+            model_call_id=KEY,
+            fallback=None,
+            invoke=invoke,
+            clock=lambda: self.now,
+            sleep=self.sleep,
+        )
+        self.calls.clear()
+        result = consumer.retrieve(job_id="wj42", cwd=self.root, execution=execution)
+        self.assertIsInstance(result, CommandResult, result)
+        assert isinstance(result, CommandResult)
+        self.assert_remote(result)
+        self.assertTrue(all(argv[1:3] == ["artifact", "cat"] for argv, _, _ in self.calls))
+        self.assertEqual(self.payloads, ["review"])
+
     def test_writer_dispatch_receipt_survives_retrieval_and_recovery(self) -> None:
         for route in ("receipt", "probe", "submission_timeout", "lost_watcher"):
             with self.subTest(route=route):

@@ -43,7 +43,9 @@ and returns this relative path. Identities use lowercase ASCII letters, digits,
 underscores, and hyphens (1–128 characters, starting with a letter or digit).
 Uppercase identities are rejected to prevent case-insensitive filesystem collisions.
 Fresh execution has no `--evidence-out` flag or
-Python `output` argument. Weft declares the same path with `--produces`.
+Python `output` argument. Weft declares the same path with `--produces` and
+`--output`, so inventory completion discovery tracks the worker result for
+later artifact retrieval even when the local waiter has exited.
 
 Write and edit tools refuse `.agent-execution` components case-insensitively.
 They also protect legacy `agent-execution-worker-result.json` and

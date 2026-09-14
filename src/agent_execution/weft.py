@@ -1372,6 +1372,10 @@ class WeftCommandRunner:
                     self.submitter_session,
                     "--produces",
                     self.worker_result_path,
+                    # Inventory completion discovery tracks --output separately
+                    # from --produces dependency/manifest declarations.
+                    "--output",
+                    self.worker_result_path,
                     "--payload",
                     f"{WORKER_PROMPT_PAYLOAD}={payload.name}",
                     "--if-online",
