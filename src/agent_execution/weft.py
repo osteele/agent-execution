@@ -1758,6 +1758,7 @@ class WeftCommandRunner:
                     "attempt": attempt,
                     "receipt": receipt.to_dict(),
                     "submission_exit_status": submission.exit_status,
+                    "submission_stderr": _tail(submission.stderr),
                 }
             )
             if receipt.placement_decision != "not_accepted":

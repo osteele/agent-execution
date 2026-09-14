@@ -400,6 +400,38 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(len(self.payloads), 1)
         self.assertEqual(self.local_calls, [])
 
+    def test_rejection_diagnostics_survive_retries_and_local_fallback_timeout(self) -> None:
+        long_reason = "\n".join(f"remote reason {index}" for index in range(250))
+        self.submissions = [
+            CommandResult(1, receipt("not_accepted"), "host constraint mismatch"),
+            CommandResult(1, receipt("not_accepted"), "offline probe failed"),
+            CommandResult(1, receipt("not_accepted"), long_reason),
+        ]
+
+        def timed_out(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
+            self.local_calls.append(command)
+            raise TimeoutError("local admission expired")
+
+        self.runner.fallback = timed_out
+
+        with self.assertRaisesRegex(TimeoutError, "local admission expired"):
+            self.run_dispatch()
+
+        assert self.runner.last_execution is not None
+        admission = self.runner.last_execution["admission"]
+        assert isinstance(admission, dict)
+        attempts = admission["attempts"]
+        assert isinstance(attempts, list)
+        self.assertEqual(
+            [attempt["submission_stderr"] for attempt in attempts[:2]],
+            ["host constraint mismatch", "offline probe failed"],
+        )
+        retained = attempts[2]["submission_stderr"].splitlines()
+        self.assertEqual(len(retained), 200)
+        self.assertEqual(retained[0], "remote reason 50")
+        self.assertEqual(retained[-1], "remote reason 249")
+        self.assertEqual(len(self.local_calls), 1)
+
     def test_admission_sequences_obey_no_double_execution(self) -> None:
         # Exhaust the bounded event model. R retries; A owns remotely; U is unknown.
         # The oracle is the first non-rejection, independently of production state.
