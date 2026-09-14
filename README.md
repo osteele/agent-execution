@@ -67,6 +67,31 @@ retrieval therefore preserves the old read-only evidence contract, without
 claiming retrospective tamper protection. Mixed old and new writable runtimes
 must not share an execution snapshot.
 
+## Weft admission receipts
+
+The transport normalizes `weft.run.receipt.v1` into `WeftRunReceipt`.
+A validated `not_accepted` receipt permits bounded admission retries and then
+local fallback only when it claims no durable job: its job ID is absent or empty,
+`accepted_immediately` is false, and `deduplicated` is false or absent.
+Accepted, deduplicated, and unreadable receipts never authorize local fallback.
+An unreadable receipt triggers an exact-assignment job probe before the transport
+reports an unknown outcome.
+
+An optional `rejection` object supplies a nonempty string `code` and a string
+`detail` containing at most 1024 UTF-8 bytes of valid Unicode. It is valid only
+with `not_accepted`; `null`, missing required fields, malformed values, and
+contradictory acceptance claims make the receipt unreadable. Unknown nonempty
+codes remain valid for compatibility with future Weft publishers. Older
+publishers may omit the object.
+
+Normalized execution records retain the object at
+`admission.attempts[].receipt.rejection`, including when a later attempt is
+accepted or local fallback fails. Each attempt also retains the existing
+`submission_stderr` tail as raw diagnostic evidence. The final normalized
+`receipt` includes its rejection when present; serialization omits the field
+when absent. Codes and human-only details explain refusals without changing
+retry policy or granting fallback authority.
+
 ## Checks
 
 ```sh

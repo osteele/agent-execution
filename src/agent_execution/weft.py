@@ -32,6 +32,7 @@ from agent_execution.worker import (
 )
 
 WEFT_RECEIPT_VERSION = "weft.run.receipt.v1"
+WEFT_REJECTION_DETAIL_MAX_BYTES = 1024
 WEFT_JOB_LIST_VERSION = 1
 WEFT_HOST_OBSERVATION_TIMEOUT = 10.0
 WEFT_INVENTORY_TAG = "inventory"
@@ -67,6 +68,36 @@ def uninterrupted_wait(seconds: float) -> bool:
 
 
 @dataclass(frozen=True)
+class WeftRunRejection:
+    """A stable refusal code and bounded human diagnostic from Weft."""
+
+    code: str
+    detail: str
+
+    @classmethod
+    def parse(cls, value: object) -> WeftRunRejection:
+        if not isinstance(value, dict):
+            raise ValueError("Weft receipt rejection must be an object")
+        raw = cast(dict[str, object], value)
+        code = raw.get("code")
+        detail = raw.get("detail")
+        if not isinstance(code, str) or not code:
+            raise ValueError("Weft receipt rejection code must be a nonempty string")
+        if not isinstance(detail, str):
+            raise ValueError("Weft receipt rejection detail must be a string")
+        try:
+            detail_size = len(detail.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise ValueError("Weft receipt rejection detail must be valid Unicode") from error
+        if detail_size > WEFT_REJECTION_DETAIL_MAX_BYTES:
+            raise ValueError("Weft receipt rejection detail exceeds 1024 UTF-8 bytes")
+        return cls(code=code, detail=detail)
+
+    def to_dict(self) -> dict[str, object]:
+        return {"code": self.code, "detail": self.detail}
+
+
+@dataclass(frozen=True)
 class WeftRunReceipt:
     """The normalized subset of Weft's versioned submission receipt."""
 
@@ -77,6 +108,7 @@ class WeftRunReceipt:
     accepted_immediately: bool
     deduplicated: bool
     idempotency_key: str
+    rejection: WeftRunRejection | None = None
 
     @classmethod
     def parse(cls, text: str, *, idempotency_key: str) -> WeftRunReceipt:
@@ -120,11 +152,14 @@ class WeftRunReceipt:
             accepted_immediately=accepted,
             deduplicated=deduplicated,
             idempotency_key=received_key,
+            rejection=WeftRunRejection.parse(raw["rejection"]) if "rejection" in raw else None,
         )
         if decision == "not_accepted":
             if receipt.job_id or accepted or deduplicated:
                 raise ValueError("not_accepted Weft receipt claims a durable job")
             return receipt
+        if receipt.rejection is not None:
+            raise ValueError("accepted Weft receipt claims a rejection")
         if not receipt.job_id or not receipt.source_pin:
             raise ValueError("accepted Weft receipt lacks a job ID or source pin")
         if decision == "accepted_immediately" and not accepted:
@@ -134,7 +169,7 @@ class WeftRunReceipt:
         return receipt
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "api_version": WEFT_RECEIPT_VERSION,
             "job_id": self.job_id,
             "placement_decision": self.placement_decision,
@@ -144,6 +179,9 @@ class WeftRunReceipt:
             "deduplicated": self.deduplicated,
             "idempotency_key": self.idempotency_key,
         }
+        if self.rejection is not None:
+            value["rejection"] = self.rejection.to_dict()
+        return value
 
 
 class WeftExecutionAmbiguous(TimeoutError):

@@ -453,6 +453,15 @@ surface WeftTransport {
     @guarantee AdmissionIsAtomic
         -- Only a validated rejection permits retry or local fallback.
         -- Accepted and unknown submission outcomes both prohibit local execution.
+        -- weft.run.receipt.v1 may include rejection {code, detail} only for
+        -- not_accepted with no durable job and false acceptance/deduplication.
+        -- An absent rejection supports older publishers. A present rejection
+        -- must be an object with a nonempty string code and a string detail
+        -- containing valid Unicode bounded to 1024 UTF-8 bytes. Unknown codes
+        -- are accepted. Malformed or contradictory rejections leave ownership
+        -- unknown and cannot authorize retry or local fallback.
+        -- Normalized admission attempts preserve structured rejections beside
+        -- raw stderr diagnostics, including across retries and fallback failure.
 }
 
 contract DurableExecution {

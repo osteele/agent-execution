@@ -392,6 +392,48 @@ class AdmissionTests(unittest.TestCase):
         self.assertFalse(any(command[1] == "status" for command, _, _ in self.calls))
         self.assertEqual(self.local_calls, [])
 
+    def test_invalid_rejection_never_authorizes_retry_or_fallback(self) -> None:
+        rejection = {"code": "host_offline", "detail": "studio is offline"}
+        invalid = [
+            receipt("not_accepted", rejection=None),
+            receipt("not_accepted", rejection={"code": "host_offline", "detail": "\ud800"}),
+            receipt("not_accepted", rejection=rejection, job_id="wj42"),
+            receipt(rejection=rejection),
+            receipt("deduplicated", rejection=rejection),
+        ]
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.payloads.clear()
+                self.calls.clear()
+                self.local_calls.clear()
+                self.submissions = [CommandResult(1, raw, "unmodified refusal evidence")] * 3
+                with self.assertRaises(WeftExecutionAmbiguous):
+                    self.run_dispatch()
+                self.assertEqual(len(self.payloads), 1)
+                self.assertEqual(self.local_calls, [])
+                assert self.runner.last_execution is not None
+                diagnostics = self.runner.last_execution["diagnostics"]
+                assert isinstance(diagnostics, dict)
+                self.assertEqual(diagnostics["receipt_stdout"], raw)
+                self.assertEqual(diagnostics["receipt_stderr"], "unmodified refusal evidence")
+
+    def test_rejection_then_acceptance_retains_diagnostics_without_local_execution(self) -> None:
+        rejection = {"code": "admission_race_lost", "detail": "another caller won admission"}
+        self.submissions = [
+            CommandResult(1, receipt("not_accepted", rejection=rejection), "raw admission error"),
+            CommandResult(0, receipt("deduplicated"), ""),
+        ]
+        result = self.run_dispatch()
+        self.assert_remote(result)
+        self.assertEqual(len(self.payloads), 2)
+        assert result.execution is not None
+        execution = json.loads(json.dumps(result.execution))
+        attempts = execution["admission"]["attempts"]
+        self.assertEqual(attempts[0]["receipt"]["rejection"], rejection)
+        self.assertEqual(attempts[0]["submission_stderr"], "raw admission error")
+        self.assertNotIn("rejection", execution["receipt"])
+        self.assertEqual(execution["admission"]["final_placement"]["transport"], "weft")
+
     def test_rejection_retry_is_cancelled_before_next_submission(self) -> None:
         self.submissions = [CommandResult(1, receipt("not_accepted"), "offline")]
         self.cancel = True
@@ -402,10 +444,19 @@ class AdmissionTests(unittest.TestCase):
 
     def test_rejection_diagnostics_survive_retries_and_local_fallback_timeout(self) -> None:
         long_reason = "\n".join(f"remote reason {index}" for index in range(250))
+        first_rejection = {
+            "code": "host_constraints_unsatisfied",
+            "detail": "studio lacks the required capability",
+        }
+        final_rejection = {"code": "future_capacity_reason", "detail": "界" * 341 + "!"}
         self.submissions = [
-            CommandResult(1, receipt("not_accepted"), "host constraint mismatch"),
+            CommandResult(
+                1,
+                receipt("not_accepted", rejection=first_rejection),
+                "host constraint mismatch",
+            ),
             CommandResult(1, receipt("not_accepted"), "offline probe failed"),
-            CommandResult(1, receipt("not_accepted"), long_reason),
+            CommandResult(1, receipt("not_accepted", rejection=final_rejection), long_reason),
         ]
 
         def timed_out(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
@@ -422,6 +473,9 @@ class AdmissionTests(unittest.TestCase):
         assert isinstance(admission, dict)
         attempts = admission["attempts"]
         assert isinstance(attempts, list)
+        self.assertEqual(attempts[0]["receipt"]["rejection"], first_rejection)
+        self.assertNotIn("rejection", attempts[1]["receipt"])
+        self.assertEqual(attempts[2]["receipt"]["rejection"], final_rejection)
         self.assertEqual(
             [attempt["submission_stderr"] for attempt in attempts[:2]],
             ["host constraint mismatch", "offline probe failed"],
@@ -580,6 +634,42 @@ class ReceiptTests(unittest.TestCase):
                 WeftRunReceipt.parse(json.dumps(parsed.to_dict()), idempotency_key=KEY),
                 parsed,
             )
+            self.assertIsNone(parsed.rejection)
+            self.assertNotIn("rejection", parsed.to_dict())
+
+    def test_rejection_accepts_future_codes_and_utf8_boundary(self) -> None:
+        for detail in ("", "界" * 341 + "!"):
+            with self.subTest(detail=detail):
+                value = json.loads(receipt("not_accepted"))
+                for name in ("job_id", "source_pin", "deduplicated"):
+                    value.pop(name)
+                value["rejection"] = {"code": "future_capacity_reason", "detail": detail}
+                parsed = WeftRunReceipt.parse(json.dumps(value), idempotency_key=KEY)
+                assert parsed.rejection is not None
+                self.assertEqual(parsed.rejection.code, "future_capacity_reason")
+                self.assertEqual(parsed.rejection.detail, detail)
+                self.assertEqual(
+                    WeftRunReceipt.parse(json.dumps(parsed.to_dict()), idempotency_key=KEY),
+                    parsed,
+                )
+
+    def test_malformed_rejections_raise_value_error(self) -> None:
+        invalid = [
+            None,
+            [],
+            {"detail": "offline"},
+            {"code": "host_offline"},
+            {"code": "", "detail": "offline"},
+            {"code": 1, "detail": "offline"},
+            {"code": "host_offline", "detail": 1},
+            {"code": "host_offline", "detail": "\ud800"},
+            {"code": "host_offline", "detail": "界" * 342},
+        ]
+        for rejection in invalid:
+            with self.subTest(rejection=rejection), self.assertRaises(ValueError):
+                WeftRunReceipt.parse(
+                    receipt("not_accepted", rejection=rejection), idempotency_key=KEY
+                )
 
     def test_malformed_receipts_raise_value_error(self) -> None:
         invalid = [
