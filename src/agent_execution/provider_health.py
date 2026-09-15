@@ -83,7 +83,13 @@ SIGNATURES: list[tuple[str, str, str | None, int | None]] = [
     ),
     (r"您已达到每周/每月使用上限", "quota", "weekly-or-monthly", 24 * 3600),
     (r"You've reached your (\d+)-hour usage limit", "quota", "session", -1),
-    (r"reached your monthly (?:usage )?limit", "quota", "monthly", 7 * 24 * 3600),
+    # Monthly, however it is worded. The narrow "reached your monthly limit"
+    # missed "monthly allowance exhausted" and fell through to the 600s
+    # unknown-signature default — the same failure as matching only English
+    # quota text, one layer later: a cap measured in weeks classified as a
+    # transient blip because nobody had seen that exact phrasing.
+    (r"monthly[^.\n]{0,40}(?:limit|allowance|quota|cap)\b", "quota", "monthly", 7 * 24 * 3600),
+    (r"(?:limit|allowance|quota|cap)[^.\n]{0,40}\bmonthly\b", "quota", "monthly", 7 * 24 * 3600),
     (r"provider\.auth_error:\s*403", "quota", "session", 5 * 3600),
     (r"OAuth request .*token failed", "auth", None, 24 * 3600),
     (r"Cannot connect to API", "network", None, 300),
