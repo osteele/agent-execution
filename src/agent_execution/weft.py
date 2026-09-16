@@ -713,6 +713,38 @@ class WeftCommandRunner:
         else:
             self._processing(execution, state="marked", step="mark_processed")
 
+    def _discard_settled_evidence(self, cwd: Path, execution: dict[str, object]) -> None:
+        """Remove the local worker receipt of a cycle its consumer has banked.
+
+        Reported by a creative-coding.osteele.com session: every dispatched
+        review left ``.agent-execution/results/<model-call-id>.json`` in the
+        reviewed working copy, where jj/git showed it as an untracked file no
+        consumer owned. The receipt doubles as the detached-cycle recovery
+        handle, so nothing may remove it while retrieval is still possible;
+        this runs only from ``mark_consumed``, after the consumer confirms its
+        ingestion is durable. Only the deterministic protocol-2 path is
+        touched -- a caller-supplied artifact location is never the SDK's to
+        delete. Remote workers never write into the local tree, so absence is
+        ordinary; a removal failure is recorded on the execution, never
+        raised, because cleanup must not fail a settled cycle.
+        """
+        if execution.get("worker_result_path") != self.worker_result_path:
+            return
+        receipt = cwd / self.worker_result_path
+        try:
+            receipt.unlink(missing_ok=True)
+        except OSError as error:
+            execution["evidence_discard_error"] = f"{type(error).__name__}: {error}"
+            return
+        execution.pop("evidence_discard_error", None)
+        # Empty parents are untracked noise too; rmdir refuses non-empty ones,
+        # which is what keeps a sibling cycle's live receipt safe.
+        for directory in (receipt.parent, receipt.parent.parent):
+            try:
+                directory.rmdir()
+            except OSError:
+                break
+
     def _artifact(self, job_id: str, cwd: Path, deadline: float) -> CommandResult:
         """Contain Weft's artifact auto-sync outside the consumer's source tree.
 
@@ -974,6 +1006,7 @@ class WeftCommandRunner:
         self._processing(execution, state="pending", step="consumer_validation")
 
         def mark_consumed() -> None:
+            self._discard_settled_evidence(cwd, execution)
             self._mark_processed(job_id=job_id, cwd=cwd, execution=execution)
 
         return CommandResult(

@@ -160,6 +160,95 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(self.execution["processed"], True)
         self.assertEqual(self.processing()["state"], "marked")
 
+    def plant_receipt(self, model_call_id: str = KEY, content: str = "{}") -> Path:
+        receipt = self.root / worker_evidence_path(model_call_id)
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(content, encoding="utf-8")
+        return receipt
+
+    def test_settled_cycle_discards_its_local_receipt(self) -> None:
+        receipt = self.plant_receipt()
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        # Before settlement the receipt is still the detached-recovery handle.
+        self.assertTrue(receipt.exists())
+        result.mark_consumed()
+        self.assertFalse(receipt.exists())
+        self.assertFalse((self.root / ".agent-execution").exists())
+        self.assertEqual(self.execution["processed"], True)
+        self.assertNotIn("evidence_discard_error", self.execution)
+
+    def test_discard_preserves_a_sibling_cycle_receipt(self) -> None:
+        settled = self.plant_receipt()
+        sibling = self.plant_receipt("model-call-8")
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        result.mark_consumed()
+        self.assertFalse(settled.exists())
+        self.assertTrue(sibling.exists())
+        self.assertTrue((self.root / ".agent-execution" / "results").is_dir())
+
+    def test_remote_cycle_has_no_local_receipt_to_discard(self) -> None:
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        result.mark_consumed()
+        self.assertEqual(self.execution["processed"], True)
+        self.assertNotIn("evidence_discard_error", self.execution)
+
+    def test_historical_contract_path_discards_nothing(self) -> None:
+        stray = self.plant_receipt()
+        legacy = self.root / "outputs/agent-execution-worker-result.json"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("{}", encoding="utf-8")
+        self.execution["expected_worker_protocol_version"] = 1
+        self.execution["worker_result_path"] = "outputs/agent-execution-worker-result.json"
+        self.artifact_calls = [CommandResult(0, worker_artifact(protocol=1), "")]
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        self.assertEqual(result.exit_status, 0, result.stderr)
+        result.mark_consumed()
+        self.assertTrue(stray.exists())
+        self.assertTrue(legacy.exists())
+
+    def test_undiscardable_receipt_is_recorded_and_marking_continues(self) -> None:
+        receipt = self.root / worker_evidence_path(KEY)
+        receipt.mkdir(parents=True)
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        result.mark_consumed()
+        self.assertEqual(self.execution["processed"], True)
+        self.assertIsInstance(self.execution["evidence_discard_error"], str)
+        self.assertTrue(receipt.is_dir())
+        # A retry after the obstruction clears discards and clears the error.
+        receipt.rmdir()
+        self.plant_receipt()
+        self.mark.append(CommandResult(0, "", ""))
+        result.mark_consumed()
+        self.assertNotIn("evidence_discard_error", self.execution)
+        self.assertFalse((self.root / ".agent-execution").exists())
+
+    def test_settled_file_ingestion_discards_the_ingested_receipt(self) -> None:
+        receipt = self.plant_receipt(content=worker_artifact())
+        result = self.runner.retrieve_from_file(
+            job_id=JOB, cwd=self.root, execution=self.execution, artifact_path=receipt
+        )
+        assert isinstance(result, CommandResult)
+        self.assertEqual(result.exit_status, 0, result.stderr)
+        self.assertTrue(receipt.exists())
+        result.mark_consumed()
+        self.assertFalse(receipt.exists())
+        self.assertFalse((self.root / ".agent-execution").exists())
+
+    def test_file_ingestion_never_deletes_a_caller_supplied_artifact(self) -> None:
+        artifact = self.root / "artifact.json"
+        artifact.write_text(worker_artifact(), encoding="utf-8")
+        result = self.runner.retrieve_from_file(
+            job_id=JOB, cwd=self.root, execution=self.execution, artifact_path=artifact
+        )
+        assert isinstance(result, CommandResult)
+        result.mark_consumed()
+        self.assertTrue(artifact.exists())
+
     def test_retrieval_does_not_submit_or_fallback(self) -> None:
         result = self.retrieve()
         self.assertIsInstance(result, CommandResult)

@@ -121,6 +121,10 @@ entity RetrievalOutcome {
     job: WeftJob
     -- ingested: artifact consumed exactly once; lost: proven failed with no
     -- artifact; unresolved: the job's live state explains the absence.
+    -- The local protocol-2 receipt doubles as the detached-cycle recovery
+    -- handle, so it survives until the consumer acknowledges durable
+    -- ingestion; only then is the in-tree receipt discarded, since the
+    -- banked record and the durable artifact store supersede it.
     resolution: ingested | lost | unresolved
     detail: String
 }
