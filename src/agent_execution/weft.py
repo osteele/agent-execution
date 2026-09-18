@@ -1822,6 +1822,23 @@ class WeftCommandRunner:
                         "receipt_stdout": _tail(submission.stdout),
                         "receipt_stderr": _tail(submission.stderr),
                     },
+                    # Reaching here means the probe above ran and found no job
+                    # attributable to this call. That is a proven absence, and
+                    # recording it is what lets a consumer retry safely: an
+                    # unobserved outcome must not be re-dispatched, but a
+                    # dispatch proven never to have created a job spawned
+                    # nothing and can duplicate nothing. Unrecorded, the
+                    # distinction is invisible and the request never settles
+                    # -- measured on cycle ff82c4337350, four hours `running`
+                    # over a cycle that had completed.
+                    "processing": {
+                        "state": "unknown",
+                        "step": "submission_receipt",
+                        "detail": (
+                            "no Weft job was attributable to this model call when probed; "
+                            "the submission receipt could not be read"
+                        ),
+                    },
                 }
                 raise WeftExecutionAmbiguous(str(error)) from error
             attempts.append(

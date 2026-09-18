@@ -760,3 +760,32 @@ class JobAttributionTests(unittest.TestCase):
         self.assertIsNone(
             submitted_job_from_listing(listing(correct, version=True), model_call_id=KEY)
         )
+
+
+class UnreadableReceiptProbeTests(AdmissionTests):
+    """An unreadable receipt whose probe found nothing records that it found nothing.
+
+    Consumers must not retry an unobserved outcome — re-dispatching one risks
+    running a review that already ran. But this path probes Weft for a job
+    attributable to the call and only raises when the probe comes back empty,
+    which is a proven absence rather than an unknown. Leaving that out of the
+    record made the two indistinguishable, and agent-review then held a
+    request `running` for four hours over a cycle that had completed
+    (cycle ff82c4337350).
+    """
+
+    def test_a_probed_absence_is_recorded_as_such(self) -> None:
+        self.submissions = [CommandResult(0, "not json", "")]
+
+        with self.assertRaises(WeftExecutionAmbiguous):
+            self.run_dispatch()
+
+        assert self.runner.last_execution is not None
+        execution = json.loads(json.dumps(self.runner.last_execution))
+        self.assertEqual(execution["processing"]["state"], "unknown")
+        self.assertEqual(execution["processing"]["step"], "submission_receipt")
+        self.assertIn("no Weft job was attributable", execution["processing"]["detail"])
+        self.assertNotIn("job_id", execution)
+        # The returned bytes stay, because the message alone says a receipt did
+        # not parse and not what arrived.
+        self.assertIn("unreadable_receipt", execution["diagnostics"])
