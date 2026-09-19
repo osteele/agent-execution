@@ -17,6 +17,8 @@ from agent_execution.command import CommandResult
 from agent_execution.identity import worker_evidence_path
 from agent_execution.omp_execution import omp_transcript
 from agent_execution.weft import (
+    ARTIFACT_RETRIEVAL_SECONDS,
+    LOST_OBSERVATION_PROBE_SECONDS,
     WeftAdmissionCancelled,
     WeftCommandRunner,
     WeftExecutionAmbiguous,
@@ -351,7 +353,10 @@ class AdmissionTests(unittest.TestCase):
         self.assert_remote(self.run_dispatch())
         self.assertFalse(any(command[1] == "status" for command, _, _ in self.calls))
         artifact_budgets = [budget for command, _, budget in self.calls if command[1] == "artifact"]
-        self.assertEqual(artifact_budgets, [30.0])
+        # The property is that the fetch gets a FRESH budget rather than the
+        # submission's exhausted deadline; the size is the retrieval constant,
+        # which is deliberately larger than a status probe's (wb139).
+        self.assertEqual(artifact_budgets, [ARTIFACT_RETRIEVAL_SECONDS])
 
     def test_receipt_at_deadline_without_artifact_detaches(self) -> None:
         self.submit_elapsed = 30.0
@@ -789,3 +794,22 @@ class UnreadableReceiptProbeTests(AdmissionTests):
         # The returned bytes stay, because the message alone says a receipt did
         # not parse and not what arrived.
         self.assertIn("unreadable_receipt", execution["diagnostics"])
+
+
+class RetrievalBudgetTests(unittest.TestCase):
+    """Reading a result is not the same operation as asking after a job.
+
+    Weft's wb139 diagnosis: retrieval spent 10-15s listing R2 prefixes and
+    15-25s downloading a 6-13 MB payload, exceeding the 30s probe budget this
+    module reused. The TimeoutExpired became
+    WeftExecutionDetached("outlived its local waiter"), and a completed review
+    was recorded unretrievable because the budget for reading it was sized for
+    asking after it.
+    """
+
+    def test_a_result_download_gets_more_than_a_status_lookup(self) -> None:
+        self.assertGreater(ARTIFACT_RETRIEVAL_SECONDS, LOST_OBSERVATION_PROBE_SECONDS)
+
+    def test_the_retrieval_budget_covers_the_measured_worst_case(self) -> None:
+        """15s listing plus 25s download was the observed failure, with headroom."""
+        self.assertGreaterEqual(ARTIFACT_RETRIEVAL_SECONDS, 40.0)

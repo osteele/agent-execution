@@ -48,6 +48,21 @@ ReadinessObservation = Callable[[str], tuple[str, str]]
 ARTIFACT_RETRY_DELAYS = (0.5, 1.0, 2.0)
 ADMISSION_RETRY_DELAYS = (1.0, 2.0)
 LOST_OBSERVATION_PROBE_SECONDS = 30.0
+#: How long a worker RESULT may take to arrive, as distinct from how long it
+#: takes to ask whether a job exists. One constant served both, and the two
+#: answer to different quantities: a probe is a status lookup, while a
+#: retrieval downloads the reviewer's output. Weft measured the consequence --
+#: 10-15s listing R2 prefixes plus 15-25s downloading a 6-13 MB payload
+#: exceeded the 30s probe budget, raising TimeoutExpired, which this module
+#: translated into WeftExecutionDetached("outlived its local waiter") and the
+#: register recorded as unretrievable. A completed review became unreachable
+#: because the budget for reading it was sized for asking after it (wb139).
+#:
+#: Weft has since made retrieval fast, so this is latent rather than active.
+#: It is separated anyway: a payload-sized operation must not inherit a
+#: lookup-sized bound, or the same fault returns the next time a result is
+#: large or a link is slow.
+ARTIFACT_RETRIEVAL_SECONDS = 300.0
 REMOTE_OBSERVATION_SECONDS = 900.0
 DIAGNOSTIC_TAIL_LINES = 200
 
@@ -810,7 +825,7 @@ class WeftCommandRunner:
         Returns ``None`` when the artifact is not there, which is the genuine detached
         case and the only one that leaves work for a later retrieval.
         """
-        deadline = self.clock() + LOST_OBSERVATION_PROBE_SECONDS
+        deadline = self.clock() + ARTIFACT_RETRIEVAL_SECONDS
         try:
             artifact = self._artifact(job_id, cwd, deadline)
         except (WeftExecutionAmbiguous, WeftExecutionDetached, OSError):
