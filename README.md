@@ -92,6 +92,30 @@ accepted or local fallback fails. Each attempt also retains the existing
 when absent. Codes and human-only details explain refusals without changing
 retry policy or granting fallback authority.
 
+## Shared provider status
+
+`agent-execution provider` records provider availability, authentication,
+inventory, quota, and transport observations in `provider-status/v2`. Writers
+commit immutable events under `~/.claude/state/provider-status-v2` before a
+best-effort background upload to the `weft-results` R2 bucket. Unsent events
+remain in the local outbox. An R2 outage never blocks model execution.
+
+Account names and credential values are excluded. Credential identities become
+HMAC fingerprints, which allow observations about one account to remain
+separate from another without publishing either identity.
+
+```sh
+agent-execution provider probe --sync --json
+agent-execution provider status --refresh --json
+agent-execution provider sync --json
+```
+
+The status command emits `provider-status-snapshot/v2`. Consumers should use
+this CLI contract instead of reading the cache directory. Every observation
+includes its host, OS user, route, billing pool, credential fingerprint,
+provenance, observation time, and expiration time. Stale observations remain
+visible but do not make a route unavailable.
+
 ## Checks
 
 ```sh

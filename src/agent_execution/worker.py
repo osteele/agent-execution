@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from agent_execution import __version__, provider_health
+from agent_execution import __version__, provider_status
 from agent_execution.command import CommandResult, CommandRunner
 from agent_execution.costs import estimate_execution_cost, require_cost_cap, validate_max_cost_usd
 from agent_execution.identity import source_sha256, worker_evidence_path
@@ -617,28 +617,25 @@ def _fsync_directory(path: Path) -> None:
 _PROVIDER_ATTRIBUTABLE = {"harness_failed", "evidence_failed"}
 
 
-def _publish_provider_health(result: WorkerResult, *, route: str) -> None:
+def _publish_provider_status(result: WorkerResult, *, route: str) -> None:
     """Share what this call observed about its provider route.
 
     The worker is the only component that watches a provider refuse. Without
     this, agent-review cuts reviewer anchors and the delegate picker chooses
     delegates while blind to a cap that this process already read in the
-    provider's own words — which is how a review cycle came to re-dispatch into
-    the same weekly cap for two days (2026-09-15, cycle da2afd9e).
+    provider's own words.
 
-    Best-effort by construction: reporting is a side benefit of running the
-    call, never a condition of it, so a failure to write must not turn a
-    completed model call into a failed one.
+    Publication first commits an immutable local observation. Central sync is
+    deliberately separate: an unavailable registry must never turn a completed
+    model call into a failed one.
     """
     if not route:
         return
     try:
         if result.status == "completed":
-            # A success is evidence any standing record is stale. Clearing beats
-            # waiting out a cooldown we inferred from a previous failure.
-            provider_health.clear(route)
+            provider_status.record_success(route)
         elif result.status in _PROVIDER_ATTRIBUTABLE and result.failure:
-            provider_health.record(route, result.failure)
+            provider_status.record_refusal(route, result.failure)
     except OSError:
         return
 
@@ -746,7 +743,7 @@ def execute_worker(
     prompt = ""
     prompt_sha256 = ""
     harness_started_at: float | None = None
-    # The provider route this call resolved to, for provider-health reporting.
+    # The provider route this call resolved to, for shared status reporting.
     # A one-element list rather than a closed-over name: `finish` is defined
     # here but `omp_invocation` is not bound until the harness is validated far
     # below, and every preflight failure returns through `finish` before that.
@@ -785,7 +782,7 @@ def execute_worker(
             harness_started_at=harness_started_at,
             omp_evidence=omp_evidence,
         )
-        _publish_provider_health(result, route=selected_route[0] or provider)
+        _publish_provider_status(result, route=selected_route[0] or provider)
         _write_result(output, result, cwd=working_directory)
         return result
 
