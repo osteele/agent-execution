@@ -29,10 +29,14 @@ Consumers that embed the worker install it into their own environment
 - Bun >= 1.3.14 only for the OMP adapter; `install-omp` provisions the
   lockfile-pinned SDK under `~/.local/share/agent-execution/omp-sdk/<version>`.
 - `workspace-write-no-shell` admits only supported writer identities
-  `kimi-code/k3` and `openai-codex/gpt-6-astra`; read-only grounded
-  selector rules are unchanged. Its write/edit tools refuse VCS and harness
-  metadata such as `.omp`, preserve existing ordinary-file permission bits on
-  replacement, and create new files with conservative permissions.
+  `kimi-code/k3` and `openai-codex/gpt-6-{sol,luna,astra}`. Sol is the ordinary
+  OpenAI default; Luna supports focused work, and Astra is reserved for explicit
+  largest-model escalation. Grounded reviews default to
+  `anthropic/claude-opus-5-5` or `openai-codex/gpt-6-sol` for those providers;
+  Luna and Astra are also admitted as explicit read-only selectors. Its
+  write/edit tools refuse VCS and harness metadata such as `.omp`, preserve
+  existing ordinary-file permission bits on replacement, and create new files
+  with conservative permissions.
 
 ## Worker evidence
 

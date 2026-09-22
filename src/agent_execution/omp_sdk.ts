@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type * as OmpSdk from "@oh-my-pi/pi-coding-agent";
 
-export const SDK_VERSION = "18.1.15";
+export const SDK_VERSION = "18.2.10";
 export const READ_TOOLS = ["execution_read", "execution_glob", "execution_grep"];
 export const WRITE_TOOLS = [...READ_TOOLS, "execution_write", "execution_edit"];
 export const TOOLS = READ_TOOLS;

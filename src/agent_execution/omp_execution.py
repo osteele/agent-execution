@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
     from agent_execution.processes import ProcessIdentity
 
-OMP_SDK_VERSION = "18.1.15"
+OMP_SDK_VERSION = "18.2.10"
 OMP_EXECUTION_SCHEMA = "agent-execution.omp-execution/v1"
 OMP_TRANSCRIPT_SCHEMA = "agent-execution.omp-transcript/v1"
 #: Provider-qualified models admitted to the grounded SDK boundary. The same
@@ -31,22 +31,32 @@ OMP_TRANSCRIPT_SCHEMA = "agent-execution.omp-transcript/v1"
 #: validation, and transcript validation so a model upgrade cannot leave one
 #: layer accepting an identity another rejects.
 GROUNDED_OMP_SELECTORS_BY_PROVIDER: dict[str, str] = {
-    "anthropic": "anthropic/claude-opus-5",
-    "openai-codex": "openai-codex/gpt-6-astra",
+    "anthropic": "anthropic/claude-opus-5-5",
+    "openai-codex": "openai-codex/gpt-6-sol",
     "zhipu-coding-plan": "zhipu-coding-plan/glm-5.3-flash",
     "kimi-code": "kimi-code/kimi-k2.5",
 }
 DEFAULT_GROUNDED_OMP_SELECTOR = GROUNDED_OMP_SELECTORS_BY_PROVIDER["anthropic"]
-GROUNDED_OMP_SELECTORS = frozenset(GROUNDED_OMP_SELECTORS_BY_PROVIDER.values())
+#: Provider defaults above are the automatic roster. Additional selectors are
+#: admitted only when explicitly requested: Luna for economical focused work,
+#: Astra for rare largest-model escalation.
+GROUNDED_OMP_SELECTORS = frozenset(
+    {
+        *GROUNDED_OMP_SELECTORS_BY_PROVIDER.values(),
+        "openai-codex/gpt-6-luna",
+        "openai-codex/gpt-6-astra",
+    }
+)
 #: Historical grounded selectors remain parseable for durable retrieval but
 #: cannot pass launch validation after retirement.
 GROUNDED_OMP_TRANSCRIPT_SELECTORS = frozenset(
-    {*GROUNDED_OMP_SELECTORS, "anthropic/claude-opus-4-6"}
+    {*GROUNDED_OMP_SELECTORS, "anthropic/claude-opus-4-6", "anthropic/claude-opus-5"}
 )
 #: Automatic reviewers frozen before a selector upgrade may follow the current
 #: route on retry. Caller-pinned selectors never use this map.
 RETIRED_GROUNDED_OMP_SELECTOR_REPLACEMENTS: dict[str, str] = {
     "anthropic/claude-opus-4-6": DEFAULT_GROUNDED_OMP_SELECTOR,
+    "anthropic/claude-opus-5": DEFAULT_GROUNDED_OMP_SELECTOR,
 }
 #: Provider keys that can displace a stored subscription credential. Restricted
 #: OMP strips all of them. ``ZAI_API_KEY`` is deliberately absent: it is the
@@ -66,6 +76,8 @@ OMP_WRITER_SELECTORS = frozenset(
     {
         "kimi-code/k3",
         GROUNDED_OMP_SELECTORS_BY_PROVIDER["openai-codex"],
+        "openai-codex/gpt-6-luna",
+        "openai-codex/gpt-6-astra",
     }
 )
 
@@ -177,7 +189,7 @@ def validate_omp_command(
         raise ValueError("OMP requires an exact provider/model selector")
     grounded_selectors = GROUNDED_OMP_TRANSCRIPT_SELECTORS if historical else GROUNDED_OMP_SELECTORS
     if policy == _GROUNDED and selector not in grounded_selectors:
-        permitted = ", ".join(GROUNDED_OMP_SELECTORS_BY_PROVIDER.values())
+        permitted = ", ".join(sorted(GROUNDED_OMP_SELECTORS))
         raise ValueError(f"grounded OMP selector must be registered: {permitted}")
     if policy == _WRITER and selector not in OMP_WRITER_SELECTORS:
         permitted = ", ".join(sorted(OMP_WRITER_SELECTORS))
@@ -261,7 +273,11 @@ def omp_transcript(
     header = events[0]
     if header.get("type") != "execution" or header.get("schema_version") != OMP_EXECUTION_SCHEMA:
         raise ValueError("OMP output lacks restricted execution attestation")
-    if header.get("sdk_version") != OMP_SDK_VERSION or header.get("harness") != "omp":
+    # Stored transcripts retain their original, previously supported SDK pin.
+    if (
+        header.get("sdk_version") not in ("18.1.15", OMP_SDK_VERSION)
+        or header.get("harness") != "omp"
+    ):
         raise ValueError("OMP execution has unsupported SDK or harness identity")
     selected = header.get("selector")
     selected_policy = header.get("tool_policy")

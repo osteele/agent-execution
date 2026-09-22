@@ -84,7 +84,7 @@ class RetrievalTests(unittest.TestCase):
             "worker_result_path": worker_evidence_path(KEY),
             "omp_policy": "read-only-no-shell",
             "prompt_sha256": hashlib.sha256(b"review").hexdigest(),
-            "omp_selector": "anthropic/claude-opus-5",
+            "omp_selector": "anthropic/claude-opus-5-5",
         }
         self.runner = WeftCommandRunner(
             host="studio",
@@ -357,7 +357,7 @@ class RetrievalTests(unittest.TestCase):
         self.execution.pop("worker_result_path")
         self.execution["omp_selector"] = selector
         command = dispatch_command().replace("--expect-protocol 2", "--expect-protocol 1")
-        command = command.replace("anthropic/claude-opus-5", selector)
+        command = command.replace("anthropic/claude-opus-5-5", selector)
         command = command.replace(" -- ", f" --evidence-out {path} -- ", 1)
         self.inspect = CommandResult(0, inspect_record(command=command), "")
         self.artifact_calls = [CommandResult(0, worker_artifact(protocol=1, selector=selector), "")]

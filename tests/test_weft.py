@@ -78,7 +78,7 @@ def worker_artifact(
     *,
     packet: bool = False,
     writer: bool = False,
-    selector: str = "anthropic/claude-opus-5",
+    selector: str = "anthropic/claude-opus-5-5",
     protocol: int = WORKER_PROTOCOL_VERSION,
 ) -> str:
     stdout = omp_output(

@@ -16,7 +16,7 @@ from agent_execution.omp_execution import (
 def omp_events(
     *,
     cwd: str,
-    selector: str = "anthropic/claude-opus-5",
+    selector: str = "anthropic/claude-opus-5-5",
     policy: str = "read-only-no-shell",
     prompt: str = "review",
     final: str = "final response",
@@ -113,7 +113,7 @@ def omp_events(
 def omp_output(
     *,
     cwd: str,
-    selector: str = "anthropic/claude-opus-5",
+    selector: str = "anthropic/claude-opus-5-5",
     policy: str = "read-only-no-shell",
     prompt: str = "review",
     final: str = "final response",
@@ -135,7 +135,7 @@ def omp_output(
 def omp_command(
     cwd: str,
     *,
-    selector: str = "anthropic/claude-opus-5",
+    selector: str = "anthropic/claude-opus-5-5",
     packet: bool = False,
     writer: bool = False,
     prompt: str = "review",
