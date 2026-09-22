@@ -436,7 +436,9 @@ def _probe_omp_auth_status(
         return None
     credential = status.get("credential_type")
     return (
-        credential if isinstance(credential, str) and credential in {"oauth", "api_key"} else None
+        credential
+        if isinstance(credential, str) and credential in {"oauth", "api_key", "missing", "unknown"}
+        else None
     )
 
 
@@ -521,15 +523,14 @@ def _cached_observation(
     *,
     fingerprint: str,
     now: float,
-    ttl: float,
+    ttl: float | None,
 ) -> CredentialBasis | None:
-    """Serve a cached row only when it was written by these cache semantics.
+    """Read a cache row written by these semantics for the same launch route.
 
     A row is usable when it carries the current cache version, matches the
-    fingerprint, and was observed in a past-but-recent moment: a negative or
-    future `observed_at` is corrupt rather than immortal, a non-finite one
-    compares as neither and is refused with them, and a row written under
-    retired cache semantics is re-probed rather than trusted.
+    fingerprint, and was observed in a non-future moment. Passing a TTL also
+    requires a fresh row; omitting it recovers prior direct evidence after a
+    transient probe failure.
     """
     if not isinstance(cached, dict):
         return None
@@ -545,7 +546,9 @@ def _cached_observation(
     if isinstance(observed_at, bool) or not isinstance(observed_at, (int, float)):
         return None
     observed = float(observed_at)
-    if not (0.0 <= observed <= now) or now - observed >= ttl:
+    if not (0.0 <= observed <= now):
+        return None
+    if ttl is not None and now - observed >= ttl:
         return None
     reported = row.get("reported_source")
     return CredentialBasis(
@@ -575,9 +578,10 @@ def observe_credential_basis(
     environment, the working directory, and the profile/home config selection,
     so a changed route re-probes; expired by ``ttl`` because an approval
     decision changes the answer without changing the environment; and
-    invalidated as a whole by the cache version. ``refresh=True`` skips the
-    cache read for a caller that must have a fresh answer, such as a hard-cap
-    check about to authorize dispatch.
+    invalidated as a whole by the cache version. ``refresh=True`` forces a new
+    probe before serving the result. A transient no-answer does not erase older
+    direct evidence for the same route; explicit missing or changed credentials
+    do.
 
     ``state_root=None`` probes without any cache: a worker with no database
     still gets a real observation. A harness with no known status command is
@@ -621,18 +625,24 @@ def observe_credential_basis(
         env_keys=_CACHE_ENV_KEYS[name],
     )
     path = None if state_root is None else _cache_path(state_root)
-    if path is not None and not refresh and path.exists():
+    cached: dict[str, object] = {}
+    previous: CredentialBasis | None = None
+    if path is not None and path.exists():
         try:
-            cached = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+            loaded = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
-            cached = {}
-        if not isinstance(cached, dict):
-            cached = {}
-        served = _cached_observation(
-            cached.get(executable), fingerprint=fingerprint, now=now, ttl=ttl
+            loaded = {}
+        if isinstance(loaded, dict):
+            cached = loaded
+        previous = _cached_observation(
+            cached.get(executable), fingerprint=fingerprint, now=now, ttl=None
         )
-        if served is not None:
-            return served
+        if not refresh:
+            served = _cached_observation(
+                cached.get(executable), fingerprint=fingerprint, now=now, ttl=ttl
+            )
+            if served is not None:
+                return served
     reported = probe(
         resolved,
         cwd=cwd,
@@ -640,6 +650,8 @@ def observe_credential_basis(
         profile=profile,
         timeout=_PROBE_TIMEOUT_SECONDS if timeout is None else timeout,
     )
+    if reported is None and previous is not None and previous.reported_source is not None:
+        return previous
     observation = CredentialBasis(
         harness=executable,
         basis=_SOURCE_BASIS_FOR_HARNESS[name](reported),
