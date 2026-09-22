@@ -224,6 +224,7 @@ class AdmissionTests(unittest.TestCase):
         result = self.run_dispatch()
         self.assert_remote(result)
         submitted = next(argv for argv, _, _ in self.calls if argv[1] == "run")
+        self.assertIn("--if-online", submitted)
         self.assertEqual(
             submitted[submitted.index("--produces") + 1],
             ".agent-execution/results/model-call-7.json",
@@ -238,6 +239,26 @@ class AdmissionTests(unittest.TestCase):
         summary = result.execution["worker_result"]
         assert isinstance(summary, dict)
         self.assertEqual(summary["artifact_path"], artifact[-1])
+
+    def test_queue_enabled_submission_does_not_require_an_online_host(self) -> None:
+        self.runner = WeftCommandRunner(
+            host="studio",
+            agent="omp",
+            model_call_id=KEY,
+            fallback=self.fallback,
+            invoke=self.invoke,
+            clock=lambda: self.now,
+            sleep=self.sleep,
+            admission_wait=self.wait,
+            expected_source_sha256=SOURCE,
+            allow_queue=True,
+        )
+        self.submissions = [CommandResult(0, receipt("queued"), "")]
+
+        self.assert_remote(self.run_dispatch())
+
+        submitted = next(argv for argv, _, _ in self.calls if argv[1] == "run")
+        self.assertNotIn("--if-online", submitted)
 
     def test_tracked_result_survives_waiter_exit_and_later_completion(self) -> None:
         self.submissions = [CommandResult(0, receipt(), "")]
@@ -633,7 +654,7 @@ class AdmissionTests(unittest.TestCase):
 
 class ReceiptTests(unittest.TestCase):
     def test_supported_decisions_round_trip(self) -> None:
-        for decision in ("accepted_immediately", "deduplicated", "not_accepted"):
+        for decision in ("accepted_immediately", "queued", "deduplicated", "not_accepted"):
             parsed = WeftRunReceipt.parse(receipt(decision), idempotency_key=KEY)
             self.assertEqual(
                 WeftRunReceipt.parse(json.dumps(parsed.to_dict()), idempotency_key=KEY),
@@ -687,6 +708,7 @@ class ReceiptTests(unittest.TestCase):
             receipt("not_accepted", job_id="wj42"),
             receipt("not_accepted", deduplicated=True),
             receipt("deduplicated", deduplicated=False),
+            receipt("queued", accepted_immediately=True),
             receipt(deduplicated="false"),
         ]
         for raw in invalid:

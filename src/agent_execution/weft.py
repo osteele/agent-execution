@@ -146,6 +146,7 @@ class WeftRunReceipt:
         decision = raw.get("placement_decision")
         if not isinstance(decision, str) or decision not in {
             "accepted_immediately",
+            "queued",
             "deduplicated",
             "not_accepted",
         }:
@@ -179,6 +180,8 @@ class WeftRunReceipt:
             raise ValueError("accepted Weft receipt lacks a job ID or source pin")
         if decision == "accepted_immediately" and not accepted:
             raise ValueError("accepted_immediately Weft receipt denies immediate acceptance")
+        if decision == "queued" and accepted:
+            raise ValueError("queued Weft receipt claims immediate acceptance")
         if decision == "deduplicated" and not deduplicated:
             raise ValueError("deduplicated Weft receipt lacks its deduplication flag")
         return receipt
@@ -365,6 +368,7 @@ class WeftCommandRunner:
         submitter_session: str | None = None,
         readiness: ReadinessObservation | None = None,
         max_cost_usd: float | None = None,
+        allow_queue: bool = False,
     ) -> None:
         self.host = host
         self.agent = agent
@@ -381,6 +385,7 @@ class WeftCommandRunner:
         self.readiness = readiness
 
         self.max_cost_usd = validate_max_cost_usd(max_cost_usd)
+        self.allow_queue = allow_queue
         self.prompt_sha256: str | None = None
         self.omp_selector: str | None = None
         self.omp_policy: str | None = None
@@ -1464,7 +1469,7 @@ class WeftCommandRunner:
                     self.worker_result_path,
                     "--payload",
                     f"{WORKER_PROMPT_PAYLOAD}={payload.name}",
-                    "--if-online",
+                    *([] if self.allow_queue else ["--if-online"]),
                     "--idempotency-key",
                     self.model_call_id,
                     "--json",
