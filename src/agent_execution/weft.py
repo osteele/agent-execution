@@ -1308,8 +1308,19 @@ class WeftCommandRunner:
             return unknown
         artifact: CommandResult | None = None
         artifact_detail = ""
+        # A download is not a status lookup. `timeout` here is the caller's
+        # probe budget, defaulting to LOST_OBSERVATION_PROBE_SECONDS, and
+        # spending it on a payload is exactly the fault wb139 recorded: a
+        # 2.1 MB result over a slow link exceeded 30s, raised TimeoutExpired,
+        # and was reported as "worker-result artifact could not be read" for a
+        # completed review that `weft artifact get` fetched without trouble
+        # (ar67). `_worker_result_after_lost_observation` was separated then;
+        # this path was not, so the same fault returned the first time a
+        # result was large.
         try:
-            artifact = self._worker_result(job_id, cwd, self.clock() + timeout)
+            artifact = self._worker_result(
+                job_id, cwd, self.clock() + max(timeout, ARTIFACT_RETRIEVAL_SECONDS)
+            )
         except (WeftExecutionAmbiguous, WeftExecutionDetached, OSError) as error:
             artifact_detail = str(error)
         if artifact is not None and artifact.exit_status == 0:

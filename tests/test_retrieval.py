@@ -12,6 +12,8 @@ from pathlib import Path
 from agent_execution.command import CommandResult
 from agent_execution.identity import worker_evidence_path
 from agent_execution.weft import (
+    ARTIFACT_RETRIEVAL_SECONDS,
+    LOST_OBSERVATION_PROBE_SECONDS,
     SUPPORTED_WORKER_PROTOCOL_VERSIONS,
     WeftCommandRunner,
     WeftJobFailure,
@@ -132,6 +134,24 @@ class RetrievalTests(unittest.TestCase):
         return self.runner.retrieve(
             job_id=JOB, cwd=self.root, execution=self.execution, timeout=timeout
         )
+
+    def test_a_retrieval_download_is_not_bounded_by_the_probe_budget(self) -> None:
+        """A completed result must not be unreadable because it is large (ar67).
+
+        `retrieve` takes a probe-sized timeout, and spending it on the payload
+        made a finished review unreachable: a 2.1 MB artifact over a slow link
+        exceeded 30s and was reported as 'worker-result artifact could not be
+        read', while `weft artifact get` fetched the same file at exit 0. The
+        lost-observation path was separated from the probe budget by wb139;
+        this one was not.
+        """
+        self.retrieve(timeout=LOST_OBSERVATION_PROBE_SECONDS)
+
+        budgets = [timeout for command, _, timeout in self.calls if command[1] == "artifact"]
+        self.assertTrue(budgets, "no artifact fetch was attempted")
+        for budget in budgets:
+            assert budget is not None
+            self.assertGreaterEqual(budget, ARTIFACT_RETRIEVAL_SECONDS)
 
     def test_valid_artifact_requires_explicit_acknowledgment(self) -> None:
         result = self.retrieve()
