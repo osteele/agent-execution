@@ -1,15 +1,31 @@
 /** Restricted OMP SDK execution. Never imports configuration or tools from the reviewed tree. */
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, lstat, open, readFile, realpath, readdir, rename, rm, stat } from "node:fs/promises";
+import {
+	chmod,
+	lstat,
+	open,
+	readFile,
+	realpath,
+	readdir,
+	rename,
+	rm,
+	stat,
+} from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type * as OmpSdk from "@oh-my-pi/pi-coding-agent";
 
 export const SDK_VERSION = "18.2.10";
-export const READ_TOOLS = ["execution_read", "execution_glob", "execution_grep"];
+export const READ_TOOLS = [
+	"execution_read",
+	"execution_glob",
+	"execution_grep",
+];
 export const WRITE_TOOLS = [...READ_TOOLS, "execution_write", "execution_edit"];
 export const TOOLS = READ_TOOLS;
 const MAX_BYTES = 512 * 1024;
+// A source file can be larger than its bounded read or search result.
+const MAX_READ_BYTES = 4 * 1024 * 1024;
 const FORBIDDEN_METADATA = new Set([
 	".git",
 	".jj",
@@ -58,7 +74,10 @@ function rejectUnsafePath(value: string, forbidMetadata: boolean): void {
 async function safeSnapshotPath(
 	root: string,
 	value: string,
-	{ mustExist, forbidMetadata = false }: { mustExist: boolean; forbidMetadata?: boolean },
+	{
+		mustExist,
+		forbidMetadata = false,
+	}: { mustExist: boolean; forbidMetadata?: boolean },
 ): Promise<string> {
 	rejectUnsafePath(value, forbidMetadata);
 	const rootReal = await realpath(root);
@@ -73,7 +92,8 @@ async function safeSnapshotPath(
 		cursor = join(cursor, parts[index]);
 		try {
 			const info = await lstat(cursor);
-			if (info.isSymbolicLink()) throw new Error("Symlink paths are not permitted");
+			if (info.isSymbolicLink())
+				throw new Error("Symlink paths are not permitted");
 			if (index < parts.length - 1 && !info.isDirectory())
 				throw new Error("Path parent is not a directory");
 		} catch (error) {
@@ -98,12 +118,12 @@ async function textFile(
 ): Promise<{ path: string; text: string }> {
 	const path = await confinedPath(root, value);
 	const info = await stat(path);
-	if (!info.isFile() || info.size > MAX_BYTES)
+	if (!info.isFile() || info.size > MAX_READ_BYTES)
 		throw new UnsupportedTextFile(
-			"Read requires a regular file of at most 512 KiB",
+			"Read requires a regular file of at most 4 MiB",
 		);
 	const bytes = await readFile(path);
-	if (bytes.length > MAX_BYTES || bytes.includes(0))
+	if (bytes.length > MAX_READ_BYTES || bytes.includes(0))
 		throw new UnsupportedTextFile("Binary or oversized file is not readable");
 	try {
 		return {
@@ -140,7 +160,15 @@ async function files(root: string, base: string): Promise<string[]> {
 	return found.sort();
 }
 
+function checkResultSize(bytes: number): void {
+	if (bytes > MAX_BYTES)
+		throw new Error(
+			"Tool result exceeds 512 KiB; narrow the path, pattern, or line range",
+		);
+}
+
 function response(text: string, paths: string[]) {
+	checkResultSize(Buffer.byteLength(text, "utf8"));
 	return {
 		content: [{ type: "text" as const, text }],
 		details: { paths },
@@ -169,7 +197,10 @@ async function atomicTextReplace(
 	if (encoded.length > MAX_BYTES) throw new Error("Write exceeds 512 KiB");
 	const permissions = mode & 0o777;
 	await assertSafeParent(root, path);
-	const temporary = join(dirname(path), `.agent-execution-write-${process.pid}-${randomUUID()}`);
+	const temporary = join(
+		dirname(path),
+		`.agent-execution-write-${process.pid}-${randomUUID()}`,
+	);
 	let handle;
 	try {
 		handle = await open(temporary, "wx", permissions);
@@ -189,7 +220,7 @@ export function writeTools(z: typeof OmpSdk.z, root: string) {
 	return [
 		...readTools(z, root),
 		{
-			name: "execution_write",
+			name: "execution_write" as const,
 			label: "Write snapshot",
 			description:
 				"Replace or create one UTF-8 file inside the execution snapshot. Relative paths only; symlinks, traversal, URLs and VCS metadata are refused.",
@@ -220,7 +251,7 @@ export function writeTools(z: typeof OmpSdk.z, root: string) {
 			},
 		},
 		{
-			name: "execution_edit",
+			name: "execution_edit" as const,
 			label: "Edit snapshot",
 			description:
 				"Replace exactly one matching UTF-8 span inside an existing snapshot file. Ambiguous, missing, no-op, symlink and metadata edits are refused.",
@@ -249,7 +280,8 @@ export function writeTools(z: typeof OmpSdk.z, root: string) {
 					before.slice(0, first) +
 					args.new_text +
 					before.slice(first + args.old_text.length);
-				if (after === before) throw new Error("Edit would not change file bytes");
+				if (after === before)
+					throw new Error("Edit would not change file bytes");
 				await atomicTextReplace(root, path, after, info.mode);
 				return response(`edited ${path}`, [path]);
 			},
@@ -260,10 +292,10 @@ export function writeTools(z: typeof OmpSdk.z, root: string) {
 export function readTools(z: typeof OmpSdk.z, root: string) {
 	return [
 		{
-			name: "execution_read",
+			name: "execution_read" as const,
 			label: "Read snapshot",
 			description:
-				"Read a UTF-8 file inside the execution snapshot. No URLs, internal devices, shell, or document converters. Line offsets start at 1.",
+				"Read a UTF-8 file of at most 4 MiB inside the execution snapshot. Results are limited to 512 KiB. No URLs, internal devices, shell, or document converters. Line offsets start at 1.",
 			parameters: z.object({
 				path: z.string(),
 				offset: z.number().int().min(1).optional(),
@@ -287,7 +319,7 @@ export function readTools(z: typeof OmpSdk.z, root: string) {
 			},
 		},
 		{
-			name: "execution_glob",
+			name: "execution_glob" as const,
 			label: "List snapshot",
 			description:
 				"Find snapshot files by glob (relative to path, default snapshot root). Symlinks are not followed.",
@@ -307,10 +339,10 @@ export function readTools(z: typeof OmpSdk.z, root: string) {
 			},
 		},
 		{
-			name: "execution_grep",
+			name: "execution_grep" as const,
 			label: "Search snapshot",
 			description:
-				"Search UTF-8 snapshot files for a literal string (not a regex). File path or directory path is required. Symlinks, binary and oversized files are not scanned.",
+				"Search UTF-8 snapshot files for a literal string (not a regex). File path or directory path is required. Symlinks, binary and files over 4 MiB are not scanned. Results are limited to 512 KiB.",
 			parameters: z.object({ pattern: z.string().min(1), path: z.string() }),
 			async execute(_id: string, args: { pattern: string; path: string }) {
 				const base = await confinedPath(root, args.path);
@@ -320,19 +352,25 @@ export function readTools(z: typeof OmpSdk.z, root: string) {
 				const matches: string[] = [];
 				const readPaths: string[] = [];
 				const skipped: string[] = [];
+				let resultBytes = 0;
+				const appendResult = (destination: string[], line: string) => {
+					resultBytes += Buffer.byteLength(line, "utf8") + 1;
+					checkResultSize(resultBytes);
+					destination.push(line);
+				};
 				for (const path of inputs) {
 					let file;
 					try {
 						file = await textFile(root, relative(root, path));
 					} catch (error) {
 						if (!(error instanceof UnsupportedTextFile)) throw error;
-						skipped.push(`${path}: ${error.message}`);
+						appendResult(skipped, `${path}: ${error.message}`);
 						continue;
 					}
 					readPaths.push(path);
 					for (const [index, line] of file.text.split("\n").entries()) {
 						if (line.includes(args.pattern))
-							matches.push(`${path}:${index + 1}: ${line}`);
+							appendResult(matches, `${path}:${index + 1}: ${line}`);
 						if (matches.length > 1000)
 							throw new Error("More than 1000 matching lines; narrow search");
 					}

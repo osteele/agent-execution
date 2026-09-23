@@ -67,7 +67,6 @@ test("read, glob and literal search expose served paths but neither execute nor 
 	const read = tools.find((tool) => tool.name === "execution_read")!;
 	const result = await read.execute("read-1", {
 		path: "source.txt",
-		pattern: "",
 		offset: 2,
 		limit: 1,
 	});
@@ -84,12 +83,78 @@ test("read, glob and literal search expose served paths but neither execute nor 
 	});
 	expect(searched.content[0].text).toContain(":2: needle");
 	expect(searched.details.paths).toEqual([join(root, "source.txt")]);
-	await expect(
-		read.execute("escape-1", { path: "escape", pattern: "" }),
-	).rejects.toThrow();
+	await expect(read.execute("escape-1", { path: "escape" })).rejects.toThrow();
 	expect(await readFile(join(root, "source.txt"), "utf8")).toBe(
 		"first\nneedle\nlast\n",
 	);
+});
+
+test("ranged reads and literal search inspect large sources without widening writes", async () => {
+	const root = await snapshot();
+	const source = "padding\n".repeat(70_000) + "large-source-marker\n";
+	await writeFile(join(root, "large.txt"), source);
+	const sdkRoot =
+		process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
+		join(homedir(), ".local/share/agent-execution/omp-sdk", SDK_VERSION);
+	// The SDK location is selected by the runtime environment.
+	const sdk = await import(
+		pathToFileURL(
+			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
+		).href
+	);
+	const tools = readTools(sdk.z, root);
+	const read = tools.find((tool) => tool.name === "execution_read")!;
+	const ranged = await read.execute("large-read", {
+		path: "large.txt",
+		offset: 70_001,
+		limit: 1,
+	});
+	expect(ranged.content[0].text).toContain("70001: large-source-marker");
+	expect(ranged.content[0].text).not.toContain("padding");
+	const grep = tools.find((tool) => tool.name === "execution_grep")!;
+	const searched = await grep.execute("large-search", {
+		path: "large.txt",
+		pattern: "large-source-marker",
+	});
+	expect(searched.content[0].text).toContain(":70001: large-source-marker");
+	expect(searched.details.paths).toEqual([join(root, "large.txt")]);
+	const write = writeTools(sdk.z, root).find(
+		(tool) => tool.name === "execution_write",
+	)!;
+	await expect(
+		write.execute("large-write", {
+			path: "large.txt",
+			content: source + "changed\n",
+		}),
+	).rejects.toThrow();
+	expect(await readFile(join(root, "large.txt"), "utf8")).toBe(source);
+});
+
+test("read and search bound emitted UTF-8 bytes even for one long line", async () => {
+	const root = await snapshot();
+	await writeFile(join(root, "long.txt"), "漢".repeat(200_000));
+	const sdkRoot =
+		process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
+		join(homedir(), ".local/share/agent-execution/omp-sdk", SDK_VERSION);
+	// The SDK location is selected by the runtime environment.
+	const sdk = await import(
+		pathToFileURL(
+			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
+		).href
+	);
+	const tools = readTools(sdk.z, root);
+	const read = tools.find((tool) => tool.name === "execution_read")!;
+	await expect(
+		read.execute("long-read", {
+			path: "long.txt",
+			offset: 1,
+			limit: 1,
+		}),
+	).rejects.toThrow();
+	const grep = tools.find((tool) => tool.name === "execution_grep")!;
+	await expect(
+		grep.execute("long-search", { path: "long.txt", pattern: "漢" }),
+	).rejects.toThrow();
 });
 
 test("workspace-write tools change snapshot bytes and refuse ambiguous edits", async () => {
@@ -100,7 +165,7 @@ test("workspace-write tools change snapshot bytes and refuse ambiguous edits", a
 	const sdk = await import(
 		pathToFileURL(
 			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
-		).href,
+		).href
 	);
 	const tools = writeTools(sdk.z, root);
 	const write = tools.find((tool) => tool.name === "execution_write")!;
@@ -143,7 +208,7 @@ test("workspace-write tools refuse escapes symlinks and metadata", async () => {
 	const sdk = await import(
 		pathToFileURL(
 			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
-		).href,
+		).href
 	);
 	const tools = writeTools(sdk.z, root);
 	const write = tools.find((tool) => tool.name === "execution_write")!;
@@ -192,8 +257,13 @@ test("a writer cannot overwrite another call's authoritative result", async () =
 		"outputs/AGENT-EXECUTION-WORKER-RESULT.json",
 	];
 	for (const path of evidence) {
-		await mkdir(join(root, path.substring(0, path.lastIndexOf("/"))), { recursive: true });
-		await writeFile(join(root, path), '{"model_call_id":"other-call","status":"completed"}');
+		await mkdir(join(root, path.substring(0, path.lastIndexOf("/"))), {
+			recursive: true,
+		});
+		await writeFile(
+			join(root, path),
+			'{"model_call_id":"other-call","status":"completed"}',
+		);
 	}
 	const sdkRoot =
 		process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
@@ -202,7 +272,7 @@ test("a writer cannot overwrite another call's authoritative result", async () =
 	const sdk = await import(
 		pathToFileURL(
 			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
-		).href,
+		).href
 	);
 	const tools = writeTools(sdk.z, root);
 	const write = tools.find((tool) => tool.name === "execution_write")!;
@@ -210,15 +280,27 @@ test("a writer cannot overwrite another call's authoritative result", async () =
 	for (const path of evidence) {
 		const before = await readFile(join(root, path), "utf8");
 		await expect(
-			write.execute("writer-overwrite", { path, content: '{"status":"completed","forged":true}' }),
+			write.execute("writer-overwrite", {
+				path,
+				content: '{"status":"completed","forged":true}',
+			}),
 		).rejects.toThrow();
 		await expect(
-			edit.execute("writer-edit", { path, old_text: "completed", new_text: "forged" }),
+			edit.execute("writer-edit", {
+				path,
+				old_text: "completed",
+				new_text: "forged",
+			}),
 		).rejects.toThrow();
 		expect(await readFile(join(root, path), "utf8")).toBe(before);
 	}
-	await write.execute("ordinary-output", { path: "outputs/report.json", content: '{"report":true}' });
-	expect(await readFile(join(root, "outputs/report.json"), "utf8")).toBe('{"report":true}');
+	await write.execute("ordinary-output", {
+		path: "outputs/report.json",
+		content: '{"report":true}',
+	});
+	expect(await readFile(join(root, "outputs/report.json"), "utf8")).toBe(
+		'{"report":true}',
+	);
 });
 
 test("workspace-write replacement does not mutate outside hardlink targets", async () => {
@@ -234,7 +316,7 @@ test("workspace-write replacement does not mutate outside hardlink targets", asy
 	const sdk = await import(
 		pathToFileURL(
 			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
-		).href,
+		).href
 	);
 	const write = writeTools(sdk.z, root).find(
 		(tool) => tool.name === "execution_write",
@@ -247,7 +329,6 @@ test("workspace-write replacement does not mutate outside hardlink targets", asy
 	expect(await readFile(join(parent, "shared.txt"), "utf8")).toBe("outside\n");
 });
 
-
 test("workspace-write replacement preserves existing executable mode", async () => {
 	const root = await snapshot();
 	const script = join(root, "run.sh");
@@ -259,7 +340,7 @@ test("workspace-write replacement preserves existing executable mode", async () 
 	const sdk = await import(
 		pathToFileURL(
 			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
-		).href,
+		).href
 	);
 	const tools = writeTools(sdk.z, root);
 	const write = tools.find((tool) => tool.name === "execution_write")!;
@@ -279,4 +360,3 @@ test("workspace-write replacement preserves existing executable mode", async () 
 	expect(await readFile(script, "utf8")).toBe("#!/bin/sh\necho newer\n");
 	expect((await stat(script)).mode & 0o777).toBe(beforeMode);
 });
-
