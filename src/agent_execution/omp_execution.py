@@ -72,9 +72,14 @@ OMP_WRITE_TOOLS = (*OMP_READ_TOOLS, "execution_write", "execution_edit")
 _PACKET = "packet-only-no-tools"
 _GROUNDED = "read-only-no-shell"
 _WRITER = "workspace-write-no-shell"
+#: Identities admitted to ``workspace-write-no-shell``. This is a curated
+#: allowlist, not a projection of the grounded registry: Kimi writes as ``k3``
+#: rather than its grounded ``kimi-k2.5``, so membership is stated per provider
+#: and a provider admitted for review is not thereby admitted to write.
 OMP_WRITER_SELECTORS = frozenset(
     {
         GROUNDED_OMP_SELECTORS_BY_PROVIDER["anthropic"],
+        GROUNDED_OMP_SELECTORS_BY_PROVIDER["zhipu-coding-plan"],
         "kimi-code/k3",
         GROUNDED_OMP_SELECTORS_BY_PROVIDER["openai-codex"],
         "openai-codex/gpt-6-luna",
