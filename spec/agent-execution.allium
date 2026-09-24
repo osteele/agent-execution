@@ -96,7 +96,10 @@ entity Dispatch {
         -- this namespace (case-insensitive) or legacy worker-result filenames.
         -- New execution accepts no caller-selected evidence output location.
         harness_policy = workspace_write_no_shell implies harness_selector in {
+            "anthropic/claude-opus-5-5",
             "kimi-code/k3",
+            "openai-codex/gpt-6-sol",
+            "openai-codex/gpt-6-luna",
             "openai-codex/gpt-6-astra",
         }
     }

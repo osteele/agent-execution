@@ -267,6 +267,32 @@ class WorkerResultTests(unittest.TestCase):
         )
         self.assertEqual(stored, result)
 
+    def test_workspace_writer_admits_opus(self) -> None:
+        selector = "anthropic/claude-opus-5-5"
+        invoked: list[list[str]] = []
+
+        def invoke(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
+            invoked.append(command)
+            return CommandResult(
+                0,
+                omp_output(cwd=str(cwd), selector=selector, policy="workspace-write-no-shell"),
+                "",
+            )
+
+        with mock.patch("agent_execution.worker.require_omp_sdk", return_value=(self.root, "bun")):
+            result = execute_worker(
+                provider="omp",
+                model_call_id="opus-writer",
+                command=omp_command(str(self.root), selector=selector, writer=True),
+                invoke=invoke,
+                timeout=30.0,
+                ctx_timeout=10.0,
+                which=lambda name: None,
+                cwd=self.root,
+            )
+        self.assertEqual(result.status, "completed", result.failure)
+        self.assertEqual(len(invoked), 1)
+
     def test_workspace_writer_refuses_unregistered_identity_before_harness(self) -> None:
         with mock.patch("agent_execution.worker.require_omp_sdk", return_value=(self.root, "bun")):
             result = execute_worker(

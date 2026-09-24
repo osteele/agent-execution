@@ -74,6 +74,7 @@ _GROUNDED = "read-only-no-shell"
 _WRITER = "workspace-write-no-shell"
 OMP_WRITER_SELECTORS = frozenset(
     {
+        GROUNDED_OMP_SELECTORS_BY_PROVIDER["anthropic"],
         "kimi-code/k3",
         GROUNDED_OMP_SELECTORS_BY_PROVIDER["openai-codex"],
         "openai-codex/gpt-6-luna",
