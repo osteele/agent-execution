@@ -1,0 +1,1171 @@
+-- allium: 3
+-- provider-scheduling.allium
+--
+-- Scope: shared provider observations, probabilistic availability and quota
+-- inference, cross-host scheduling, execution fallback, repair, synchronization,
+-- retention, and operator governance for one user's subscription-backed agents.
+-- Includes: synchronous and asynchronous execution, offline operation, evidence
+-- provenance, quota reset prediction, capability beliefs, host pressure, and audit.
+-- Excludes: multi-user tenancy, credential storage or rotation, automatic harness
+-- installation on disabled hosts, central retention of full raw diagnostics,
+-- exposure of intermediate scheduler hypotheses to agent sessions, and globally
+-- exactly-once execution during network partitions.
+-- Dependencies: harness execution and durable raw execution evidence are governed
+-- by agent-execution.allium; providers, harnesses, hosts, and network paths are
+-- external systems observed by this specification.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity Principal {
+    principal_id: String
+    active: Boolean
+    authority: ClientAuthority | ReporterAuthority | ExecutorAuthority | MaintainerAuthority | OperatorAuthority
+}
+
+variant ClientAuthority : Principal {}
+variant ReporterAuthority : Principal {}
+variant ExecutorAuthority : Principal {}
+variant MaintainerAuthority : Principal {}
+variant OperatorAuthority : Principal {}
+
+external entity InferencePayload {
+    digest: String
+}
+
+external entity InferenceResult {
+    digest: String
+}
+
+external entity RawExecutionEvidence {
+    evidence_id: String
+    restricted: Boolean
+}
+
+external entity ProviderStatusSource {
+    source_id: String
+    schema_version: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value SoftwareIdentity {
+    name: String
+    release_version: String?
+    source_digest: String?
+    git_commit: String?
+    jj_change_id: String?
+    protocol_version: String?
+}
+
+value EvidenceTime {
+    occurred_at: Timestamp?
+    observed_at: Timestamp
+    received_at: Timestamp
+    uncertainty: Duration
+    source_sequence: Integer?
+}
+
+value NetworkContext {
+    host: HostName
+    exit_node: String?
+    routing_profile: String?
+    vpn_state: String?
+    fingerprint: String
+}
+
+value EvidenceProvenance {
+    reporter_class: ReporterClass
+    reporter_id: String
+    evidence_form: EvidenceForm
+    source_reliability: Decimal
+    producer: SoftwareIdentity
+    harness: SoftwareIdentity?
+    execution_context: String?
+}
+
+value QuotaSubject {
+    service: SubscriptionService
+    pool_kind: QuotaPoolKind
+    model_family: ModelFamily?
+    provider_pool_id: String?
+}
+
+value QuotaMeasurement {
+    native_value: String?
+    normalized_remaining_fraction: Decimal?
+    provider_reported_reset_at: Timestamp?
+    predicted_reset_at: Timestamp?
+    reset_uncertainty: Duration?
+}
+
+value ResourceProbability {
+    resource: ResourceKind
+    probability: Decimal
+}
+
+value DerivationVersion {
+    inference_model: String
+    scheduler_policy: String
+    capability_priors: String
+    normalization_schema: String
+}
+
+value HardConstraints {
+    provider: ProviderId?
+    service: SubscriptionService?
+    model: String?
+    harness: HarnessName?
+    host: HostName?
+    required_capabilities: Set<String>
+    privacy_requirements: Set<String>
+    max_marginal_cost_usd: Decimal?
+}
+
+value RoutePreferences {
+    preferred_provider: ProviderId?
+    preferred_harness: HarnessName?
+    preferred_host: HostName?
+}
+
+value TerminalExplanation {
+    blocking_disposition: Disposition?
+    unmet_constraint: String?
+    next_recovery_at: Timestamp?
+    recovery_action: String?
+    evidence_ids: Set<String>
+}
+
+value SuccessfulExecution {
+    provider: ProviderId
+    service: SubscriptionService
+    model: String
+    harness: HarnessName
+    host: HostName
+    billing_class: BillingClass
+    attempt_id: String
+    result: InferenceResult
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ProviderId {
+    abliteration | aiand | `alibaba-coding-plan` | `alibaba-token-plan` |
+    anthropic | baseten | cerebras | `charm-hyper` | `cline-pass` |
+    `cloudflare-ai-gateway` | commandcode | coreweave | cursor | deepinfra |
+    deepseek | devin | exa | firepass | fireworks | `github-copilot` |
+    `gitlab-duo` | `gitlab-duo-agent` | `gmi-cloud` | `google-antigravity` |
+    `google-gemini-cli` | huggingface | kagi | kilo | `kimi-code` |
+    litellm | `llama.cpp` | `lm-studio` | meta | `minimax-code` |
+    `minimax-code-cn` | moonshot | `muse-code` | nanogpt | novita | nvidia |
+    ollama | `ollama-cloud` | `openai-codex` | `openai-codex-device` |
+    `opencode-go` | `opencode-zen` | openrouter | parallel | perplexity |
+    qianfan | `qwen-portal` | sakana | siliconflow | `siliconflow-cn` |
+    stencil | synthetic | tavily | together | typesafe | umans | venice |
+    `vercel-ai-gateway` | vllm | `wafer-serverless` | xai | `xai-oauth` |
+    xiaomi | `xiaomi-token-plan-ams` | `xiaomi-token-plan-cn` |
+    `xiaomi-token-plan-sgp` | `yolo-auto` | zai | `zai-coding-plan` |
+    `zhipu-coding-plan` | zenmux
+}
+
+enum SubscriptionService {
+    anthropic | google_antigravity | kimi_code | openai_codex | zhipu_coding_plan
+}
+
+enum HostName { workstation | studio | cool30 | cool100 }
+enum HarnessName { claude | codex | opencode | kimi | gemini | agy | omp }
+enum ModelFamily { gemini | other | unknown }
+enum QuotaPoolKind { session | week | month | unknown }
+enum ReporterClass { human | agent | scheduler | harness | provider | host_monitor | deployment_tool }
+enum EvidenceForm { direct_output | structured_status | quoted_output | paraphrase | inference | manual_statement }
+enum ObservationKind {
+    execution_outcome | quota_status | authentication_status | subscription_status |
+    capability_result | host_health | network_health | deployment_status |
+    collector_parse_failure | user_report
+}
+enum Cause {
+    quota_exhausted | subscription_lapsed | credential_missing_or_invalid |
+    capability_absent | provider_outage | network_connectivity | network_routing |
+    harness_defect | deployment_outdated | host_contention | directory_unclean |
+    request_invalid | policy_denied | cancelled | unknown
+}
+enum ResourceKind { cpu | memory | swap | disk | gpu | process_capacity | unknown }
+enum BillingClass { subscription_included | free | metered_paid | unknown }
+enum Disposition {
+    eligible | avoid | defer_until | repair_deployment | repair_required |
+    disabled | permanently_blocked
+}
+enum RequestMode { synchronous | asynchronous }
+enum RequestState { queued | running | succeeded | failed | cancelled }
+enum AttemptState { admitted | running | succeeded | failed | cancelled | redundant }
+enum LeaseKind { admission | execution | repair }
+enum IncidentState { open | resolved }
+enum PolicyProfile { interactive | batch | reliability_critical }
+enum CandidateState { draft | replayed | approved | active | retired }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity Host {
+    name: HostName
+}
+
+entity ProviderAlias {
+    alias: String
+    service: SubscriptionService
+}
+
+entity QuotaPool {
+    subject: QuotaSubject
+}
+
+entity ExecutionOption {
+    option_id: String
+    host: Host
+    harness: HarnessName
+    provider: ProviderId
+    service: SubscriptionService
+    model_family: ModelFamily?
+    installed: Boolean
+    explicitly_enabled: Boolean
+    billing_class: BillingClass
+    billing_class_established_at: Timestamp?
+}
+
+entity InitialOptionState {
+    option: ExecutionOption
+    disposition: Disposition
+    basis: String
+}
+
+entity Observation {
+    observation_id: String
+    kind: ObservationKind
+    provenance: EvidenceProvenance
+    time: EvidenceTime
+    network_context: NetworkContext?
+    host: Host?
+    option: ExecutionOption?
+    quota_subject: QuotaSubject?
+    capability: String?
+    failure_mode: String?
+    reported_cause: Cause?
+    resource_probabilities: Set<ResourceProbability>
+    quota: QuotaMeasurement?
+    safe_excerpt: String?
+    diagnostic_digest: String?
+    raw_evidence: RawExecutionEvidence?
+    positive: Boolean
+}
+
+entity Projection {
+    projection_id: String
+    option: ExecutionOption
+    active_probability: Decimal
+    quota_available_probability: Decimal
+    cause_probabilities: String
+    capability_probabilities: String
+    disposition: Disposition
+    defer_until: Timestamp?
+    computed_at: Timestamp
+    evidence_ids: Set<String>
+    version: DerivationVersion
+}
+
+entity ModelCandidate {
+    version: DerivationVersion
+    state: CandidateState
+    replay_report_digest: String?
+    disposition_change_report_digest: String?
+    approved_by: Principal?
+}
+
+entity ExecutionRequest {
+    request_id: String
+    client_id: String
+    idempotency_key: String
+    mode: RequestMode
+    state: RequestState
+    profile: PolicyProfile
+    payload: InferencePayload
+    payload_digest: String
+    hard_constraints: HardConstraints
+    preferences: RoutePreferences
+    submitted_at: Timestamp
+    deadline_at: Timestamp?
+    attempt_cost_budget: Decimal?
+    content_expires_at: Timestamp
+    content_available: Boolean
+    local_during_partition: Boolean
+    success: SuccessfulExecution?
+    failure: TerminalExplanation?
+
+    attempts: ExecutionAttempt with request = this
+}
+
+entity ExecutionAttempt {
+    attempt_id: String
+    request: ExecutionRequest
+    option: ExecutionOption
+    state: AttemptState
+    started_at: Timestamp
+    completed_at: Timestamp?
+    billing_class: BillingClass
+    estimated_quota_consumption: String?
+    actual_quota_consumption: String?
+    result: InferenceResult?
+    result_digest: String?
+    result_delivered: Boolean
+}
+
+entity ExecutionLease {
+    lease_id: String
+    kind: LeaseKind
+    holder: Principal
+    request: ExecutionRequest?
+    option: ExecutionOption?
+    quota_subject: QuotaSubject?
+    version_mismatch: String?
+    expires_at: Timestamp
+}
+
+entity MaintenanceIncident {
+    incident_id: String
+    option: ExecutionOption
+    disposition: Disposition
+    state: IncidentState
+    opened_at: Timestamp
+    resolved_at: Timestamp?
+    evidence_ids: Set<String>
+}
+
+entity StatusSourceState {
+    source: ProviderStatusSource
+    last_success_at: Timestamp?
+    last_attempt_at: Timestamp?
+    retry_after: Timestamp?
+    stale: Boolean
+    schema_recognized: Boolean
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    payload_delivery_window: Duration = 7.days
+}
+
+------------------------------------------------------------
+-- Defaults
+------------------------------------------------------------
+
+default Host workstation_host = { name: workstation }
+default Host studio_host = { name: studio }
+default Host cool30_host = { name: cool30 }
+default Host cool100_host = { name: cool100 }
+
+-- No ExecutionOption is present for cool30 or cool100. Every harness on those
+-- hosts is unschedulable until an explicit deployment creates and enables it.
+
+default ProviderAlias claude_alias = { alias: "claude", service: anthropic }
+default ProviderAlias codex_alias = { alias: "codex", service: openai_codex }
+default ProviderAlias zai_alias = { alias: "zai", service: zhipu_coding_plan }
+default ProviderAlias zai_plan_alias = { alias: "zai-coding-plan", service: zhipu_coding_plan }
+
+default QuotaPool anthropic_session = {
+    subject: { service: anthropic, pool_kind: session, model_family: null, provider_pool_id: null }
+}
+default QuotaPool anthropic_week = {
+    subject: { service: anthropic, pool_kind: week, model_family: null, provider_pool_id: null }
+}
+-- Antigravity keeps Gemini quota separate from the shared pool used by older
+-- Claude and Codex models.
+default QuotaPool antigravity_gemini_session = {
+    subject: { service: google_antigravity, pool_kind: session, model_family: gemini, provider_pool_id: null }
+}
+default QuotaPool antigravity_gemini_week = {
+    subject: { service: google_antigravity, pool_kind: week, model_family: gemini, provider_pool_id: null }
+}
+default QuotaPool antigravity_other_session = {
+    subject: { service: google_antigravity, pool_kind: session, model_family: other, provider_pool_id: null }
+}
+default QuotaPool antigravity_other_week = {
+    subject: { service: google_antigravity, pool_kind: week, model_family: other, provider_pool_id: null }
+}
+-- Kimi exposes session and weekly status. Monthly exhaustion is inferred from
+-- failures because no direct monthly status is available.
+default QuotaPool kimi_session = {
+    subject: { service: kimi_code, pool_kind: session, model_family: null, provider_pool_id: null }
+}
+default QuotaPool kimi_week = {
+    subject: { service: kimi_code, pool_kind: week, model_family: null, provider_pool_id: null }
+}
+default QuotaPool kimi_month = {
+    subject: { service: kimi_code, pool_kind: month, model_family: null, provider_pool_id: null }
+}
+default QuotaPool codex_session = {
+    subject: { service: openai_codex, pool_kind: session, model_family: null, provider_pool_id: null }
+}
+default QuotaPool codex_week = {
+    subject: { service: openai_codex, pool_kind: week, model_family: null, provider_pool_id: null }
+}
+default QuotaPool zhipu_session = {
+    subject: { service: zhipu_coding_plan, pool_kind: session, model_family: null, provider_pool_id: null }
+}
+default QuotaPool zhipu_week = {
+    subject: { service: zhipu_coding_plan, pool_kind: week, model_family: null, provider_pool_id: null }
+}
+
+default ExecutionOption workstation_agy = {
+    option_id: "workstation/agy/google-antigravity",
+    host: workstation_host,
+    harness: agy,
+    provider: `google-antigravity`,
+    service: google_antigravity,
+    model_family: unknown,
+    installed: true,
+    explicitly_enabled: true,
+    billing_class: subscription_included,
+    billing_class_established_at: null
+}
+default ExecutionOption studio_agy = {
+    option_id: "studio/agy/google-antigravity",
+    host: studio_host,
+    harness: agy,
+    provider: `google-antigravity`,
+    service: google_antigravity,
+    model_family: unknown,
+    installed: true,
+    explicitly_enabled: true,
+    billing_class: subscription_included,
+    billing_class_established_at: null
+}
+default ExecutionOption workstation_omp_antigravity = {
+    option_id: "workstation/omp/google-antigravity",
+    host: workstation_host,
+    harness: omp,
+    provider: `google-antigravity`,
+    service: google_antigravity,
+    model_family: unknown,
+    installed: true,
+    explicitly_enabled: true,
+    billing_class: subscription_included,
+    billing_class_established_at: null
+}
+default ExecutionOption studio_omp_antigravity = {
+    option_id: "studio/omp/google-antigravity",
+    host: studio_host,
+    harness: omp,
+    provider: `google-antigravity`,
+    service: google_antigravity,
+    model_family: unknown,
+    installed: true,
+    explicitly_enabled: true,
+    billing_class: subscription_included,
+    billing_class_established_at: null
+}
+
+default InitialOptionState workstation_agy_state = {
+    option: workstation_agy,
+    disposition: eligible,
+    basis: "user reports that agy works on the workstation"
+}
+default InitialOptionState studio_agy_state = {
+    option: studio_agy,
+    disposition: repair_required,
+    basis: "agy does not work on Studio"
+}
+default InitialOptionState workstation_omp_antigravity_state = {
+    option: workstation_omp_antigravity,
+    disposition: repair_required,
+    basis: "the Antigravity provider does not execute through OMP"
+}
+default InitialOptionState studio_omp_antigravity_state = {
+    option: studio_omp_antigravity,
+    disposition: repair_required,
+    basis: "the Antigravity provider does not execute through OMP"
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule ObservationAccepted {
+    when: ReporterSubmitsObservation(reporter, observation)
+    requires: reporter.active
+    requires: reporter.authority = ReporterAuthority
+    requires: not exists Observation{observation_id: observation.observation_id}
+    requires: observation.provenance.reporter_id = reporter.principal_id
+
+    ensures: Observation.created(
+        observation_id: observation.observation_id,
+        kind: observation.kind,
+        provenance: observation.provenance,
+        time: observation.time,
+        network_context: observation.network_context,
+        host: observation.host,
+        option: observation.option,
+        quota_subject: observation.quota_subject,
+        capability: observation.capability,
+        failure_mode: observation.failure_mode,
+        reported_cause: observation.reported_cause,
+        resource_probabilities: observation.resource_probabilities,
+        quota: observation.quota,
+        safe_excerpt: observation.safe_excerpt,
+        diagnostic_digest: observation.diagnostic_digest,
+        raw_evidence: observation.raw_evidence,
+        positive: observation.positive
+    )
+}
+
+rule DuplicateObservationIgnored {
+    when: ReporterSubmitsObservation(reporter, observation)
+    requires: reporter.active
+    requires: exists Observation{observation_id: observation.observation_id}
+
+    ensures: ExistingObservationReturned(observation.observation_id)
+}
+
+rule ProjectionRecomputed {
+    when: observation: Observation.created
+
+    ensures: evaluate_inference(
+        observation: observation,
+        retained_observations: Observations,
+        active_version: active_derivation_version()
+    )
+
+    @guidance
+        -- The model retains probabilities for competing causes and capabilities.
+        -- Newer applicable direct-output or structured-status positive evidence
+        -- has precedence over older evidence. Human and agent reports update
+        -- beliefs according to source reliability; they are not overrides.
+        -- Ambiguous negative evidence decays toward its prior. Definitive quota
+        -- exhaustion follows its reset rather than decaying, and definitive
+        -- subscription lapse persists until positive replacement evidence.
+        -- A generic quota refusal updates applicable pools without inventing a
+        -- known pool kind. Success clears applicable exhaustion but re-anchors a
+        -- quota cycle only when its evidence supplies a new reset time.
+        -- Correlated nearby failures inform network and routing causes even when
+        -- only some providers fail. A Kimi missing-key message from OMP remains
+        -- ambiguous because network failure can produce the same symptom.
+        -- Capability configuration supplies priors; version-scoped successes and
+        -- failures update capability beliefs through competing explanations.
+        -- Host load alone does not establish CPU contention. CPU, memory, swap,
+        -- and other resource probabilities may rise together from raw metrics.
+}
+
+rule PredictedQuotaResetMakesRouteOptimistic {
+    when: projection: Projection.defer_until <= now
+    requires: projection.disposition = defer_until
+
+    ensures: projection.disposition = eligible
+    ensures: projection.defer_until = null
+
+    @guidance
+        -- Selection may proceed without a probe. New direct evidence may
+        -- immediately overturn the optimistic disposition.
+}
+
+rule DirectBillingEvidencePersists {
+    when: BillingClassEstablished(option, billing_class, observation)
+    requires: observation.positive
+    requires: billing_class in {subscription_included, free, metered_paid}
+
+    ensures: option.billing_class = billing_class
+    ensures: option.billing_class_established_at = observation.time.observed_at
+
+    @guidance
+        -- Transient authentication or status-refresh failure does not revert a
+        -- known billing class to unknown. Credential replacement, sign-out,
+        -- subscription lapse, or newer contradictory direct evidence may revise it.
+}
+
+rule StatusRefreshFailed {
+    when: ProviderStatusRefreshFailed(source, observation, retry_after)
+
+    ensures: source.stale = true
+    ensures: source.retry_after = retry_after
+    ensures: ReporterSubmitsObservation(CurrentReporter(), observation)
+}
+
+rule StatusRefreshSucceeded {
+    when: ProviderStatusRefreshSucceeded(source, observed_at)
+
+    ensures: source.last_success_at = observed_at
+    ensures: source.last_attempt_at = observed_at
+    ensures: source.stale = false
+    ensures: source.schema_recognized = true
+}
+
+rule UnrecognizedStatusSchemaRecorded {
+    when: ProviderStatusSchemaUnrecognized(source, observation)
+
+    ensures: source.schema_recognized = false
+    ensures: source.stale = true
+    ensures: ReporterSubmitsObservation(CurrentReporter(), observation)
+}
+
+rule NewExecutionSubmitted {
+    when: ClientSubmitsExecution(client, submission)
+    requires: client.active
+    requires: client.authority = ClientAuthority
+    requires:
+        not exists ExecutionRequest{
+            client_id: client.principal_id,
+            idempotency_key: submission.idempotency_key
+        }
+
+    ensures: ExecutionRequest.created(
+        request_id: submission.request_id,
+        client_id: client.principal_id,
+        idempotency_key: submission.idempotency_key,
+        mode: submission.mode,
+        state: queued,
+        profile: submission.profile,
+        payload: submission.payload,
+        payload_digest: submission.payload.digest,
+        hard_constraints: submission.hard_constraints,
+        preferences: submission.preferences,
+        submitted_at: now,
+        deadline_at: submission.deadline_at,
+        attempt_cost_budget: submission.attempt_cost_budget,
+        content_expires_at: now + config.payload_delivery_window,
+        content_available: true,
+        local_during_partition: submission.local_during_partition,
+        success: null,
+        failure: null
+    )
+}
+
+rule DuplicateExecutionSubmissionReturned {
+    when: ClientSubmitsExecution(client, submission)
+    requires: client.active
+    requires:
+        exists ExecutionRequest{
+            client_id: client.principal_id,
+            idempotency_key: submission.idempotency_key
+        }
+
+    ensures: ExistingExecutionRequestReturned(client.principal_id, submission.idempotency_key)
+}
+
+rule QueuedRequestScheduled {
+    when: request: ExecutionRequest.state becomes queued
+    requires: request.content_available
+
+    ensures: choose_route(
+        request: request,
+        projections: Projections,
+        considering: {
+            request.hard_constraints,
+            request.preferences,
+            request.profile,
+            request.deadline_at,
+            request.attempt_cost_budget,
+            InitialOptionStates,
+            active_admission_leases(),
+            current_host_pressure(),
+            fallback_options(),
+            uncertainty_and_information_value()
+        }
+    )
+
+    @guidance
+        -- Exploration remains internal. The client receives a successful result
+        -- or a terminal explanation, not an exploratory sequence or hypothesis.
+        -- An avoid route is last-resort selectable. Disabled, repair-required,
+        -- and permanently-blocked routes are not ordinary execution candidates.
+}
+
+rule UninstalledOptionDisabled {
+    when: option: ExecutionOption.created
+    requires: not option.installed
+
+    ensures: option.explicitly_enabled = false
+    ensures: ProjectionDispositionRequested(option, disabled, null, {})
+}
+
+rule RouteAdmitted {
+    when: RouteSelected(request, option, executor, lease, estimated_quota)
+    requires: executor.active
+    requires: executor.authority = ExecutorAuthority
+    requires: option.explicitly_enabled
+    requires: option.installed
+    requires: option_satisfies(request.hard_constraints, option)
+    requires:
+        request.hard_constraints.max_marginal_cost_usd != 0 or
+        option.billing_class in {subscription_included, free}
+    requires: not active_conflicting_lease(lease)
+
+    ensures: request.state = running
+    ensures: ExecutionLease.created(
+        lease_id: lease.lease_id,
+        kind: admission,
+        holder: executor,
+        request: request,
+        option: option,
+        quota_subject: quota_subject_for(option),
+        version_mismatch: null,
+        expires_at: lease.expires_at
+    )
+    ensures: ExecutionAttempt.created(
+        attempt_id: new_attempt_id(request, option),
+        request: request,
+        option: option,
+        state: admitted,
+        started_at: now,
+        completed_at: null,
+        billing_class: option.billing_class,
+        estimated_quota_consumption: estimated_quota,
+        actual_quota_consumption: null,
+        result: null,
+        result_digest: null,
+        result_delivered: false
+    )
+}
+
+rule AttemptSucceeded {
+    when: AttemptCompleted(attempt, result, actual_quota)
+    requires: attempt.state in {admitted, running}
+
+    ensures: attempt.state = succeeded
+    ensures: attempt.completed_at = now
+    ensures: attempt.result = result
+    ensures: attempt.result_digest = result.digest
+    ensures: attempt.actual_quota_consumption = actual_quota
+    ensures: attempt.request.state = succeeded
+    ensures: attempt.request.success = successful_execution_for(attempt, result)
+    ensures: QuotaReservationReconciled(attempt, actual_quota)
+}
+
+rule AttemptFailed {
+    when: AttemptFailedWithEvidence(attempt, observation)
+    requires: attempt.state in {admitted, running}
+
+    ensures: attempt.state = failed
+    ensures: attempt.completed_at = now
+    ensures: ReporterSubmitsObservation(CurrentReporter(), observation)
+    ensures: QuotaReservationReleased(attempt)
+    ensures: RetryDecisionRequested(attempt.request)
+}
+
+rule RetryOnlyWhenProspectImproves {
+    when: RetryDecisionRequested(request)
+    requires: request_within_bounds(request)
+    requires: same_route_prospect_materially_improved(request) or viable_alternative_exists(request)
+
+    ensures: request.state = queued
+}
+
+rule RequestFailsTerminally {
+    when: RetryDecisionRequested(request)
+    requires:
+        not request_within_bounds(request) or
+        (not same_route_prospect_materially_improved(request) and not viable_alternative_exists(request))
+
+    ensures: request.state = failed
+    ensures: request.failure = terminal_explanation_for(request)
+}
+
+rule ExecutionCancelled {
+    when: ClientCancelsExecution(client, request)
+    requires: client.active
+    requires: client.principal_id = request.client_id
+    requires: request.state in {queued, running}
+
+    ensures: request.state = cancelled
+    ensures: NewAttemptsPrevented(request)
+    ensures: RunningAttemptsCancellationRequested(request)
+
+    @guidance
+        -- Cancellation is best-effort. It preserves all observations and cannot
+        -- invalidate a completion that was concurrent or already observed.
+}
+
+rule ExpiredExecutionLeaseRecovered {
+    when: lease: ExecutionLease.expires_at <= now
+    requires: lease.kind = execution
+    requires: lease.request != null
+    requires: lease.request.state = running
+
+    ensures: lease.request.state = queued
+    ensures: LeaseExpired(lease)
+}
+
+rule OfflineExecutionsReconciled {
+    when: OfflineDuplicateRequestsMerged(requests)
+
+    ensures: LogicalRequestReconciled(
+        requests: requests,
+        prefer: earliest_temporally_known_success_or_stable_attempt_order(requests)
+    )
+
+    @guidance
+        -- All attempts and results remain in the audit history. Non-canonical
+        -- completed attempts become redundant. A caller may already have received
+        -- such a result. Concurrent cancellation affects only attempts that
+        -- observed it before starting or continuing.
+}
+
+rule DeploymentRepairLeased {
+    when: DeploymentMismatchObserved(option, mismatch, executor, lease)
+    requires: option.explicitly_enabled
+    requires: not repair_already_attempted_for(option, mismatch)
+    requires: not active_repair_lease(option, mismatch)
+
+    ensures: ExecutionLease.created(
+        lease_id: lease.lease_id,
+        kind: repair,
+        holder: executor,
+        request: null,
+        option: option,
+        quota_subject: null,
+        version_mismatch: mismatch,
+        expires_at: lease.expires_at
+    )
+    ensures: EstablishedDeploymentWorkflowRequested(option, mismatch)
+}
+
+rule DeploymentRepairFailed {
+    when: EstablishedDeploymentWorkflowFailed(option, mismatch, observation, retry_after)
+
+    ensures: ReporterSubmitsObservation(CurrentReporter(), observation)
+    ensures: ProjectionDispositionRequested(
+        option,
+        repair_required,
+        retry_after,
+        { observation.observation_id }
+    )
+}
+
+rule DecisionCandidateReplayed {
+    when: MaintainerSubmitsCandidate(maintainer, candidate)
+    requires: maintainer.active
+    requires: maintainer.authority = MaintainerAuthority
+
+    ensures: HistoricalReplayCompleted(candidate, Observations)
+    ensures: candidate.state = replayed
+    ensures: candidate.replay_report_digest != null
+    ensures: candidate.disposition_change_report_digest != null
+}
+
+rule DecisionCandidateActivated {
+    when: OperatorApprovesCandidate(operator, candidate)
+    requires: operator.active
+    requires: operator.authority = OperatorAuthority
+    requires: candidate.state = replayed
+    requires: candidate.replay_report_digest != null
+    requires: candidate.disposition_change_report_digest != null
+
+    ensures: candidate.state = active
+    ensures: candidate.approved_by = operator
+    ensures: AllProjectionsRecomputed(candidate.version)
+}
+
+rule PermanentBlockAuthorized {
+    when: OperatorPermanentlyBlocks(operator, option, evidence_ids)
+    requires: operator.active
+    requires: operator.authority = OperatorAuthority
+
+    ensures: ProjectionDispositionRequested(
+        option,
+        permanently_blocked,
+        null,
+        evidence_ids
+    )
+}
+
+rule ExplicitDeploymentEnabled {
+    when: OperatorEnablesDeployment(operator, option)
+    requires: operator.active
+    requires: operator.authority = OperatorAuthority
+
+    ensures: option.explicitly_enabled = true
+}
+
+rule BlockingIncidentOpened {
+    when: ProjectionDispositionRequested(option, disposition, _, evidence_ids)
+    requires: disposition in {repair_required, permanently_blocked}
+    requires:
+        not exists MaintenanceIncident{
+            option: option,
+            disposition: disposition,
+            state: open
+        }
+
+    ensures: MaintenanceIncident.created(
+        incident_id: new_incident_id(option, disposition),
+        option: option,
+        disposition: disposition,
+        state: open,
+        opened_at: now,
+        resolved_at: null,
+        evidence_ids: evidence_ids
+    )
+}
+
+rule BlockingIncidentResolved {
+    when: observation: Observation.created
+    requires: observation.positive
+    requires: observation.option != null
+    for incident in MaintenanceIncidents where incident.option = observation.option and incident.state = open:
+        ensures: incident.state = resolved
+        ensures: incident.resolved_at = now
+        ensures: incident.evidence_ids.add(observation.observation_id)
+}
+
+rule DeliveryContentExpired {
+    when: request: ExecutionRequest.content_expires_at <= now
+    requires: request.content_available
+
+    ensures: request.content_available = false
+    ensures: PayloadAndResultContentDeleted(request)
+
+    @guidance
+        -- Request and attempt metadata, content digests, observations, and audit
+        -- history remain indefinitely.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UniqueObservationId {
+    for a in Observations:
+        for b in Observations:
+            a != b implies a.observation_id != b.observation_id
+}
+
+invariant UniqueLogicalRequest {
+    for a in ExecutionRequests:
+        for b in ExecutionRequests:
+            a != b implies
+                a.client_id != b.client_id or a.idempotency_key != b.idempotency_key
+}
+
+invariant DisabledOptionsNeverRun {
+    for attempt in ExecutionAttempts:
+        let projection = current_projection(attempt.option)
+        projection.disposition = disabled implies attempt.state not in {admitted, running}
+}
+
+invariant ZeroCostRequestsUseZeroMarginalCostRoutes {
+    for attempt in ExecutionAttempts:
+        attempt.request.hard_constraints.max_marginal_cost_usd = 0 implies
+            attempt.billing_class in {subscription_included, free}
+}
+
+invariant EveryProjectionIsReproducible {
+    for projection in Projections:
+        projection.evidence_ids.count > 0 and projection.version != null
+}
+
+invariant CentralEvidenceIsRedacted {
+    for observation in Observations:
+        observation.raw_evidence != null implies observation.raw_evidence.restricted
+}
+
+invariant CoolHostsRequireExplicitDeployment {
+    for option in ExecutionOptions:
+        option.host.name in {cool30, cool100} and not option.installed implies
+            not option.explicitly_enabled
+}
+
+invariant SuccessfulRequestNamesItsExecution {
+    for request in ExecutionRequests:
+        request.state = succeeded implies request.success != null
+}
+
+invariant FailedRequestExplainsItsTerminalState {
+    for request in ExecutionRequests:
+        request.state = failed implies request.failure != null
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor Client {
+    identified_by: Principal where active and authority = ClientAuthority
+}
+
+actor Reporter {
+    identified_by: Principal where active and authority = ReporterAuthority
+}
+
+actor Executor {
+    identified_by: Principal where active and authority = ExecutorAuthority
+}
+
+actor Maintainer {
+    identified_by: Principal where active and authority = MaintainerAuthority
+}
+
+actor Operator {
+    identified_by: Principal where active and authority = OperatorAuthority
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ObservationRegistry {
+    facing reporter: Reporter
+
+    exposes:
+        Observations
+        Projections
+        StatusSourceStates
+
+    provides:
+        ReporterSubmitsObservation(reporter, observation)
+        OfflineDuplicateRequestsMerged(requests)
+
+    @guarantee ObservableVersionsRecorded
+        -- Producer and harness versions are required whenever the reporter can
+        -- obtain them without starting an inference request. A local tool in a
+        -- colocated jj repository records both its immutable Git commit and its
+        -- rewrite-stable jj change ID.
+
+    @guarantee RestrictedDiagnosticSplit
+        -- Central evidence contains structured fields, a bounded redacted excerpt,
+        -- a digest, and an optional reference to restricted local raw evidence.
+        -- Credentials, account names, and full raw diagnostics are never copied.
+
+    @guarantee IndependentSourceFailure
+        -- A collector failure makes only that source stale-with-age. Other source
+        -- projections remain available, and unrecognized schemas are observations.
+        -- Refreshes use source-specific freshness windows and failure backoff.
+        -- Selection may use the last projection instead of blocking on refresh.
+
+    @guarantee SharedSubscriptionQuota
+        -- A subscription service denotes one user's logical quota subject across
+        -- every host and harness. Token differences do not split the quota identity.
+
+    @guarantee ImmutableEvidence
+        -- Accepted observations are immutable and retained indefinitely. A retry
+        -- with the same observation ID is idempotent. Separate observations of
+        -- the same symptom remain separate evidence.
+
+    @guarantee PartialTemporalOrder
+        -- Cross-host ordering uses event time, receipt time, uncertainty, and
+        -- per-source sequence. Wall-clock timestamps are not assumed exact.
+
+    @guarantee MultiAxisProvenance
+        -- Reliability is conditioned on reporter identity, reporter class,
+        -- evidence form, claim type, and context. Direct output and an agent's
+        -- diagnosis remain distinguishable.
+}
+
+surface ExecutionScheduling {
+    facing client: Client
+
+    exposes:
+        ExecutionRequests where client_id = client.principal_id
+        Projections
+        MaintenanceIncidents where state = open
+
+    provides:
+        ClientSubmitsExecution(client, submission)
+        ClientCancelsExecution(client, request)
+        ExecutionStatusRequested(client, request)
+        ExecutionResultRequested(client, request)
+
+    @guarantee SynchronousCompletion
+        -- A synchronous request returns one successful execution or one concise
+        -- terminal explanation after scheduling and fallback finish.
+
+    @guarantee AsynchronousDurability
+        -- An asynchronous submission returns a durable request ID. Its state,
+        -- result, and cancellation remain queryable during their defined lifetime.
+
+    @guarantee HardConstraintsRemainHard
+        -- Fallback may change preferences but never provider, model, capability,
+        -- privacy, host, harness, or cost requirements declared as constraints.
+
+    @guarantee PartitionRecovery
+        -- During shared-registry failure a host continues from its last local
+        -- projection and durable queue. With no projection, an otherwise enabled
+        -- option is eligible under the shared prior. Host-local idempotency applies
+        -- until reconciliation.
+
+    @guarantee CanonicalProviderVocabulary
+        -- Provider IDs use OMP's complete namespace. The initial schedulable
+        -- subscription services are Anthropic, Antigravity, Kimi Code, OpenAI
+        -- Codex, and Zhipu Coding Plan. Other provider IDs require configuration
+        -- or evidence that explicitly enables an execution option.
+}
+
+surface SchedulerExecution {
+    facing executor: Executor
+
+    exposes:
+        ExecutionRequests where state in {queued, running}
+        Projections
+        ExecutionLeases
+
+    provides:
+        RouteSelected(request, option, executor, lease, estimated_quota)
+        AttemptCompleted(attempt, result, actual_quota)
+        AttemptFailedWithEvidence(attempt, observation)
+        LeaseRenewed(executor, lease)
+        DeploymentMismatchObserved(option, mismatch, executor, lease)
+        EstablishedDeploymentWorkflowFailed(option, mismatch, observation, retry_after)
+
+    @guarantee AdmissionCoordination
+        -- Renewable leases coordinate host capacity, quota capacity, request
+        -- execution, and repair. Estimated quota use is reserved and reconciled
+        -- against actual use when meaningful units exist.
+
+    @guarantee NoScheduledInferenceProbe
+        -- The scheduler never creates an inference request solely to test health.
+        -- Exploration occurs only while fulfilling a client request. It does not
+        -- start a route whose evidence predicts an uninformative failure.
+        -- Periodic lightweight host and network observations are allowed.
+        -- Non-billed quota and provider-status refreshes are also allowed.
+
+    @guarantee AttemptContextRecorded
+        -- Every provider attempt and status refresh records the observable host,
+        -- exit node, routing profile, VPN state, and network-context fingerprint.
+}
+
+surface DecisionMaintenance {
+    facing maintainer: Maintainer
+    facing operator: Operator
+
+    exposes:
+        ModelCandidates
+        Projections
+        MaintenanceIncidents
+
+    provides:
+        MaintainerSubmitsCandidate(maintainer, candidate)
+        OperatorApprovesCandidate(operator, candidate)
+        OperatorPermanentlyBlocks(operator, option, evidence_ids)
+        OperatorEnablesDeployment(operator, option)
+
+    @guarantee DecisionAffectingChangesAreReviewed
+        -- Inference, scheduler policy, capability-prior, and normalization changes
+        -- that may alter beliefs, dispositions, billing, eligibility, or selection
+        -- require historical replay and operator approval. Backward-compatible
+        -- storage and parser changes that preserve decisions may proceed directly.
+
+    @guarantee PermanentMeansAuthoritative
+        -- Repeated failures and low probability cannot create a permanent block.
+        -- Provider discontinuation or an explicit operator decision can.
+}
+
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- None for the initial specification.
