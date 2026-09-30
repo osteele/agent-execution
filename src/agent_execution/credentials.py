@@ -518,6 +518,18 @@ def _cache_path(state_root: Path) -> Path:
     return state_root / "credential-basis.json"
 
 
+def _cache_key(executable: str, profile: str | None) -> str:
+    """Name one route's row: the executable plus the profile or selector it launches.
+
+    One executable serves several routes -- `omp` serves every provider/model
+    selector -- so rows are per route. A shared row would let probing one route
+    evict another, leaving a later silent probe no prior evidence to fall back
+    on. A bare-executable row never serves a profiled route; that route is
+    re-probed rather than guessed.
+    """
+    return f"{executable}|{profile}" if profile else executable
+
+
 def _cached_observation(
     cached: object,
     *,
@@ -634,13 +646,10 @@ def observe_credential_basis(
             loaded = {}
         if isinstance(loaded, dict):
             cached = loaded
-        previous = _cached_observation(
-            cached.get(executable), fingerprint=fingerprint, now=now, ttl=None
-        )
+        key = _cache_key(executable, profile)
+        previous = _cached_observation(cached.get(key), fingerprint=fingerprint, now=now, ttl=None)
         if not refresh:
-            served = _cached_observation(
-                cached.get(executable), fingerprint=fingerprint, now=now, ttl=ttl
-            )
+            served = _cached_observation(cached.get(key), fingerprint=fingerprint, now=now, ttl=ttl)
             if served is not None:
                 return served
     reported = probe(
@@ -660,12 +669,12 @@ def observe_credential_basis(
         fingerprint=fingerprint,
     )
     if path is not None:
-        _write_cache_row(path, executable, observation)
+        _write_cache_row(path, _cache_key(executable, profile), observation)
     return observation
 
 
-def _write_cache_row(path: Path, executable: str, observation: CredentialBasis) -> None:
-    """Merge the observation into the cache file, preserving other harnesses' rows."""
+def _write_cache_row(path: Path, key: str, observation: CredentialBasis) -> None:
+    """Merge the observation into the cache file, preserving other routes' rows."""
     cached: dict[str, object] = {}
     try:
         existing = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
@@ -673,7 +682,7 @@ def _write_cache_row(path: Path, executable: str, observation: CredentialBasis) 
             cached = existing
     except (OSError, json.JSONDecodeError):
         cached = {}
-    cached[executable] = {
+    cached[key] = {
         "cache_version": CREDENTIAL_CACHE_VERSION,
         "basis": observation.basis,
         "reported_source": observation.reported_source,

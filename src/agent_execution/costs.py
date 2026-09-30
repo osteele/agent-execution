@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from agent_execution.credentials import (
@@ -57,6 +57,15 @@ class ExecutionCostEstimate:
     when no bound is established — a refusal reason for a capped caller, not a
     license to dispatch. ``reason`` names the observation and policy the figures
     rest on.
+
+    ``probe_answered`` says whether the figures rest on an answer from a
+    credential probe: True when the probe answered -- including an explicit
+    ``missing`` or ``unknown`` credential -- or when it was silent and this
+    route's previous direct answer was served in its place; False when no answer
+    of either kind exists (timeout, failed run, unreadable or mismatched status,
+    or no probe executable, with no prior answer for the route); None where no
+    probe applies. False is a failed observation rather than a finding about the
+    route, so a caller may wait it out; it is still never priced as free.
     """
 
     billing_mode: str
@@ -64,6 +73,7 @@ class ExecutionCostEstimate:
     estimated_incremental_usd: float | None
     maximum_incremental_usd: float | None
     reason: str
+    probe_answered: bool | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -73,6 +83,7 @@ class ExecutionCostEstimate:
             "estimated_incremental_usd": self.estimated_incremental_usd,
             "maximum_incremental_usd": self.maximum_incremental_usd,
             "reason": self.reason,
+            "probe_answered": self.probe_answered,
         }
 
 
@@ -126,27 +137,36 @@ def _credential_estimate(
     *,
     probe_detail: str,
 ) -> ExecutionCostEstimate:
+    if observation.basis == BASIS_NOT_OBSERVABLE:
+        return _unknown_estimate(
+            BASIS_NOT_OBSERVABLE,
+            f"{probe_detail} cannot be asked about billing",
+        )
+    answered = observation.reported_source is not None
     if observation.basis == BASIS_SUBSCRIPTION:
-        return _zero_estimate(
+        estimate = _zero_estimate(
             BASIS_SUBSCRIPTION,
             BASIS_SUBSCRIPTION,
             f"{probe_detail} reports a subscription login; "
             "user policy counts authenticated subscription usage as $0",
         )
-    if observation.basis == BASIS_API_KEY:
-        return _unknown_estimate(
+    elif observation.basis == BASIS_API_KEY:
+        estimate = _unknown_estimate(
             BASIS_API_KEY,
             f"{probe_detail} reports a key route; no trustworthy bound exists for it",
         )
-    if observation.basis == BASIS_UNOBSERVED:
-        return _unknown_estimate(
+    elif answered:
+        estimate = _unknown_estimate(
+            BASIS_UNOBSERVED,
+            f"{probe_detail} reports credential {observation.reported_source!r}, "
+            "which establishes no subscription; it is never priced as free",
+        )
+    else:
+        estimate = _unknown_estimate(
             BASIS_UNOBSERVED,
             f"{probe_detail} gave no answer; an unanswered probe is never priced as free",
         )
-    return _unknown_estimate(
-        BASIS_NOT_OBSERVABLE,
-        f"{probe_detail} cannot be asked about billing",
-    )
+    return replace(estimate, probe_answered=answered)
 
 
 def _omp_estimate(
@@ -194,10 +214,13 @@ def _omp_estimate(
             refresh=refresh,
         )
         if selected_provider == "zhipu-coding-plan" and observation.basis == BASIS_API_KEY:
-            return _zero_estimate(
-                BASIS_SUBSCRIPTION,
-                BASIS_SUBSCRIPTION,
-                f"OMP selector {selector_value!r} uses its observed coding-plan credential",
+            return replace(
+                _zero_estimate(
+                    BASIS_SUBSCRIPTION,
+                    BASIS_SUBSCRIPTION,
+                    f"OMP selector {selector_value!r} uses its observed coding-plan credential",
+                ),
+                probe_answered=True,
             )
         return _credential_estimate(observation, probe_detail="restricted OMP SDK auth status")
     if selected_provider not in OMP_SUBSCRIPTION_PROVIDERS:
