@@ -235,6 +235,68 @@ class WeftRetrievalOutcome:
     job_status: str | None = None
 
 
+@dataclass(frozen=True)
+class SubmissionLookup:
+    """Authoritative idempotency lookup, including failures to observe the ledger."""
+
+    status: Literal["found", "absent", "unknown"]
+    job_id: str | None = None
+    host: str | None = None
+    reason: str | None = None
+
+
+def lookup_submitted_job(
+    model_call_id: str,
+    *,
+    timeout: float,
+    cwd: Path | None = None,
+    invoke: CommandRunner = run_command,
+    executable: str = "weft",
+) -> SubmissionLookup:
+    """Ask Weft's ledger for the exact submission key; only a validated miss is absent."""
+    try:
+        result = invoke(
+            [executable, "job", "lookup", "--idempotency-key", model_call_id],
+            cwd or Path.cwd(),
+            timeout,
+        )
+    except (subprocess.SubprocessError, OSError) as error:
+        return SubmissionLookup("unknown", reason=f"{type(error).__name__}: {error}")
+    if result.exit_status != 0:
+        return SubmissionLookup(
+            "unknown", reason=f"lookup exited {result.exit_status}: {_tail(result.stderr)}"
+        )
+    try:
+        value = cast(object, json.loads(result.stdout))
+    except json.JSONDecodeError:
+        return SubmissionLookup("unknown", reason="lookup returned invalid JSON")
+    if not isinstance(value, dict):
+        return SubmissionLookup("unknown", reason="lookup response is not an object")
+    raw = cast(dict[str, object], value)
+    if raw.get("api_version") != "weft.job.lookup.v1":
+        return SubmissionLookup("unknown", reason="lookup has wrong api_version")
+    if raw.get("idempotency_key") != model_call_id:
+        return SubmissionLookup(
+            "unknown", reason="lookup did not echo the requested idempotency key"
+        )
+    if raw.get("found") is False and "receipt" not in raw:
+        return SubmissionLookup("absent")
+    if raw.get("found") is not True:
+        return SubmissionLookup("unknown", reason="lookup has invalid found/receipt fields")
+    try:
+        receipt = WeftRunReceipt.parse(
+            json.dumps(raw.get("receipt")), idempotency_key=model_call_id
+        )
+    except ValueError as error:
+        return SubmissionLookup("unknown", reason=f"invalid lookup receipt: {error}")
+    if receipt.placement_decision == "not_accepted":
+        return SubmissionLookup("unknown", reason="found lookup receipt denies a durable job")
+    if not receipt.job_id:
+        # A found answer the daemon cannot adopt is not an answer; unknown defers.
+        return SubmissionLookup("unknown", reason="found lookup receipt names no job")
+    return SubmissionLookup("found", job_id=receipt.job_id, host=receipt.selected_host or "auto")
+
+
 def parse_worker_command(command: object) -> dict[str, str]:
     """Parse the single worker argv emitted by _remote_command."""
     if not isinstance(command, str):
@@ -1853,15 +1915,9 @@ class WeftCommandRunner:
                         "receipt_stdout": _tail(submission.stdout),
                         "receipt_stderr": _tail(submission.stderr),
                     },
-                    # Reaching here means the probe above ran and found no job
-                    # attributable to this call. That is a proven absence, and
-                    # recording it is what lets a consumer retry safely: an
-                    # unobserved outcome must not be re-dispatched, but a
-                    # dispatch proven never to have created a job spawned
-                    # nothing and can duplicate nothing. Unrecorded, the
-                    # distinction is invisible and the request never settles
-                    # -- measured on cycle ff82c4337350, four hours `running`
-                    # over a cycle that had completed.
+                    # The submission-time listing did not identify a job. A
+                    # miss here is not proof of absence: the ledger must be
+                    # queried after the submitter exits before retrying.
                     "processing": {
                         "state": "unknown",
                         "step": "submission_receipt",

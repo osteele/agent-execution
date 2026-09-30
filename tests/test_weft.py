@@ -19,12 +19,14 @@ from agent_execution.omp_execution import omp_transcript
 from agent_execution.weft import (
     ARTIFACT_RETRIEVAL_SECONDS,
     LOST_OBSERVATION_PROBE_SECONDS,
+    SubmissionLookup,
     WeftAdmissionCancelled,
     WeftCommandRunner,
     WeftExecutionAmbiguous,
     WeftExecutionDetached,
     WeftPlacementRefused,
     WeftRunReceipt,
+    lookup_submitted_job,
     submitted_job_from_listing,
 )
 from agent_execution.worker import WORKER_PROTOCOL_VERSION, HarnessOutcome, WorkerResult
@@ -109,6 +111,93 @@ def worker_artifact(
         harness=HarnessOutcome(0, stdout, ""),
         omp_evidence=None if packet else omp_transcript(stdout),
     ).to_json()
+
+
+class SubmissionLookupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.executable = self.root / "weft"
+
+    def lookup(self, body: str, *, exit_status: int = 0) -> SubmissionLookup:
+        self.executable.write_text(
+            "#!/bin/sh\n"
+            f"test \"$1 $2 $3 $4\" = 'job lookup --idempotency-key {KEY}' || exit 7\n"
+            f"printf '%s' {shlex.quote(body)}\n"
+            f"exit {exit_status}\n",
+            encoding="utf-8",
+        )
+        self.executable.chmod(0o755)
+        return lookup_submitted_job(KEY, timeout=1, cwd=self.root, executable=str(self.executable))
+
+    def test_found_returns_receipt_job_and_host(self) -> None:
+        result = self.lookup(
+            json.dumps(
+                {
+                    "api_version": "weft.job.lookup.v1",
+                    "idempotency_key": KEY,
+                    "found": True,
+                    "receipt": json.loads(receipt("deduplicated")),
+                }
+            )
+        )
+        self.assertEqual(result.status, "found")
+        self.assertEqual(result.job_id, "wj42")
+        self.assertEqual(result.host, "studio")
+
+    def test_only_validated_negative_answer_is_absent(self) -> None:
+        result = self.lookup(
+            json.dumps(
+                {"api_version": "weft.job.lookup.v1", "idempotency_key": KEY, "found": False}
+            )
+        )
+        self.assertEqual(result.status, "absent")
+        self.assertIsNone(result.job_id)
+
+    def test_failed_lookup_is_unknown(self) -> None:
+        result = self.lookup("", exit_status=4)
+        self.assertEqual(result.status, "unknown")
+        self.assertIn("exited 4", result.reason or "")
+
+    def test_timed_out_lookup_is_unknown(self) -> None:
+        self.executable.write_text("#!/bin/sh\nsleep 2\n", encoding="utf-8")
+        self.executable.chmod(0o755)
+        result = lookup_submitted_job(
+            KEY, timeout=0.01, cwd=self.root, executable=str(self.executable)
+        )
+        self.assertEqual(result.status, "unknown")
+        self.assertIn("TimeoutExpired", result.reason or "")
+
+    def test_malformed_json_is_unknown(self) -> None:
+        result = self.lookup("{invalid")
+        self.assertEqual(result.status, "unknown")
+        self.assertIn("invalid JSON", result.reason or "")
+
+    def test_unknown_version_cannot_prove_absence(self) -> None:
+        result = self.lookup(
+            json.dumps(
+                {"api_version": "weft.job.lookup.v2", "idempotency_key": KEY, "found": False}
+            )
+        )
+        self.assertEqual(result.status, "unknown")
+        self.assertIn("api_version", result.reason or "")
+
+    def test_missing_executable_is_unknown(self) -> None:
+        result = lookup_submitted_job(
+            KEY, timeout=1, cwd=self.root, executable=str(self.root / "missing-weft")
+        )
+        self.assertEqual(result.status, "unknown")
+        self.assertIn("FileNotFoundError", result.reason or "")
+
+    def test_mismatched_key_is_unknown(self) -> None:
+        result = self.lookup(
+            json.dumps(
+                {"api_version": "weft.job.lookup.v1", "idempotency_key": "other", "found": False}
+            )
+        )
+        self.assertEqual(result.status, "unknown")
+        self.assertIn("idempotency key", result.reason or "")
 
 
 class AdmissionTests(unittest.TestCase):
