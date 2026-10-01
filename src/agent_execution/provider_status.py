@@ -276,7 +276,12 @@ def observe(
 
 
 def record_refusal(
-    route: str, signature: str, *, observed_by: str = "agent-execution", model: str | None = None
+    route: str,
+    signature: str,
+    *,
+    observed_by: str = "agent-execution",
+    model: str | None = None,
+    billing_pool: str | None = None,
 ) -> dict[str, object]:
     condition, window, cooldown, reset_at = classify(signature)
     detail: dict[str, object] = {
@@ -302,6 +307,7 @@ def record_refusal(
         source_tool=observed_by,
         source_method="provider-refusal",
         model=model,
+        billing_pool=billing_pool,
         ttl_seconds=cooldown,
         detail=detail,
     )
@@ -310,7 +316,11 @@ def record_refusal(
 
 
 def record_success(
-    route: str, *, observed_by: str = "agent-execution", model: str | None = None
+    route: str,
+    *,
+    observed_by: str = "agent-execution",
+    model: str | None = None,
+    billing_pool: str | None = None,
 ) -> dict[str, object]:
     event = observe(
         route,
@@ -319,6 +329,7 @@ def record_success(
         source_tool=observed_by,
         source_method="successful-dispatch",
         model=model,
+        billing_pool=billing_pool,
     )
     publish_async()
     return event

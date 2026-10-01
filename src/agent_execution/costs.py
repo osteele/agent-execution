@@ -47,6 +47,11 @@ _CLAUDE_ADAPTERS = {"claude": "claude", "claude-packet": "claude"}
 
 _OMP_ADAPTERS = frozenset({"omp", "omp-packet"})
 
+#: The Antigravity CLI. It has no registered auth-status command (see
+#: credentials.py), so its credential basis is `not_observable`.
+_AGY_ADAPTER = "agy"
+_AGY_PROBE_DETAIL = "agy, which has no non-generating auth-status command,"
+
 
 @dataclass(frozen=True)
 class ExecutionCostEstimate:
@@ -271,6 +276,18 @@ def estimate_execution_cost(
             environment=environment,
             refresh=refresh,
         )
+    if adapter == _AGY_ADAPTER:
+        # No auth-status command exists, and inventing one could start a model
+        # turn. `agy models` reports sign-in, not billing basis. The basis is
+        # therefore `not_observable`, and a hard cap refuses it.
+        observation = observe_credential_basis(
+            _AGY_ADAPTER,
+            state_root=state_root,
+            cwd=cwd,
+            environment=environment,
+            refresh=refresh,
+        )
+        return _credential_estimate(observation, probe_detail=_AGY_PROBE_DETAIL)
     if profile.get("api_key_env") or adapter in _TOKEN_API_ADAPTERS:
         return _token_api_estimate(profile)
     if adapter in _CLAUDE_ADAPTERS:

@@ -12,6 +12,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from agent_execution.agy_execution import AGY_MODELS
 from agent_execution.credentials import observe_credential_basis
 from agent_execution.identity import worker_evidence_path
 from agent_execution.omp_execution import require_omp_sdk
@@ -53,6 +54,31 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _probe_agy(harness_model: str | None) -> dict[str, object]:
+    """Report agy's presence and its unobservable credential basis; run nothing.
+
+    agy has no auth-status command, and an invented one could become a model
+    prompt. `agy models` does not generate, but it shows sign-in rather than
+    billing basis, and its output format is unverified, so it is not run here.
+    """
+    if harness_model is not None and harness_model not in AGY_MODELS:
+        permitted = ", ".join(sorted(AGY_MODELS))
+        raise ValueError(f"agy probe model must be admitted explicitly ({permitted})")
+    executable = shutil.which("agy")
+    credential = observe_credential_basis("agy", state_root=None, cwd=Path.cwd())
+    return {
+        "schema_version": "agent-execution.worker-probe/v1",
+        "worker_identity": installed_worker_identity().to_dict(),
+        "provider": "agy",
+        "harness_model": harness_model,
+        "dependencies": {
+            "agy": executable,
+            "error": None if executable else "agy is not installed on the worker",
+        },
+        "credential_basis": credential.to_dict(),
+    }
+
+
 def probe_worker(
     provider: str, *, harness_model: str | None = None, timeout: float = 60.0
 ) -> dict[str, object]:
@@ -61,6 +87,8 @@ def probe_worker(
         raise ValueError(f"unsupported worker provider: {provider}")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("probe timeout must be finite and positive")
+    if provider == "agy":
+        return _probe_agy(harness_model)
     if not harness_model or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", harness_model):
         raise ValueError("OMP probe requires an exact provider/model selector")
     dependencies: dict[str, object]

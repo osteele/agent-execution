@@ -464,12 +464,16 @@ def run_in_process_group(
     on_spawn: Callable[[ProcessIdentity], None] | None = None,
     hold_before_exec: bool = False,
     on_resource_sample: Callable[[Mapping[str, object]], None] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a harness in its own process group, then account for the whole group.
 
     Raises ``subprocess.TimeoutExpired`` on timeout, as ``subprocess.run`` does,
     but only after the group has been signalled rather than just the child.
     ``None`` leaves completion unbounded while retaining resource sampling and cleanup.
+    ``environment`` replaces the inherited environment when given; a harness
+    that must see an isolated HOME gets it here rather than from a caller's
+    ``env HOME=...`` prefix.
     """
     release_read: int | None = None
     release_write: int | None = None
@@ -492,6 +496,7 @@ def run_in_process_group(
             text=True,
             start_new_session=True,
             pass_fds=(release_read,) if release_read is not None else (),
+            env=None if environment is None else dict(environment),
         )
     except (OSError, ValueError):
         if release_write is not None:

@@ -40,6 +40,47 @@ Consumers that embed the worker install it into their own environment
   existing ordinary-file permission bits on replacement, and create new files
   with conservative permissions.
 
+## Packet-only agy (Antigravity CLI)
+
+The worker provider `agy` runs the Antigravity CLI with the tool policy
+`packet-only-no-tools` and refuses every other policy. Its logical command
+must have exactly this shape:
+
+```
+agy -p BRIEF --output-format json --print-timeout Ns --disable-slash-commands \
+    --execution-tool-policy packet-only-no-tools --model M
+```
+
+`--model` must be one of the models in `AGY_MODELS`: `gemini-3.1-pro-high`,
+`gemini-3.8-flash-high`, or `claude-opus-4-6-thinking`. `--mode` and
+`--dangerously-skip-permissions` are refused. The worker removes the policy
+flag before launch.
+
+The worker builds a throwaway HOME for each call. It copies `~/.gemini`,
+installs a deny-all `PreToolUse` hook, writes an empty MCP config and a
+packet-only rules file, and symlinks `Library/Keychains` and
+`Library/Preferences`. The launch environment is minimal, with HOME pointing
+at the throwaway directory, which is deleted after the call. A caller cannot
+supply HOME.
+
+When the Weft conductor ships the brief as a payload (`-p -`), the worker puts
+it back on argv, because `agy -p -` is not known to read stdin. Briefs on argv
+are limited to 128 KiB and must not begin with `-`.
+
+The JSON envelope on stdout is the evidence. It is refused unless `status` is
+`SUCCESS`, `response` is non-empty, and `num_turns` is positive, and it is
+refused if it records any tool use (`denied_actions` and similar fields). Use
+`agent_execution.agy_execution.agy_final_text` to get the response text.
+
+`agy` has no auth-status command, so its credential basis is `not_observable`.
+A hard `--max-cost-usd` cap therefore refuses it. Status is published under
+the route `google-antigravity`, using the billing pool
+`google-antigravity/gemini` for Gemini models and `google-antigravity/other`
+for everything else.
+
+Tool-enabled agy (grounded read-only review or writing) is not supported. The
+deny-all hook is the only enforcement known to work.
+
 ## Worker evidence
 
 Protocol 2 publishes each call's result at

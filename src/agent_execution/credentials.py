@@ -450,7 +450,9 @@ def _omp_basis_for_source(reported: str | None) -> str:
 
 #: The status commands this module knows. Anything else is never probed: an
 #: invented auth-status subcommand on another CLI can become a model prompt,
-#: which bills.
+#: which bills. `agy` is deliberately absent: it has no auth-status command,
+#: and `agy models` reports sign-in rather than billing basis, so its basis is
+#: `not_observable` and a hard cash cap refuses it.
 _AUTH_STATUS_PROBES = {
     "claude": _probe_claude_auth_status,
     "omp": _probe_omp_auth_status,

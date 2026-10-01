@@ -21,6 +21,17 @@ from pathlib import Path
 from typing import cast
 
 from agent_execution import __version__, provider_status
+from agent_execution.agy_execution import (
+    AGY_ROUTE,
+    AGY_STDIN_PROMPT_MARKER,
+    AgyInvocation,
+    AgyStatusError,
+    agy_billing_pool,
+    agy_envelope,
+    require_agy_argv_prompt,
+    run_agy_command,
+    validate_agy_command,
+)
 from agent_execution.command import CommandResult, CommandRunner
 from agent_execution.costs import estimate_execution_cost, require_cost_cap, validate_max_cost_usd
 from agent_execution.identity import source_sha256, worker_evidence_path
@@ -44,14 +55,16 @@ Version 2 fixes evidence beneath the model-inaccessible .agent-execution namespa
 Version 1 artifacts remain parseable for historical read-only retrieval.
 """
 #: New execution excludes native Codex; historical evidence remains parseable.
-SUPPORTED_WORKER_PROVIDERS = frozenset({"omp", "omp-packet"})
+#: `agy` is packet-only (see agy_execution): its one admitted tool policy is
+#: `packet-only-no-tools`, enforced by a deny-all hook in a throwaway HOME.
+SUPPORTED_WORKER_PROVIDERS = frozenset({"omp", "omp-packet", "agy"})
 #: The binary each provider means. A provider is an adapter variant and need
 #: not be a program name: `omp-packet` is OMP under a packet-only tool policy,
 #: and the binary is `omp`. The consistency check below compares the command
 #: against this rather than against the provider string, because what it exists
 #: to prevent is a record naming one harness while another ran -- not a
 #: spelling difference between a policy variant and its executable.
-_PROVIDER_EXECUTABLES = {"codex": "codex", "omp": "omp", "omp-packet": "omp"}
+_PROVIDER_EXECUTABLES = {"codex": "codex", "omp": "omp", "omp-packet": "omp", "agy": "agy"}
 #: Providers whose transcript is recoverable as a provider-owned session, which
 #: is what the session-evidence path reads. Codex writes a `thread.started`
 #: event and keeps a session; a packet-only OMP review is dispatched with
@@ -200,9 +213,16 @@ def installed_worker_identity(*, source_sha256: str | None = None) -> WorkerIden
 def run_command_with_prompt(
     command: list[str], cwd: Path, prompt: str, timeout: float | None
 ) -> CommandResult:
-    """Run a harness with prompt bytes on stdin and process-group cleanup."""
+    """Run a harness with prompt bytes on stdin and process-group cleanup.
+
+    `agy` is the exception: whether `agy -p` reads stdin is unverified, so its
+    launcher puts the payload back on argv in place of the `-` marker.
+    """
     if command and Path(command[0]).name == "omp":
         completed = run_omp_command(command, cwd, timeout, prompt=prompt)
+        return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+    if command and Path(command[0]).name == "agy":
+        completed = run_agy_command(command, cwd, timeout, prompt=prompt)
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
     completed = run_in_process_group(command, cwd, prompt, timeout)
     return CommandResult(completed.returncode, completed.stdout, completed.stderr)
@@ -215,11 +235,13 @@ def run_worker_command(command: list[str], cwd: Path, timeout: float | None) -> 
     direct-child timeout can then hang while collecting output and keep the
     enclosing Weft slot occupied after the evidence deadline.
     """
-    completed = (
-        run_omp_command(command, cwd, timeout)
-        if command and Path(command[0]).name == "omp"
-        else run_in_process_group(command, cwd, "", timeout)
-    )
+    name = Path(command[0]).name if command else ""
+    if name == "omp":
+        completed = run_omp_command(command, cwd, timeout)
+    elif name == "agy":
+        completed = run_agy_command(command, cwd, timeout)
+    else:
+        completed = run_in_process_group(command, cwd, "", timeout)
     return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
 
@@ -487,6 +509,10 @@ class WorkerResult:
                 cwd=result.worker_cwd,
                 prompt_sha256=result.prompt_sha256 or None,
             )
+        if result.provider == "agy" and status == "completed":
+            # The envelope is the evidence. A stored "completed" agy result
+            # must still show SUCCESS, a response, a model turn, and no tools.
+            agy_envelope(result.harness.stdout)
         return result
 
     def to_dict(self) -> dict[str, object]:
@@ -617,7 +643,13 @@ def _fsync_directory(path: Path) -> None:
 _PROVIDER_ATTRIBUTABLE = {"harness_failed", "evidence_failed"}
 
 
-def _publish_provider_status(result: WorkerResult, *, route: str, model: str | None = None) -> None:
+def _publish_provider_status(
+    result: WorkerResult,
+    *,
+    route: str,
+    model: str | None = None,
+    billing_pool: str | None = None,
+) -> None:
     """Share what this call observed about its provider route.
 
     The worker is the only component that watches a provider refuse. Without
@@ -631,17 +663,18 @@ def _publish_provider_status(result: WorkerResult, *, route: str, model: str | N
     """
     if not route:
         return
+    # Only what this caller knows: the OMP Antigravity route names its model,
+    # agy names its pool, and every other route passes neither.
+    pool: dict[str, str] = {}
+    if model is not None and route == "google-antigravity":
+        pool["model"] = model
+    if billing_pool is not None:
+        pool["billing_pool"] = billing_pool
     try:
         if result.status == "completed":
-            if route == "google-antigravity":
-                provider_status.record_success(route, model=model)
-            else:
-                provider_status.record_success(route)
+            provider_status.record_success(route, **pool)
         elif result.status in _PROVIDER_ATTRIBUTABLE and result.failure:
-            if route == "google-antigravity":
-                provider_status.record_refusal(route, result.failure, model=model)
-            else:
-                provider_status.record_refusal(route, result.failure)
+            provider_status.record_refusal(route, result.failure, **pool)
     except OSError:
         return
 
@@ -755,6 +788,9 @@ def execute_worker(
     # below, and every preflight failure returns through `finish` before that.
     selected_route = [""]
     selected_model = [""]
+    # The quota pool within that route, when the harness names one. Empty means
+    # the route itself is the pool, which is the registry's default.
+    selected_pool = [""]
 
     def finish(
         status: str,
@@ -790,7 +826,10 @@ def execute_worker(
             omp_evidence=omp_evidence,
         )
         _publish_provider_status(
-            result, route=selected_route[0] or provider, model=selected_model[0] or None
+            result,
+            route=selected_route[0] or provider,
+            model=selected_model[0] or None,
+            billing_pool=selected_pool[0] or None,
         )
         _write_result(output, result, cwd=working_directory)
         return result
@@ -882,12 +921,42 @@ def execute_worker(
         except ValueError as error:
             return finish("preflight_failed", failure=str(error))
         executable = "omp"
+    agy_invocation: AgyInvocation | None = None
+    if provider == "agy":
+        try:
+            logical_command = [*command, *(["--model", harness_model] if harness_model else [])]
+            # Validation refuses every tool policy except packet-only-no-tools
+            # and every model outside the admitted list.
+            agy_invocation = validate_agy_command(logical_command)
+            selected_route[0] = AGY_ROUTE
+            selected_pool[0] = agy_billing_pool(agy_invocation.model)
+            if prompt_payload is not None:
+                if agy_invocation.prompt != AGY_STDIN_PROMPT_MARKER:
+                    raise ValueError("agy payload execution requires the stdin prompt marker")
+                # The payload goes back on argv, so argv limits apply to it.
+                require_agy_argv_prompt(prompt)
+            elif agy_invocation.prompt == AGY_STDIN_PROMPT_MARKER:
+                raise ValueError("agy stdin prompt marker requires a prompt payload")
+        except ValueError as error:
+            return finish("preflight_failed", failure=str(error))
+        if executable is None:
+            return finish("preflight_failed", failure="agy is not installed on the worker")
     try:
         max_cost_usd = validate_max_cost_usd(max_cost_usd)
         if max_cost_usd is not None:
             # The actual selector is authoritative, including inline commands.
-            model = omp_invocation.selector if omp_invocation is not None else (harness_model or "")
-            route = model.partition("/")[0] if provider in {"omp", "omp-packet"} else provider
+            if omp_invocation is not None:
+                model = omp_invocation.selector
+            elif agy_invocation is not None:
+                model = agy_invocation.model
+            else:
+                model = harness_model or ""
+            if provider in {"omp", "omp-packet"}:
+                route = model.partition("/")[0]
+            elif agy_invocation is not None:
+                route = AGY_ROUTE
+            else:
+                route = provider
             profile_name = ""
             if "--profile" in command:
                 profile_index = command.index("--profile") + 1
@@ -973,6 +1042,13 @@ def execute_worker(
             ctx_version=ctx_version,
             failure=f"could not start {provider}: {error}",
         )
+    except (OSError, ValueError) as error:
+        # Building agy's throwaway HOME (copying ~/.gemini, reading its
+        # settings) and exec itself fail before any model call. Record that
+        # durably instead of exiting with no result.
+        if agy_invocation is None:
+            raise
+        return finish("preflight_failed", failure=f"could not start agy: {error}")
     harness = HarnessOutcome(
         command_result.exit_status, command_result.stdout, command_result.stderr
     )
@@ -987,6 +1063,45 @@ def execute_worker(
             )
         return detail
 
+    if agy_invocation is not None:
+        # The JSON envelope is the evidence. Stdout is kept verbatim, so the
+        # conductor reconstructs the same bytes agent-review's local
+        # AntigravityAdapter unwraps, and its nonce-fenced response extraction
+        # runs unchanged on `response`.
+        try:
+            agy_envelope(command_result.stdout)
+        except AgyStatusError as error:
+            return finish(
+                "harness_failed",
+                harness=harness,
+                model_call_started=True,
+                failure=f"agy exited {command_result.exit_status}: {error}",
+            )
+        except ValueError as error:
+            if command_result.exit_status != 0:
+                return finish(
+                    "harness_failed",
+                    harness=harness,
+                    model_call_started=True,
+                    failure=(
+                        f"agy exited {command_result.exit_status}: "
+                        f"{command_failure_detail(command_result)}"
+                    ),
+                )
+            return finish(
+                "evidence_failed",
+                harness=harness,
+                model_call_started=True,
+                failure=f"invalid agy execution evidence: {error}",
+            )
+        if command_result.exit_status != 0:
+            return finish(
+                "harness_failed",
+                harness=harness,
+                model_call_started=True,
+                failure=f"agy exited {command_result.exit_status} despite a SUCCESS envelope",
+            )
+        return finish("completed", harness=harness, model_call_started=True)
     if omp_invocation is not None:
         if command_result.exit_status != 0:
             return finish(

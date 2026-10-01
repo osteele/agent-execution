@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
+from agent_execution.agy_execution import validate_agy_command
 from agent_execution.command import CommandResult, CommandRunner, ProgressCallback, run_command
 from agent_execution.costs import validate_max_cost_usd
 from agent_execution.identity import source_sha256, worker_evidence_path
@@ -494,11 +495,16 @@ class WeftCommandRunner:
         been lifted alone the hash would have pinned a trailing flag as the
         brief.
 
-        The two supported shapes, both verified to read a prompt from stdin
-        under `-`:
+        The supported shapes:
 
             codex exec [flags] <prompt>    -- prompt last
             omp -p <prompt> [flags]        -- prompt follows `-p`
+            agy -p <prompt> [flags]        -- prompt follows `-p`
+
+        codex and omp are verified to read a prompt from stdin under `-`. agy
+        is not: whether `agy -p -` reads stdin is unknown. The `-` still keeps
+        the brief out of the Weft command line, and the worker puts the payload
+        back on agy's argv under a size limit (agy_execution).
 
         A shape this does not recognize is refused rather than guessed at
         positionally.
@@ -561,6 +567,8 @@ class WeftCommandRunner:
         resolved = str(cwd.resolve())
         if self.agent in {"omp", "omp-packet"}:
             validate_omp_command(command, cwd)
+        if self.agent == "agy":
+            validate_agy_command(command)
         # Weft establishes the mirrored project as the job's working directory.
         # A local absolute --cd/--dir would otherwise select the wrong user's
         # tree on the worker.
@@ -1050,8 +1058,11 @@ class WeftCommandRunner:
                 return CommandResult(
                     1, worker.harness.stdout, str(error), execution=execution, worker_result=worker
                 )
+        # For agy the envelope IS the evidence: an evidence failure (recorded
+        # tool use, empty response, no model turn) is a refused review, not a
+        # missing secondary export, so it never reaches the consumer as success.
         evidence_unavailable = (
-            self.agent != "omp"
+            self.agent not in {"omp", "agy"}
             and worker.status == "evidence_failed"
             and worker.harness.exit_status == 0
         )
@@ -1769,6 +1780,9 @@ class WeftCommandRunner:
             invocation = validate_omp_command(command, cwd)
             self.omp_selector = invocation.selector
             self.omp_policy = invocation.policy
+        if self.agent == "agy":
+            # Refuse before any placement or submission, as for OMP.
+            validate_agy_command(command)
         self.last_execution = None
         placement = self._placement_check(cwd, deadline)
         if placement["state"] == "unknown":
