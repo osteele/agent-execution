@@ -35,6 +35,7 @@ OMP_TRANSCRIPT_SCHEMA = "agent-execution.omp-transcript/v1"
 #: layer accepting an identity another rejects.
 GROUNDED_OMP_SELECTORS_BY_PROVIDER: dict[str, str] = {
     "anthropic": "anthropic/claude-opus-5-5",
+    "google-antigravity": "google-antigravity/gemini-3.1-pro",
     "openai-codex": "openai-codex/gpt-6-sol",
     "zhipu-coding-plan": "zhipu-coding-plan/glm-5.3-flash",
     "kimi-code": "kimi-code/kimi-k2.5",
@@ -42,13 +43,16 @@ GROUNDED_OMP_SELECTORS_BY_PROVIDER: dict[str, str] = {
 DEFAULT_GROUNDED_OMP_SELECTOR = GROUNDED_OMP_SELECTORS_BY_PROVIDER["anthropic"]
 #: Provider defaults above are the automatic roster. Additional selectors are
 #: admitted only when explicitly requested: Luna for economical focused work,
-#: Astra for rare largest-model escalation, 6.1 Sol as the newer Sol.
+#: Astra for rare largest-model escalation, 6.1 Sol as the newer Sol, and
+#: Antigravity Claude models on their own quota pool.
 GROUNDED_OMP_SELECTORS = frozenset(
     {
         *GROUNDED_OMP_SELECTORS_BY_PROVIDER.values(),
         "openai-codex/gpt-6-luna",
         "openai-codex/gpt-6-astra",
         "openai-codex/gpt-6.1-sol",
+        "google-antigravity/claude-opus-4-6",
+        "google-antigravity/claude-sonnet-4-6",
     }
 )
 #: Historical grounded selectors remain parseable for durable retrieval but
@@ -89,6 +93,8 @@ OMP_WRITER_SELECTORS = frozenset(
         "openai-codex/gpt-6-luna",
         "openai-codex/gpt-6-astra",
         "openai-codex/gpt-6.1-sol",
+        GROUNDED_OMP_SELECTORS_BY_PROVIDER["google-antigravity"],
+        "google-antigravity/claude-opus-4-6",
     }
 )
 
@@ -495,8 +501,9 @@ def omp_launch_environment(
 ) -> dict[str, str]:
     """Return the credential-minimal environment inherited by restricted OMP.
 
-    Provider API keys are absent except ``ZAI_API_KEY``: that key is the
-    Zhipu coding-plan credential rather than a metered-route override. OMP's
+    Provider API keys, including GOOGLE_API_KEY and GEMINI_API_KEY, are absent
+    except ``ZAI_API_KEY``: that key is the Zhipu coding-plan credential
+    rather than a metered-route override. OMP's
     stored or broker credentials remain reachable through its own auth store.
     """
     source = os.environ if environment is None else environment

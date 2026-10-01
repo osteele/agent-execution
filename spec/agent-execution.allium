@@ -97,10 +97,14 @@ entity Dispatch {
         -- New execution accepts no caller-selected evidence output location.
         harness_policy = workspace_write_no_shell implies harness_selector in {
             "anthropic/claude-opus-5-5",
+            "google-antigravity/gemini-3.1-pro",
+            "google-antigravity/claude-opus-4-6",
+            "zhipu-coding-plan/glm-5.3-flash",
             "kimi-code/k3",
             "openai-codex/gpt-6-sol",
             "openai-codex/gpt-6-luna",
             "openai-codex/gpt-6-astra",
+            "openai-codex/gpt-6.1-sol",
         }
     }
 }

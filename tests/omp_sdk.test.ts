@@ -15,8 +15,10 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+	antigravityOAuthCredential,
 	confinedPath,
 	readTools,
+	requireAntigravityOAuth,
 	SDK_VERSION,
 	writeTools,
 } from "../src/agent_execution/omp_sdk";
@@ -37,6 +39,30 @@ async function snapshot() {
 	await symlink(join(parent, "secret.txt"), join(root, "escape"));
 	return root;
 }
+
+test("Antigravity refuses key-only credentials and OAuth refresh failure", async () => {
+	expect(() => requireAntigravityOAuth({ hasOAuth: () => false })).toThrow(
+		"requires stored OAuth",
+	);
+	expect(() => requireAntigravityOAuth({ hasOAuth: () => true })).not.toThrow();
+	await expect(antigravityOAuthCredential(async () => null)).rejects.toThrow(
+		"API-key fallback prohibited",
+	);
+	await expect(
+		antigravityOAuthCredential(async () => { throw new Error("refresh failed"); }),
+	).rejects.toThrow("refresh failed");
+	await expect(
+		antigravityOAuthCredential(async () => ({ accessToken: "oauth-token" })),
+	).rejects.toThrow("names no Cloud project");
+	expect(
+		JSON.parse(
+			await antigravityOAuthCredential(async () => ({
+				accessToken: "oauth-token",
+				projectId: "project-1",
+			})),
+		),
+	).toEqual({ token: "oauth-token", projectId: "project-1" });
+});
 
 test("URI devices, parent traversal and symlinks cannot escape the snapshot", async () => {
 	const root = await snapshot();

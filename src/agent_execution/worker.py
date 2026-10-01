@@ -617,7 +617,7 @@ def _fsync_directory(path: Path) -> None:
 _PROVIDER_ATTRIBUTABLE = {"harness_failed", "evidence_failed"}
 
 
-def _publish_provider_status(result: WorkerResult, *, route: str) -> None:
+def _publish_provider_status(result: WorkerResult, *, route: str, model: str | None = None) -> None:
     """Share what this call observed about its provider route.
 
     The worker is the only component that watches a provider refuse. Without
@@ -633,9 +633,15 @@ def _publish_provider_status(result: WorkerResult, *, route: str) -> None:
         return
     try:
         if result.status == "completed":
-            provider_status.record_success(route)
+            if route == "google-antigravity":
+                provider_status.record_success(route, model=model)
+            else:
+                provider_status.record_success(route)
         elif result.status in _PROVIDER_ATTRIBUTABLE and result.failure:
-            provider_status.record_refusal(route, result.failure)
+            if route == "google-antigravity":
+                provider_status.record_refusal(route, result.failure, model=model)
+            else:
+                provider_status.record_refusal(route, result.failure)
     except OSError:
         return
 
@@ -748,6 +754,7 @@ def execute_worker(
     # here but `omp_invocation` is not bound until the harness is validated far
     # below, and every preflight failure returns through `finish` before that.
     selected_route = [""]
+    selected_model = [""]
 
     def finish(
         status: str,
@@ -782,7 +789,9 @@ def execute_worker(
             harness_started_at=harness_started_at,
             omp_evidence=omp_evidence,
         )
-        _publish_provider_status(result, route=selected_route[0] or provider)
+        _publish_provider_status(
+            result, route=selected_route[0] or provider, model=selected_model[0] or None
+        )
         _write_result(output, result, cwd=working_directory)
         return result
 
@@ -861,6 +870,7 @@ def execute_worker(
             # `provider` is the harness (omp); the quota belongs to the credential
             # behind the route, so report the route rather than the harness.
             selected_route[0] = omp_invocation.selector.split("/", 1)[0]
+            selected_model[0] = omp_invocation.selector
             expected_policies = (
                 {"read-only-no-shell", "workspace-write-no-shell"}
                 if provider == "omp"

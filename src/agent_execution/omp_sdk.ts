@@ -16,6 +16,28 @@ import { pathToFileURL } from "node:url";
 import type * as OmpSdk from "@oh-my-pi/pi-coding-agent";
 
 export const SDK_VERSION = "18.4.4";
+
+export function requireAntigravityOAuth(credentials: { hasOAuth(provider: string): boolean }): void {
+	if (!credentials.hasOAuth("google-antigravity"))
+		throw new Error("Restricted OMP Antigravity execution requires stored OAuth credentials");
+}
+
+/**
+ * The credential OMP's Antigravity stream accepts: it parses `apiKey` as JSON
+ * holding the OAuth token and the Cloud project (parseGeminiCliCredentials in
+ * pi-ai), so a bare token fails every request. OAuth only; no key fallback.
+ */
+export async function antigravityOAuthCredential(
+	access: () => Promise<{ accessToken: string; projectId?: string } | undefined | null>,
+): Promise<string> {
+	const credential = await access();
+	if (!credential)
+		throw new Error("OMP Antigravity OAuth unavailable; API-key fallback prohibited");
+	if (!credential.projectId)
+		throw new Error("OMP Antigravity OAuth credential names no Cloud project");
+	return JSON.stringify({ token: credential.accessToken, projectId: credential.projectId });
+}
+
 export const READ_TOOLS = [
 	"execution_read",
 	"execution_glob",
@@ -456,6 +478,9 @@ async function main(): Promise<void> {
 				"Restricted OMP Anthropic execution requires stored OAuth credentials",
 			);
 		}
+		if (provider === "google-antigravity") {
+			requireAntigravityOAuth(authStorage.credentials);
+		}
 		const prompt = await Bun.stdin.text();
 		const settings = sdk.Settings.isolated({
 			"advisor.enabled": false,
@@ -525,6 +550,11 @@ async function main(): Promise<void> {
 							);
 						return access.accessToken;
 					};
+				}
+				if (provider === "google-antigravity") {
+					return () => antigravityOAuthCredential(() =>
+						authStorage.oauth.access(provider, manager.getSessionId(), { modelId }),
+					);
 				}
 				return registry.resolver(requestModel, manager.getSessionId());
 			},

@@ -82,6 +82,52 @@ class ProviderStatusTest(unittest.TestCase):
         self.assertNotIn('"ol*"', serialized)
         self.assertIn("hmac-sha256:", serialized)
 
+    def test_dispatch_billing_pools_are_split_only_for_antigravity(self) -> None:
+        for route, model, pool in (
+            ("google-antigravity", "gemini-3.1-pro", "google-antigravity/gemini"),
+            (
+                "google-antigravity",
+                "google-antigravity/claude-opus-4-6",
+                "google-antigravity/other",
+            ),
+            ("anthropic", "claude-opus-5-5", "anthropic"),
+            ("openai-codex", "gpt-6-sol", "openai-codex"),
+            ("zhipu-coding-plan", "glm-5.3-flash", "zhipu-coding-plan"),
+            ("kimi-code", "k3", "kimi-code"),
+        ):
+            with self.subTest(route=route, model=model):
+                success = provider_status.record_success(route, model=model)
+                refusal = provider_status.record_refusal(route, "usage limit", model=model)
+                for event in (success, refusal):
+                    self.assertEqual(event["subject"]["route"], route)
+                    self.assertEqual(event["subject"]["billing_pool"], pool)
+
+    def test_antigravity_success_does_not_clear_other_family_refusal(self) -> None:
+        with mock.patch("agent_execution.provider_status.time.time", return_value=1_790_000_000):
+            provider_status.record_refusal(
+                "google-antigravity",
+                "You've reached your 5-hour usage limit",
+                model="claude-opus-4-6",
+            )
+        with mock.patch("agent_execution.provider_status.time.time", return_value=1_790_000_010):
+            provider_status.record_success("google-antigravity", model="gemini-3.1-pro")
+        providers = cast(
+            list[dict[str, object]], provider_status.snapshot(now=1_790_000_020)["providers"]
+        )
+        self.assertTrue(
+            any(
+                item["billing_pool"] == "google-antigravity/other"
+                and item["state"] == "unavailable"
+                for item in providers
+            )
+        )
+        self.assertTrue(
+            any(
+                item["billing_pool"] == "google-antigravity/gemini" and item["state"] == "available"
+                for item in providers
+            )
+        )
+
     def test_success_supersedes_an_older_refusal_for_the_same_subject(self) -> None:
         with mock.patch("agent_execution.provider_status.time.time", return_value=1_790_000_000):
             provider_status.record_refusal("kimi-code", "You've reached your 5-hour usage limit")

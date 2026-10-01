@@ -267,6 +267,36 @@ class WorkerResultTests(unittest.TestCase):
         )
         self.assertEqual(stored, result)
 
+    def test_antigravity_dispatch_publishes_its_model_family(self) -> None:
+        for selector in (
+            "google-antigravity/gemini-3.1-pro",
+            "google-antigravity/claude-opus-4-6",
+        ):
+            with (
+                self.subTest(selector=selector),
+                mock.patch(
+                    "agent_execution.worker.require_omp_sdk", return_value=(self.root, "bun")
+                ),
+                mock.patch("agent_execution.worker.provider_status.record_success") as success,
+            ):
+                result = execute_worker(
+                    provider="omp",
+                    model_call_id="antigravity-call",
+                    command=omp_command(str(self.root), selector=selector, writer=True),
+                    invoke=lambda command, cwd, timeout, selector=selector: CommandResult(
+                        0,
+                        omp_output(
+                            cwd=str(cwd), selector=selector, policy="workspace-write-no-shell"
+                        ),
+                        "",
+                    ),
+                    timeout=30.0,
+                    ctx_timeout=10.0,
+                    cwd=self.root,
+                )
+                self.assertEqual(result.status, "completed", result.failure)
+                success.assert_called_once_with("google-antigravity", model=selector)
+
     def test_workspace_writer_admits_opus(self) -> None:
         selector = "anthropic/claude-opus-5-5"
         invoked: list[list[str]] = []

@@ -66,6 +66,15 @@ def route_for(name: str) -> str:
     return ROUTE_ALIASES.get(name, name)
 
 
+def billing_pool_for(route: str, model: str | None = None) -> str:
+    """Map Antigravity model families to independent quota pools."""
+    resolved = route_for(route)
+    if resolved == "google-antigravity" and model:
+        model_id = model.partition("/")[2] if "/" in model else model
+        return f"google-antigravity/{'gemini' if model_id.startswith('gemini-') else 'other'}"
+    return resolved
+
+
 def state_dir() -> Path:
     override = os.environ.get("AGENT_PROVIDER_STATUS_DIR")
     if override:
@@ -231,6 +240,7 @@ def observe(
     host: str | None = None,
     os_user: str | None = None,
     billing_pool: str | None = None,
+    model: str | None = None,
     credential_identity: str | None = None,
     ttl_seconds: int = DEFAULT_EVENT_TTL_SECONDS,
     detail: dict[str, object] | None = None,
@@ -248,7 +258,7 @@ def observe(
         "event_id": event_id,
         "subject": {
             "route": route_for(route),
-            "billing_pool": billing_pool or route_for(route),
+            "billing_pool": billing_pool or billing_pool_for(route, model),
             "credential_fingerprint": fingerprint,
             "fingerprint_scope": fingerprint_scope,
             "host": host_name,
@@ -266,7 +276,7 @@ def observe(
 
 
 def record_refusal(
-    route: str, signature: str, *, observed_by: str = "agent-execution"
+    route: str, signature: str, *, observed_by: str = "agent-execution", model: str | None = None
 ) -> dict[str, object]:
     condition, window, cooldown, reset_at = classify(signature)
     detail: dict[str, object] = {
@@ -291,6 +301,7 @@ def record_refusal(
         state="unavailable",
         source_tool=observed_by,
         source_method="provider-refusal",
+        model=model,
         ttl_seconds=cooldown,
         detail=detail,
     )
@@ -298,13 +309,16 @@ def record_refusal(
     return event
 
 
-def record_success(route: str, *, observed_by: str = "agent-execution") -> dict[str, object]:
+def record_success(
+    route: str, *, observed_by: str = "agent-execution", model: str | None = None
+) -> dict[str, object]:
     event = observe(
         route,
         kind="availability",
         state="available",
         source_tool=observed_by,
         source_method="successful-dispatch",
+        model=model,
     )
     publish_async()
     return event

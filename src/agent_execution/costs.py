@@ -204,7 +204,7 @@ def _omp_estimate(
             f"{stack_provider!r}; billing route is unestablished",
         )
     adapter = str(profile.get("adapter", ""))
-    if selected_provider == "anthropic" or adapter == "omp":
+    if selected_provider in {"anthropic", "google-antigravity"} or adapter == "omp":
         observation = observe_credential_basis(
             "omp",
             profile=selector_value,
