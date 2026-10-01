@@ -23,7 +23,10 @@ if TYPE_CHECKING:
 
     from agent_execution.processes import ProcessIdentity
 
-OMP_SDK_VERSION = "18.2.10"
+OMP_SDK_VERSION = "18.4.4"
+#: Earlier pins whose stored transcripts must stay retrievable. A bump moves the
+#: outgoing pin here; dropping one makes its completed results unreadable.
+HISTORICAL_OMP_SDK_VERSIONS = ("18.1.15", "18.2.10")
 OMP_EXECUTION_SCHEMA = "agent-execution.omp-execution/v1"
 OMP_TRANSCRIPT_SCHEMA = "agent-execution.omp-transcript/v1"
 #: Provider-qualified models admitted to the grounded SDK boundary. The same
@@ -39,12 +42,13 @@ GROUNDED_OMP_SELECTORS_BY_PROVIDER: dict[str, str] = {
 DEFAULT_GROUNDED_OMP_SELECTOR = GROUNDED_OMP_SELECTORS_BY_PROVIDER["anthropic"]
 #: Provider defaults above are the automatic roster. Additional selectors are
 #: admitted only when explicitly requested: Luna for economical focused work,
-#: Astra for rare largest-model escalation.
+#: Astra for rare largest-model escalation, 6.1 Sol as the newer Sol.
 GROUNDED_OMP_SELECTORS = frozenset(
     {
         *GROUNDED_OMP_SELECTORS_BY_PROVIDER.values(),
         "openai-codex/gpt-6-luna",
         "openai-codex/gpt-6-astra",
+        "openai-codex/gpt-6.1-sol",
     }
 )
 #: Historical grounded selectors remain parseable for durable retrieval but
@@ -84,6 +88,7 @@ OMP_WRITER_SELECTORS = frozenset(
         GROUNDED_OMP_SELECTORS_BY_PROVIDER["openai-codex"],
         "openai-codex/gpt-6-luna",
         "openai-codex/gpt-6-astra",
+        "openai-codex/gpt-6.1-sol",
     }
 )
 
@@ -281,7 +286,7 @@ def omp_transcript(
         raise ValueError("OMP output lacks restricted execution attestation")
     # Stored transcripts retain their original, previously supported SDK pin.
     if (
-        header.get("sdk_version") not in ("18.1.15", OMP_SDK_VERSION)
+        header.get("sdk_version") not in (*HISTORICAL_OMP_SDK_VERSIONS, OMP_SDK_VERSION)
         or header.get("harness") != "omp"
     ):
         raise ValueError("OMP execution has unsupported SDK or harness identity")

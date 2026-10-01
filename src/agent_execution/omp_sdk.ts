@@ -15,7 +15,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type * as OmpSdk from "@oh-my-pi/pi-coding-agent";
 
-export const SDK_VERSION = "18.2.10";
+export const SDK_VERSION = "18.4.4";
 export const READ_TOOLS = [
 	"execution_read",
 	"execution_glob",
@@ -434,11 +434,11 @@ async function main(): Promise<void> {
 	const authStorage = await sdk.discoverAuthStorage();
 	try {
 		if (policy === "--auth-status") {
-			const credentialType = authStorage.hasOAuth(provider)
+			const credentialType = authStorage.credentials.hasOAuth(provider)
 				? "oauth"
-				: authStorage.get(provider)?.type === "api_key"
+				: authStorage.credentials.get(provider)?.type === "api_key"
 					? "api_key"
-					: authStorage.hasAuth(provider)
+					: authStorage.credentials.has(provider)
 						? "unknown"
 						: "missing";
 			await writeOutput(
@@ -451,7 +451,7 @@ async function main(): Promise<void> {
 			);
 			return;
 		}
-		if (provider === "anthropic" && !authStorage.hasOAuth(provider)) {
+		if (provider === "anthropic" && !authStorage.credentials.hasOAuth(provider)) {
 			throw new Error(
 				"Restricted OMP Anthropic execution requires stored OAuth credentials",
 			);
@@ -498,7 +498,11 @@ async function main(): Promise<void> {
 			modelRegistry: registry,
 			model,
 			sessionManager: manager,
-			thinkingLevel: "high",
+			// Effort.High; the SDK is imported for types only, so its const enum
+			// value is written as the string it stands for.
+			thinkingLevel: "high" as NonNullable<
+				OmpSdk.CreateAgentSessionOptions["thinkingLevel"]
+			>,
 			autoApprove: true,
 			getApiKey: (requestModel) => {
 				if (requestModel.provider !== provider || requestModel.id !== modelId) {
@@ -510,7 +514,7 @@ async function main(): Promise<void> {
 					return async () => {
 						// Public OAuth-only resolution refreshes stored tokens but cannot fall
 						// through to API keys if the credential disappears or refresh fails.
-						const access = await authStorage.getOAuthAccess(
+						const access = await authStorage.oauth.access(
 							provider,
 							manager.getSessionId(),
 							{ modelId },

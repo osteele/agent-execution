@@ -51,3 +51,24 @@ class OmpRuntimeInstallTests(unittest.TestCase):
             ):
                 install_omp_runtime()
             self.assertEqual((root / "bun.lock").read_text(), "existing lockfile\n")
+
+
+class OmpSdkPinTests(unittest.TestCase):
+    def test_every_copy_of_the_sdk_pin_names_one_version(self) -> None:
+        """The runtime script refuses any SDK but its own, so a pin bumped in one
+        place and not the others makes every probe silent rather than failing."""
+        import json
+        import re
+
+        from agent_execution import omp_execution
+
+        package = Path(omp_execution.__file__).resolve().parent
+        script = (package / "omp_sdk.ts").read_text(encoding="utf-8")
+        match = re.search(r'^export const SDK_VERSION = "([^"]+)";$', script, re.MULTILINE)
+        assert match is not None, "omp_sdk.ts declares no SDK_VERSION"
+        manifest = json.loads((package / "omp-runtime" / "package.json").read_text())
+        pinned = manifest["dependencies"]["@oh-my-pi/pi-coding-agent"]
+        self.assertEqual(
+            {omp_execution.OMP_SDK_VERSION, match.group(1), pinned},
+            {omp_execution.OMP_SDK_VERSION},
+        )
