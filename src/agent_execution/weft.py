@@ -64,6 +64,9 @@ LOST_OBSERVATION_PROBE_SECONDS = 30.0
 #: lookup-sized bound, or the same fault returns the next time a result is
 #: large or a link is slow.
 ARTIFACT_RETRIEVAL_SECONDS = 300.0
+# Measured 2026-10-02: four of five failed acknowledgments were a single
+# 30-second mark-processed timeout, so a second, longer attempt follows.
+MARK_PROCESSED_TIMEOUTS = (30.0, 60.0)
 REMOTE_OBSERVATION_SECONDS = 900.0
 DIAGNOSTIC_TAIL_LINES = 200
 
@@ -760,6 +763,34 @@ class WeftCommandRunner:
                 processing[name] = value
         execution["processing"] = processing
 
+    def _acknowledge(self, *, job_id: str, cwd: Path, execution: dict[str, object]) -> str | None:
+        """Remove a job from Weft's unprocessed queue; return why that failed.
+
+        ``mark-processed`` names the job by id alone, so a consumer whose
+        working directory is gone by acknowledgment time (a finished harness's
+        scratch tree, observed as ENOENT on wj8629) runs it from home instead.
+        """
+        where = cwd if cwd.is_dir() else Path.home()
+        detail = ""
+        for timeout in MARK_PROCESSED_TIMEOUTS:
+            try:
+                marked = self.invoke(
+                    [self.executable, "job", "mark-processed", job_id], where, timeout
+                )
+            except subprocess.TimeoutExpired:
+                detail = f"mark-processed timed out after {timeout:g}s"
+                continue
+            except (FileNotFoundError, PermissionError) as error:
+                return str(error)
+            execution["processed"] = marked.exit_status == 0
+            if marked.exit_status == 0:
+                execution.pop("processing_error", None)
+                return None
+            lines = (marked.stderr or marked.stdout).strip().splitlines()
+            execution["processing_error"] = lines[-1] if lines else "no output"
+            return str(execution["processing_error"])
+        return detail
+
     def _mark_processed(
         self,
         *,
@@ -768,40 +799,39 @@ class WeftCommandRunner:
         execution: dict[str, object],
     ) -> None:
         """Mark a Weft result consumed after its consumer's ingestion is durable."""
-        try:
-            marked = self.invoke(
-                [self.executable, "job", "mark-processed", job_id],
-                cwd,
-                30.0,
-            )
-        except subprocess.TimeoutExpired:
-            self._processing(
-                execution,
-                state="mark_failed",
-                step="mark_processed",
-                detail="mark-processed timed out after 30s",
-            )
-            return
-        except (FileNotFoundError, PermissionError) as error:
-            self._processing(
-                execution,
-                state="mark_failed",
-                step="mark_processed",
-                detail=str(error),
-            )
-            return
-        execution["processed"] = marked.exit_status == 0
-        if marked.exit_status != 0:
-            detail = (marked.stderr or marked.stdout).strip().splitlines()
-            execution["processing_error"] = detail[-1] if detail else "no output"
-            self._processing(
-                execution,
-                state="mark_failed",
-                step="mark_processed",
-                detail=str(execution["processing_error"]),
-            )
-        else:
+        failure = self._acknowledge(job_id=job_id, cwd=cwd, execution=execution)
+        if failure is None:
             self._processing(execution, state="marked", step="mark_processed")
+        else:
+            self._processing(execution, state="mark_failed", step="mark_processed", detail=failure)
+
+    def _refuse(
+        self,
+        *,
+        job_id: str,
+        cwd: Path,
+        execution: dict[str, object],
+        step: str,
+        detail: str,
+        **fields: object,
+    ) -> None:
+        """Record a proven-bad worker result and take it off Weft's queue.
+
+        The worker artifact was read and judged, which is everything consuming
+        it means: reading it again yields the same verdict, and recovery is
+        keyed on the consumer's own record of the job id, never on Weft's
+        unprocessed queue (agent-review decision 0050: a proven bad result is
+        terminal). Left unmarked, every refusal stayed in that queue for good
+        -- 258 of 332 unprocessed agent-execution jobs on 2026-10-02 (ax3).
+
+        ``processing`` keeps the refusal, because consumers classify failures
+        by its ``not_marked`` state and step; the Weft acknowledgment is
+        recorded on ``processed`` and ``processing_error`` beside it.
+        """
+        self._processing(execution, state="not_marked", step=step, detail=detail, **fields)
+        failure = self._acknowledge(job_id=job_id, cwd=cwd, execution=execution)
+        if failure is not None:
+            execution["processing_error"] = failure
 
     def _discard_settled_evidence(self, cwd: Path, execution: dict[str, object]) -> None:
         """Remove the local worker receipt of a cycle its consumer has banked.
@@ -951,21 +981,50 @@ class WeftCommandRunner:
         """Validate one durable worker artifact and reconstruct its command result."""
         try:
             worker = WorkerResult.parse(artifact.stdout)
-            if worker.model_call_id != self.model_call_id:
-                raise ValueError("worker result does not match the requested model call")
-            if worker.provider != self.agent:
-                raise ValueError("worker result does not match the requested provider")
         except ValueError as error:
-            self._processing(
-                execution,
-                state="not_marked",
-                step="worker_result_validation",
-                detail=str(error),
-            )
+            # Bytes that are not JSON at all may be a damaged read of a good
+            # artifact, so they are no verdict on the job and leave it on
+            # Weft's queue; a decoded artifact that fails validation is one.
+            if isinstance(error.__cause__, json.JSONDecodeError):
+                self._processing(
+                    execution,
+                    state="not_marked",
+                    step="worker_result_validation",
+                    detail=str(error),
+                )
+            else:
+                self._refuse(
+                    job_id=job_id,
+                    cwd=cwd,
+                    execution=execution,
+                    step="worker_result_validation",
+                    detail=str(error),
+                )
             return CommandResult(
                 1,
                 "",
                 f"invalid Weft worker result for {job_id}: {error}",
+                execution=execution,
+            )
+        mismatch = (
+            "worker result does not match the requested model call"
+            if worker.model_call_id != self.model_call_id
+            else "worker result does not match the requested provider"
+            if worker.provider != self.agent
+            else None
+        )
+        if mismatch is not None:
+            self._refuse(
+                job_id=job_id,
+                cwd=cwd,
+                execution=execution,
+                step="worker_result_validation",
+                detail=mismatch,
+            )
+            return CommandResult(
+                1,
+                "",
+                f"invalid Weft worker result for {job_id}: {mismatch}",
                 execution=execution,
             )
         summary = worker.summary(artifact_path=str(execution["worker_result_path"]))
@@ -979,9 +1038,10 @@ class WeftCommandRunner:
                 cast(int, expected_protocol),
                 worker.worker_protocol_version,
             )
-            self._processing(
-                execution,
-                state="not_marked",
+            self._refuse(
+                job_id=job_id,
+                cwd=cwd,
+                execution=execution,
                 step="worker_protocol_validation",
                 detail=detail,
             )
@@ -995,9 +1055,10 @@ class WeftCommandRunner:
                 "worker source mismatch: conductor expects "
                 f"{expected_source}, remote worker reports {worker.worker_source_sha256}"
             )
-            self._processing(
-                execution,
-                state="not_marked",
+            self._refuse(
+                job_id=job_id,
+                cwd=cwd,
+                execution=execution,
                 step="worker_source_validation",
                 detail=detail,
             )
@@ -1010,9 +1071,10 @@ class WeftCommandRunner:
                 "worker prompt mismatch: conductor expects "
                 f"{expected_prompt}, remote worker reports {worker.prompt_sha256}"
             )
-            self._processing(
-                execution,
-                state="not_marked",
+            self._refuse(
+                job_id=job_id,
+                cwd=cwd,
+                execution=execution,
                 step="worker_prompt_validation",
                 detail=detail,
             )
@@ -1049,9 +1111,10 @@ class WeftCommandRunner:
                     prompt_sha256=worker.prompt_sha256 or None,
                 )
             except ValueError as error:
-                self._processing(
-                    execution,
-                    state="not_marked",
+                self._refuse(
+                    job_id=job_id,
+                    cwd=cwd,
+                    execution=execution,
                     step="worker_result_validation",
                     detail=str(error),
                 )
@@ -1076,9 +1139,10 @@ class WeftCommandRunner:
             # carried one line of `detail` and the bytes that would explain the
             # crash lived only in a studio-side weft log, which expires. Tails
             # are bounded and kept on the same terms as the local path.
-            self._processing(
-                execution,
-                state="not_marked",
+            self._refuse(
+                job_id=job_id,
+                cwd=cwd,
+                execution=execution,
                 step="worker_execution",
                 detail=worker.failure,
                 worker_status=worker.status,

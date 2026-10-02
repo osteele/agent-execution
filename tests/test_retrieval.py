@@ -166,12 +166,16 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(self.processing()["state"], "marked")
 
     def test_acknowledgment_failure_is_visible_and_retryable(self) -> None:
-        self.mark = [subprocess.TimeoutExpired(["weft", "job", "mark-processed"], 30)]
+        self.mark = [
+            subprocess.TimeoutExpired(["weft", "job", "mark-processed"], 30),
+            subprocess.TimeoutExpired(["weft", "job", "mark-processed"], 60),
+        ]
         result = self.retrieve()
         assert isinstance(result, CommandResult)
         result.mark_consumed()
         self.assertNotIn("processed", self.execution)
         self.assertEqual(self.processing()["state"], "mark_failed")
+        self.assertEqual(self.processing()["detail"], "mark-processed timed out after 60s")
         self.mark = [CommandResult(1, "", "state rejected")]
         result.mark_consumed()
         self.assertEqual(self.execution["processed"], False)
@@ -179,6 +183,38 @@ class RetrievalTests(unittest.TestCase):
         result.mark_consumed()
         self.assertEqual(self.execution["processed"], True)
         self.assertEqual(self.processing()["state"], "marked")
+
+    def test_a_timed_out_acknowledgment_is_retried_with_a_longer_budget(self) -> None:
+        """Four of five recorded acknowledgment failures were one 30s timeout (ax3)."""
+        self.mark = [
+            subprocess.TimeoutExpired(["weft", "job", "mark-processed"], 30),
+            CommandResult(0, "", ""),
+        ]
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        result.mark_consumed()
+        self.assertEqual(self.execution["processed"], True)
+        self.assertEqual(self.processing()["state"], "marked")
+        budgets = [
+            timeout for command, _, timeout in self.calls if command[2:3] == ["mark-processed"]
+        ]
+        self.assertEqual(budgets, [30.0, 60.0])
+
+    def test_acknowledgment_survives_a_removed_working_directory(self) -> None:
+        """A harness scratch tree can be gone by acknowledgment time (wj8629, ENOENT)."""
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        gone = self.root / "removed-harness-tree"
+        result_in_gone_tree = self.runner._command_result_from_worker(
+            job_id=JOB,
+            cwd=gone,
+            execution=self.execution,
+            artifact=CommandResult(0, worker_artifact(), ""),
+        )
+        result_in_gone_tree.mark_consumed()
+        self.assertEqual(self.execution["processed"], True)
+        mark_cwds = [cwd for command, cwd, _ in self.calls if command[2:3] == ["mark-processed"]]
+        self.assertEqual(mark_cwds, [Path.home()])
 
     def plant_receipt(self, model_call_id: str = KEY, content: str = "{}") -> Path:
         receipt = self.root / worker_evidence_path(model_call_id)
@@ -284,8 +320,7 @@ class RetrievalTests(unittest.TestCase):
         assert isinstance(result, CommandResult)
         self.assertEqual(result.exit_status, 1)
         self.assertEqual(self.processing()["step"], "worker_result_validation")
-        result.mark_consumed()
-        self.assertEqual(self.mark, [CommandResult(0, "", "")])
+        self.assertIsNone(result.consumed)
 
     def test_validation_boundaries_refuse_consumption(self) -> None:
 
@@ -305,14 +340,40 @@ class RetrievalTests(unittest.TestCase):
                 payload = json.loads(worker_artifact())
                 payload[field] = value
                 self.artifact_calls = [CommandResult(0, json.dumps(payload), "")]
+                self.mark = [CommandResult(0, "", "")]
+                self.execution.pop("processed", None)
                 self.execution.update(execution_changes)
                 result = self.retrieve()
                 assert isinstance(result, CommandResult)
                 self.assertEqual(result.exit_status, 1)
+                # The refusal is what the consumer classifies by; the Weft
+                # acknowledgment is recorded beside it, not over it.
                 self.assertEqual(self.processing()["state"], "not_marked")
                 self.assertEqual(self.processing()["step"], step)
-                result.mark_consumed()
-                self.assertEqual(self.mark, [CommandResult(0, "", "")])
+                self.assertIsNone(result.consumed)
+                self.assertEqual(self.mark, [])
+                self.assertEqual(self.execution["processed"], True)
+
+    def test_a_refusal_whose_acknowledgment_fails_records_why(self) -> None:
+        payload = json.loads(worker_artifact())
+        payload["worker_source_sha256"] = "b" * 64
+        self.artifact_calls = [CommandResult(0, json.dumps(payload), "")]
+        self.mark = [CommandResult(1, "", "hub unreachable")]
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        self.assertEqual(self.processing()["step"], "worker_source_validation")
+        self.assertEqual(self.execution["processed"], False)
+        self.assertEqual(self.execution["processing_error"], "hub unreachable")
+
+    def test_an_unparseable_artifact_stays_on_the_weft_queue(self) -> None:
+        """Bytes that do not parse may be a damaged read, not a verdict on the job."""
+        self.artifact_calls = [CommandResult(0, "{not json", "")]
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        self.assertEqual(result.exit_status, 1)
+        self.assertEqual(self.processing()["state"], "not_marked")
+        self.assertEqual(self.mark, [CommandResult(0, "", "")])
+        self.assertNotIn("processed", self.execution)
 
     def test_noncompleted_worker_result_keeps_bounded_diagnostics_unacknowledged(self) -> None:
         payload = json.loads(worker_artifact())
@@ -328,8 +389,8 @@ class RetrievalTests(unittest.TestCase):
         stdout_tail = self.processing()["stdout_tail"]
         assert isinstance(stdout_tail, str)
         self.assertEqual(len(stdout_tail), 8000)
-        result.mark_consumed()
-        self.assertEqual(self.mark, [CommandResult(0, "", "")])
+        self.assertEqual(self.processing()["step"], "worker_execution")
+        self.assertEqual(self.execution["processed"], True)
 
     def test_missing_source_is_recovered_from_accepted_command(self) -> None:
         del self.execution["expected_worker_source_sha256"]
@@ -469,8 +530,11 @@ class RetrievalTests(unittest.TestCase):
         )
         assert isinstance(refused, CommandResult)
         self.assertEqual(refused.exit_status, 1)
-        refused.mark_consumed()
-        self.assertEqual(self.calls, [])
+        self.assertIsNone(refused.consumed)
+        self.assertEqual(
+            [command[1:3] for command, _, _ in self.calls], [["job", "mark-processed"]]
+        )
+        self.mark = [CommandResult(0, "", "")]
 
         self.execution["omp_policy"] = "workspace-write-no-shell"
         accepted = self.runner.retrieve_from_file(
@@ -494,6 +558,7 @@ class RetrievalTests(unittest.TestCase):
         ):
             with self.subTest(writer=writer, policy=policy):
                 self.execution["omp_policy"] = policy
+                self.mark = [CommandResult(0, "", "")]
                 self.artifact_calls = [
                     CommandResult(
                         0,
@@ -505,8 +570,8 @@ class RetrievalTests(unittest.TestCase):
                 assert isinstance(result, CommandResult)
                 self.assertEqual(result.exit_status, 1)
                 self.assertEqual(self.processing()["state"], "not_marked")
-                result.mark_consumed()
-                self.assertEqual(self.mark, [CommandResult(0, "", "")])
+                self.assertIsNone(result.consumed)
+                self.assertEqual(self.mark, [])
 
     def test_native_file_ingestion_still_refuses_new_execution(self) -> None:
         execution: dict[str, object] = {
