@@ -1166,6 +1166,11 @@ class WeftCommandRunner:
             self._discard_settled_evidence(cwd, execution)
             self._mark_processed(job_id=job_id, cwd=cwd, execution=execution)
 
+        def acknowledge_refusal() -> None:
+            failure = self._acknowledge(job_id=job_id, cwd=cwd, execution=execution)
+            if failure is not None:
+                execution["processing_error"] = failure
+
         return CommandResult(
             worker.harness.exit_status or 0,
             worker.harness.stdout,
@@ -1173,6 +1178,7 @@ class WeftCommandRunner:
             execution=execution,
             worker_result=worker,
             consumed=mark_consumed,
+            refused=acknowledge_refusal,
         )
 
     @property

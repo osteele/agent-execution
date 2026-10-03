@@ -165,6 +165,31 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(self.execution["processed"], True)
         self.assertEqual(self.processing()["state"], "marked")
 
+    def test_a_consumer_refusal_is_acknowledged_without_rewriting_processing(self) -> None:
+        """A consumer's refusal is a result; its classification must survive the mark."""
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        refusal = {
+            "state": "not_marked",
+            "step": "review_response_validation",
+            "detail": "no fenced review response",
+        }
+        self.execution["processing"] = dict(refusal)
+        result.acknowledge_refusal()
+        self.assertEqual(self.processing(), refusal)
+        self.assertEqual(self.execution["processed"], True)
+        self.assertNotIn("processing_error", self.execution)
+
+    def test_a_consumer_refusal_whose_acknowledgment_fails_records_why(self) -> None:
+        result = self.retrieve()
+        assert isinstance(result, CommandResult)
+        self.execution["processing"] = {"state": "not_marked", "step": "review_response_validation"}
+        self.mark = [CommandResult(1, "", "hub unreachable")]
+        result.acknowledge_refusal()
+        self.assertEqual(self.processing()["state"], "not_marked")
+        self.assertEqual(self.execution["processed"], False)
+        self.assertEqual(self.execution["processing_error"], "hub unreachable")
+
     def test_acknowledgment_failure_is_visible_and_retryable(self) -> None:
         self.mark = [
             subprocess.TimeoutExpired(["weft", "job", "mark-processed"], 30),

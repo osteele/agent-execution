@@ -24,11 +24,23 @@ class CommandResult:
     harness: dict[str, object] | None = None
     consumed: Callable[[], None] | None = None
     worker_result: WorkerResult | None = None
+    refused: Callable[[], None] | None = None
 
     def mark_consumed(self) -> None:
         """Acknowledge only after the consumer validates and durably records output."""
         if self.consumed is not None:
             self.consumed()
+
+    def acknowledge_refusal(self) -> None:
+        """Acknowledge a result the consumer judged and durably recorded as refused.
+
+        Unlike `mark_consumed`, this leaves `execution["processing"]` as the
+        consumer wrote it, because consumers classify failures by that state
+        and step; the Weft mark is recorded on `processed` and
+        `processing_error` beside it, as for a worker-side refusal.
+        """
+        if self.refused is not None:
+            self.refused()
 
 
 def run_command(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
