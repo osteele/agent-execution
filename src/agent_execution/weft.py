@@ -435,6 +435,7 @@ class WeftCommandRunner:
         readiness: ReadinessObservation | None = None,
         max_cost_usd: float | None = None,
         allow_queue: bool = False,
+        project: str = WORKER_PROJECT,
     ) -> None:
         self.host = host
         self.agent = agent
@@ -452,6 +453,11 @@ class WeftCommandRunner:
 
         self.max_cost_usd = validate_max_cost_usd(max_cost_usd)
         self.allow_queue = allow_queue
+        # The Weft project credits the job to its consumer, whose unprocessed
+        # list it belongs on: the worker only executes it, and a job filed
+        # under agent-execution showed that project's sessions another tool's
+        # recorded failures as their own orphans.
+        self.project = project
         self.prompt_sha256: str | None = None
         self.omp_selector: str | None = None
         self.omp_policy: str | None = None
@@ -1612,7 +1618,7 @@ class WeftCommandRunner:
                     "--setup",
                     "none",
                     "--project",
-                    WORKER_PROJECT,
+                    self.project,
                     "--submitter-session",
                     self.submitter_session,
                     "--produces",
