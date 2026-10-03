@@ -92,6 +92,20 @@ AGY_RULES_PATH = AGY_CONFIG_DIR / "GEMINI.md"
 AGY_DENY_HOOK_PATH = AGY_CONFIG_DIR / "hooks" / "agent-execution-deny-all.sh"
 #: macOS credential stores, symlinked rather than copied.
 AGY_LINKED_LIBRARY_DIRS = ("Keychains", "Preferences")
+#: What a reviewer home copies from the real HOME: sign-in and settings, and
+#: nothing that is the user's history. Measured 2026-10-03: a home of these six
+#: entries (52 KB) signs in and answers, as the whole `.gemini` (697 MB) did.
+#: Everything else -- `antigravity-cli/conversations` and `brain`, the Chromium
+#: browser profile, browser recordings, `skills`, `tmp` -- is excluded, which is
+#: also what the other harnesses' flags do (no sessions, no memory, no skills).
+AGY_HOME_ALLOWLIST: tuple[Path, ...] = (
+    AGY_CONFIG_DIR / "settings.json",
+    AGY_CONFIG_DIR / "installation_id",
+    AGY_CONFIG_DIR / "config",
+    AGY_CONFIG_DIR / "antigravity-cli" / "antigravity-oauth-token",
+    AGY_CONFIG_DIR / "antigravity-cli" / "settings.json",
+    AGY_CONFIG_DIR / "antigravity-cli" / "installation_id",
+)
 
 _DENY_REASON = (
     "agent-execution packet-only review: every tool is disabled; answer from the brief alone"
@@ -279,19 +293,18 @@ def _write_json(path: Path, value: object) -> None:
 
 def build_agy_home(home: Path, *, source_home: Path) -> None:
     """Populate a throwaway HOME for one packet-only agy call."""
-    source_config = source_home / AGY_CONFIG_DIR
     target_config = home / AGY_CONFIG_DIR
-    if source_config.is_dir():
+    target_config.mkdir(parents=True)
+    for entry in AGY_HOME_ALLOWLIST:
+        source = source_home / entry
+        target = home / entry
+        target.parent.mkdir(parents=True, exist_ok=True)
         # Followed, not preserved: a copied symlink could write through into
         # the real configuration.
-        shutil.copytree(
-            source_config,
-            target_config,
-            symlinks=False,
-            ignore_dangling_symlinks=True,
-        )
-    else:
-        target_config.mkdir(parents=True)
+        if source.is_dir():
+            shutil.copytree(source, target, symlinks=False, ignore_dangling_symlinks=True)
+        elif source.is_file():
+            shutil.copy2(source, target)
 
     script = home / AGY_DENY_HOOK_PATH
     script.parent.mkdir(parents=True, exist_ok=True)

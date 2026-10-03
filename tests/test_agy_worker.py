@@ -22,6 +22,7 @@ from agent_execution.agy_execution import (
     AgyStatusError,
     agy_envelope,
     agy_final_text,
+    build_agy_home,
     validate_agy_command,
 )
 from agent_execution.command import CommandResult
@@ -452,6 +453,34 @@ class AgyIsolatedHomeTests(unittest.TestCase):
 
     def record(self) -> dict[str, object]:
         return json.loads((self.root / "agy-record.json").read_text())
+
+    def test_the_home_copies_sign_in_and_settings_and_none_of_the_users_history(self) -> None:
+        gemini = self.source_home / ".gemini"
+        cli = gemini / "antigravity-cli"
+        (cli / "conversations").mkdir(parents=True)
+        (cli / "conversations" / "c1.pb").write_text("an earlier session")
+        (cli / "brain").mkdir()
+        (cli / "brain" / "notes.md").write_text("remembered")
+        (cli / "antigravity-oauth-token").write_text("token")
+        (gemini / "antigravity-browser-profile").mkdir()
+        (gemini / "skills" / "deploy").mkdir(parents=True)
+        (gemini / "skills" / "deploy" / "SKILL.md").write_text("a user skill")
+        home = self.root.parent / "built-home"
+
+        build_agy_home(home, source_home=self.source_home)
+
+        built = home / ".gemini"
+        self.assertEqual(
+            (built / "antigravity-cli" / "antigravity-oauth-token").read_text(), "token"
+        )
+        self.assertTrue((built / "settings.json").is_file())
+        for excluded in (
+            "antigravity-cli/conversations",
+            "antigravity-cli/brain",
+            "antigravity-browser-profile",
+            "skills",
+        ):
+            self.assertFalse((built / excluded).exists(), excluded)
 
     def test_child_sees_deny_all_hook_and_empty_mcp_config_and_home_is_removed(self) -> None:
         result = self.execute(stdout=envelope(), exit_status=0, model_call_id="agy-home")
