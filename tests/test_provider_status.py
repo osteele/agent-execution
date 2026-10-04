@@ -137,6 +137,95 @@ class ProviderStatusTest(unittest.TestCase):
         self.assertIsNone(provider_status.unavailable_reason("kimi-code", now=1_790_000_020))
         self.assertNotIn("kimi-code", provider_status.quota_blocked_routes(now=1_790_000_020))
 
+    def test_observation_order_is_by_instant_not_by_timestamp_spelling(self) -> None:
+        """Events arrive from other hosts; a valid RFC 3339 offset must order by instant."""
+        refusal = provider_status.observe(
+            "kimi-code",
+            kind="quota",
+            state="unavailable",
+            source_tool="test",
+            source_method="fixture",
+            host="other-host",
+            os_user="agent",
+            now=1_790_000_000,
+            detail={"reason": "weekly cap"},
+        )
+        success = provider_status.observe(
+            "kimi-code",
+            kind="availability",
+            state="available",
+            source_tool="test",
+            source_method="fixture",
+            host="other-host",
+            os_user="agent",
+            now=1_790_000_000,
+        )
+        # 10:00Z spelled in +08:00 (sorts after "11:00Z" as text), then 11:00Z.
+        for event, observed in (
+            (refusal, "2026-10-04T18:00:00+08:00"),
+            (success, "2026-10-04T11:00:00Z"),
+        ):
+            event["observed_at"] = observed
+            event["expires_at"] = "2026-10-05T00:00:00Z"
+            path = self.root / "outbox" / f"{event['event_id']}.json"
+            path.write_text(json.dumps(event))
+
+        now = provider_status._timestamp("2026-10-04T12:00:00Z")
+        self.assertIsNone(provider_status.unavailable_reason("kimi-code", now=now))
+
+    def test_the_latest_observation_of_one_kind_is_chosen_by_instant(self) -> None:
+        older = provider_status.observe(
+            "kimi-code",
+            kind="quota",
+            state="available",
+            source_tool="test",
+            source_method="fixture",
+            host="other-host",
+            os_user="agent",
+            now=1_790_000_000,
+        )
+        newer = provider_status.observe(
+            "kimi-code",
+            kind="quota",
+            state="unavailable",
+            source_tool="test",
+            source_method="fixture",
+            host="other-host",
+            os_user="agent",
+            now=1_790_000_000,
+            detail={"reason": "weekly cap"},
+        )
+        # The older event's spelling sorts after the newer one's as text.
+        for event, observed in (
+            (older, "2026-10-04T18:00:00+08:00"),
+            (newer, "2026-10-04T11:00:00Z"),
+        ):
+            event["observed_at"] = observed
+            event["expires_at"] = "2026-10-05T00:00:00Z"
+            (self.root / "outbox" / f"{event['event_id']}.json").write_text(json.dumps(event))
+
+        now = provider_status._timestamp("2026-10-04T12:00:00Z")
+        self.assertEqual(provider_status.unavailable_reason("kimi-code", now=now), "weekly cap")
+
+    def test_an_unparseable_timestamp_is_not_a_valid_observation(self) -> None:
+        event = provider_status.observe(
+            "anthropic",
+            kind="inventory",
+            state="available",
+            source_tool="test",
+            source_method="fixture",
+            now=1_790_000_000,
+        )
+        for field in ("observed_at", "expires_at"):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                provider_status.validate_event({**event, field: "yesterday"})
+            # Without an offset, the same text names a different instant per host.
+            with (
+                self.subTest(field=field, form="no offset"),
+                self.assertRaisesRegex(ValueError, field),
+            ):
+                provider_status.validate_event({**event, field: "2026-10-04T11:00:00"})
+
     def test_refusal_keeps_provider_text_out_of_the_registry(self) -> None:
         signature = "You've reached your 5-hour usage limit for alice@example.test"
 

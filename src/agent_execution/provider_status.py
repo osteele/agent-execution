@@ -161,12 +161,18 @@ def _iso(timestamp: float | None = None) -> str:
 
 
 def _timestamp(value: object) -> float | None:
+    """The instant an RFC 3339 timestamp names, or None when it names none.
+
+    A timestamp without an offset is refused: read in each host's local time,
+    the same text would name different instants on different hosts.
+    """
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return None if parsed.tzinfo is None else parsed.timestamp()
 
 
 def _safe_component(value: str) -> str:
@@ -198,8 +204,12 @@ def classify(signature: str) -> tuple[str, str | None, int, str | None]:
 def validate_event(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("provider observation has an unsupported schema")
-    for field in ("event_id", "observed_at", "expires_at"):
-        if not isinstance(value.get(field), str) or not value[field]:
+    if not isinstance(value.get("event_id"), str) or not value["event_id"]:
+        raise ValueError("provider observation has invalid event_id")
+    # Observations arrive from other hosts and other versions, and they are
+    # ordered by these instants, so the text must name one.
+    for field in ("observed_at", "expires_at"):
+        if _timestamp(value.get(field)) is None:
             raise ValueError(f"provider observation has invalid {field}")
     subject = value.get("subject")
     if not isinstance(subject, dict):
@@ -635,13 +645,14 @@ def snapshot(
             continue
         key = _subject_key(event)
         previous = latest.get(key)
-        if previous is None or cast(str, event["observed_at"]) > cast(str, previous["observed_at"]):
+        # By instant, not by text: the same instant has several valid spellings.
+        if previous is None or observed_at > cast(float, _timestamp(previous["observed_at"])):
             latest[key] = event
-    successful_at: dict[tuple[str, str, str, str, str], str] = {}
+    successful_at: dict[tuple[str, str, str, str, str], float] = {}
     for key, event in latest.items():
         fact = cast(dict[str, object], event["fact"])
         if fact["kind"] == "availability" and fact["state"] == "available":
-            successful_at[key[:-1]] = cast(str, event["observed_at"])
+            successful_at[key[:-1]] = cast(float, _timestamp(event["observed_at"]))
     providers: list[dict[str, object]] = []
     unavailable_routes: dict[str, str] = {}
     for event in sorted(
@@ -657,7 +668,7 @@ def snapshot(
         if (
             fact["state"] == "unavailable"
             and success is not None
-            and success > cast(str, event["observed_at"])
+            and success > cast(float, _timestamp(event["observed_at"]))
         ):
             continue
         expires_at = _timestamp(event.get("expires_at"))
