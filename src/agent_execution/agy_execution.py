@@ -18,21 +18,23 @@ not import agent-review.
   packet-only-no-tools``. As with OMP, that flag is stripped here and never
   reaches the CLI.
 - Isolation: the worker builds HOME itself. It never accepts an ``env HOME=...``
-  prefix from a caller. The throwaway HOME copies ``~/.gemini``, replaces the
-  MCP configuration with an empty one, replaces the user rules with a
-  packet-only rule, installs the deny-all hook, and symlinks
-  ``Library/Keychains`` and ``Library/Preferences``, where the credential lives.
-  The whole HOME is removed after the call.
+  prefix from a caller. The throwaway HOME copies the sign-in and settings
+  entries in ``AGY_HOME_ALLOWLIST``, never the user's history. ``agy`` reads
+  MCP servers from ``.gemini/config/mcp_config.json`` and hooks from
+  ``.gemini/config/hooks.json``, so the user's copies of both are left out and
+  replaced: an empty MCP configuration, and a hooks file holding only the
+  deny-all ``PreToolUse`` hook. The user rules are replaced with a packet-only
+  rule, and ``Library/Keychains`` and ``Library/Preferences``, where the
+  credential lives, are symlinked. The whole HOME is removed after the call.
 - Evidence: stdout is the JSON envelope. The envelope is accepted only when
   ``status`` is ``SUCCESS``, ``response`` is non-empty, ``num_turns`` is
   positive, and no tool use is recorded.
 
-UNVERIFIED LAYOUT: the paths and hook schema under ``AGY_*_PATH`` and
-``_AGY_DENY_SCRIPT``/``_hook_settings`` were reconstructed from a description
-of agent-review ``adapters.py:1982-2082``. That source was not available while
-writing this module. Diff them against that source before relying on the hook.
-The envelope check refuses recorded tool use either way, so a hook in the wrong
-place fails closed for any tool use the envelope reports.
+The home layout and hook format follow agent-review's measured
+``antigravity_reviewer_home`` (``adapters.py``), which found the user's MCP
+servers (a browser, agent mail) offered to the model through
+``.gemini/config``. The envelope check refuses recorded tool use as a second
+line, but it runs after the call, so the home is the enforcement.
 """
 
 from __future__ import annotations
@@ -83,11 +85,11 @@ AGY_MAX_ARGV_PROMPT_BYTES = 128 * 1024
 #: Bound on `--print-timeout`, so "finite" means a real limit as well as a number.
 AGY_MAX_PRINT_TIMEOUT_SECONDS = 24 * 60 * 60
 
-# Throwaway-HOME layout, relative to the HOME the child sees. See the
-# UNVERIFIED LAYOUT note in the module docstring.
+# Throwaway-HOME layout, relative to the HOME the child sees.
 AGY_CONFIG_DIR = Path(".gemini")
 AGY_SETTINGS_PATH = AGY_CONFIG_DIR / "settings.json"
-AGY_MCP_CONFIG_PATH = AGY_CONFIG_DIR / "antigravity" / "mcp_config.json"
+AGY_MCP_CONFIG_PATH = AGY_CONFIG_DIR / "config" / "mcp_config.json"
+AGY_HOOKS_CONFIG_PATH = AGY_CONFIG_DIR / "config" / "hooks.json"
 AGY_RULES_PATH = AGY_CONFIG_DIR / "GEMINI.md"
 AGY_DENY_HOOK_PATH = AGY_CONFIG_DIR / "hooks" / "agent-execution-deny-all.sh"
 #: macOS credential stores, symlinked rather than copied.
@@ -106,6 +108,8 @@ AGY_HOME_ALLOWLIST: tuple[Path, ...] = (
     AGY_CONFIG_DIR / "antigravity-cli" / "settings.json",
     AGY_CONFIG_DIR / "antigravity-cli" / "installation_id",
 )
+
+_AGY_HOOK_NAME = "agent-execution-packet-only"
 
 _DENY_REASON = (
     "agent-execution packet-only review: every tool is disabled; answer from the brief alone"
@@ -326,7 +330,14 @@ def build_agy_home(home: Path, *, source_home: Path) -> None:
     if "mcpServers" in settings:
         settings["mcpServers"] = {}
     _write_json(settings_path, settings)
+    # The copied `config` directory holds the user's MCP servers and hooks;
+    # both files are overwritten, never merged.
     _write_json(home / AGY_MCP_CONFIG_PATH, {"mcpServers": {}})
+    deny = {"type": "command", "command": shlex.quote(str(script)), "timeout": 10}
+    _write_json(
+        home / AGY_HOOKS_CONFIG_PATH,
+        {_AGY_HOOK_NAME: {"PreToolUse": [{"matcher": "*", "hooks": [deny]}]}},
+    )
     rules = home / AGY_RULES_PATH
     rules.parent.mkdir(parents=True, exist_ok=True)
     rules.write_text(_AGY_RULES, encoding="utf-8")

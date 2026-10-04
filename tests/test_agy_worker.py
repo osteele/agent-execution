@@ -390,14 +390,14 @@ class AgyIsolatedHomeTests(unittest.TestCase):
 
         self.source_home = base / "real-home"
         config = self.source_home / ".gemini"
-        (config / "antigravity").mkdir(parents=True)
+        (config / "config").mkdir(parents=True)
         self.user_settings = {
             "selectedAuthType": "oauth-personal",
             "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"command": "/bin/true"}]}]},
             "mcpServers": {"filesystem": {"command": "mcp-filesystem", "args": ["/"]}},
         }
         (config / "settings.json").write_text(json.dumps(self.user_settings))
-        (config / "antigravity" / "mcp_config.json").write_text(
+        (config / "config" / "mcp_config.json").write_text(
             json.dumps({"mcpServers": {"browser": {"command": "mcp-browser"}}})
         )
         (config / "GEMINI.md").write_text("Always run the test suite before answering.\n")
@@ -481,6 +481,34 @@ class AgyIsolatedHomeTests(unittest.TestCase):
             "skills",
         ):
             self.assertFalse((built / excluded).exists(), excluded)
+
+    def test_the_users_mcp_servers_and_hooks_in_config_do_not_reach_the_home(self) -> None:
+        """`agy` reads MCP servers and hooks from `.gemini/config` (agent-review's
+        measured adapter); copying that directory must not carry the user's
+        servers or hooks into a packet-only call."""
+        config = self.source_home / ".gemini" / "config"
+        (config / "hooks").mkdir(parents=True)
+        (config / "config.json").write_text('{"signed_in": true}')
+        (config / "mcp_config.json").write_text(
+            json.dumps({"mcpServers": {"puppeteer": {"command": "mcp-puppeteer"}}})
+        )
+        (config / "hooks.json").write_text(
+            json.dumps({"reminder": {"PreInvocation": [{"matcher": "*", "hooks": []}]}})
+        )
+        home = self.root.parent / "built-home"
+
+        build_agy_home(home, source_home=self.source_home)
+
+        built = home / ".gemini" / "config"
+        self.assertEqual((built / "config.json").read_text(), '{"signed_in": true}')
+        self.assertEqual(json.loads((built / "mcp_config.json").read_text()), {"mcpServers": {}})
+        hooks = json.loads((built / "hooks.json").read_text())
+        self.assertEqual(list(hooks), ["agent-execution-packet-only"])
+        (entry,) = hooks["agent-execution-packet-only"]["PreToolUse"]
+        self.assertEqual(entry["matcher"], "*")
+        self.assertEqual(entry["hooks"][0]["command"], shlex.quote(str(home / AGY_DENY_HOOK_PATH)))
+        # The user's configuration is untouched.
+        self.assertIn("puppeteer", (config / "mcp_config.json").read_text())
 
     def test_child_sees_deny_all_hook_and_empty_mcp_config_and_home_is_removed(self) -> None:
         result = self.execute(stdout=envelope(), exit_status=0, model_call_id="agy-home")
