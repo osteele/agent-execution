@@ -27,14 +27,21 @@ not import agent-review.
   rule, and ``Library/Keychains`` and ``Library/Preferences``, where the
   credential lives, are symlinked. The whole HOME is removed after the call.
 - Evidence: stdout is the JSON envelope. The envelope is accepted only when
-  ``status`` is ``SUCCESS``, ``response`` is non-empty, ``num_turns`` is
-  positive, and no tool use is recorded.
+  ``status`` is ``SUCCESS``, ``response`` is non-empty, and ``num_turns`` is
+  positive. A print timeout returns ``SUCCESS`` with ``num_turns`` 0 and an
+  empty response, which the turn check refuses.
 
 The home layout and hook format follow agent-review's measured
 ``antigravity_reviewer_home`` (``adapters.py``), which found the user's MCP
 servers (a browser, agent mail) offered to the model through
-``.gemini/config``. The envelope check refuses recorded tool use as a second
-line, but it runs after the call, so the home is the enforcement.
+``.gemini/config``.
+
+Containment rests on the home alone: the deny-all hook, the empty MCP
+configuration, and the rules file. The envelope cannot confirm it. Probed on
+agy 1.2.16 (2026-10-04), a tool that ran and a tool the hook denied produced
+envelopes with the same keys (``conversation_id``, ``duration_seconds``,
+``num_turns``, ``response``, ``status``, ``usage``), so nothing in stdout says
+whether a tool ran.
 """
 
 from __future__ import annotations
@@ -114,17 +121,18 @@ _AGY_HOOK_NAME = "agent-execution-packet-only"
 _DENY_REASON = (
     "agent-execution packet-only review: every tool is disabled; answer from the brief alone"
 )
-#: Denies every tool call. Exit status 2 blocks under the PreToolUse
-#: convention. The JSON on stdout states the same decision for hook runners
-#: that read structured output. stdin is drained first so the runner never
-#: sees a broken pipe, which some runners treat as a non-blocking hook error.
+#: Denies every tool call through agy's decision channel: exit status 0 with a
+#: JSON ``deny`` decision on stdout. Probed on agy 1.2.16, this is a clean
+#: denial that carries the reason to the model. A nonzero exit also blocked,
+#: but agy reported it as a failed hook and ignored the decision, so
+#: containment would depend on how agy treats a crashing hook. stdin is
+#: drained first so agy never sees a broken pipe.
 _AGY_DENY_SCRIPT = f"""#!/bin/sh
 # Installed by agent-execution for one packet-only agy call; removed afterwards.
 cat >/dev/null 2>&1
 reason='{_DENY_REASON}'
 printf '{{"decision":"deny","reason":"%s","hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}}}\\n' "$reason" "$reason"
-printf '%s\\n' "$reason" >&2
-exit 2
+exit 0
 """
 _AGY_RULES = """# Packet-only review (installed by agent-execution)
 
@@ -152,9 +160,9 @@ _AGY_ENVIRONMENT_ALLOWED = frozenset(
         "__CF_USER_TEXT_ENCODING",
     }
 )
-#: Envelope fields that would record tool use. Only `denied_actions` is known
-#: from agent-review's `unwrap`. The others are refused if present, so a schema
-#: that names tool use differently cannot be read as "no tools used".
+#: Envelope fields that would record tool use, refused if a later agy emits
+#: them. agy 1.2.16 emits none of them, whether a tool ran or was denied, so
+#: their absence is not evidence that no tool ran (see the module docstring).
 _TOOL_RECORD_FIELDS = ("denied_actions", "tool_calls", "tool_uses", "tools_used")
 _PRINT_TIMEOUT = re.compile(r"[1-9][0-9]*s")
 _VALUE_FLAGS = frozenset(

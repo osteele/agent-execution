@@ -536,8 +536,12 @@ class AgyIsolatedHomeTests(unittest.TestCase):
             },
         )
         self.assertTrue(record["hook_executable"])
-        self.assertEqual(record["hook_exit"], 2)
-        self.assertIn('"permissionDecision":"deny"', str(record["hook_stdout"]))
+        # agy honours the JSON decision only from a hook that exits 0; a
+        # nonzero exit is reported as a failed hook (probed on agy 1.2.16).
+        self.assertEqual(record["hook_exit"], 0)
+        decision = json.loads(str(record["hook_stdout"]))
+        self.assertEqual(decision["decision"], "deny")
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
         # Non-tool settings survive the copy; MCP servers do not.
         self.assertEqual(settings["selectedAuthType"], "oauth-personal")
         self.assertEqual(settings["mcpServers"], {})
