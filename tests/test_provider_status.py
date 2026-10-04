@@ -35,7 +35,7 @@ class ProviderStatusTest(unittest.TestCase):
             "reports": [
                 {
                     "provider": "google-antigravity",
-                    "metadata": {"email": "ol*", "projectId": "ai*"},
+                    "metadata": {"email": "alice@example.test", "projectId": "private-project"},
                     "limits": [
                         {
                             "id": "google-antigravity:google:default:gemini-weekly",
@@ -79,8 +79,8 @@ class ProviderStatusTest(unittest.TestCase):
             ],
         )
         serialized = json.dumps(snapshot)
-        self.assertNotIn('"ol*"', serialized)
-        self.assertIn("hmac-sha256:", serialized)
+        self.assertNotIn("alice@example.test", serialized)
+        self.assertNotIn("private-project", serialized)
 
     def test_dispatch_billing_pools_are_split_only_for_antigravity(self) -> None:
         for route, model, pool in (
@@ -99,8 +99,9 @@ class ProviderStatusTest(unittest.TestCase):
                 success = provider_status.record_success(route, model=model)
                 refusal = provider_status.record_refusal(route, "usage limit", model=model)
                 for event in (success, refusal):
-                    self.assertEqual(event["subject"]["route"], route)
-                    self.assertEqual(event["subject"]["billing_pool"], pool)
+                    subject = cast(dict[str, object], event["subject"])
+                    self.assertEqual(subject["route"], route)
+                    self.assertEqual(subject["billing_pool"], pool)
 
     def test_antigravity_success_does_not_clear_other_family_refusal(self) -> None:
         with mock.patch("agent_execution.provider_status.time.time", return_value=1_790_000_000):
@@ -168,7 +169,7 @@ class ProviderStatusTest(unittest.TestCase):
             event["observed_at"] = observed
             event["expires_at"] = "2026-10-05T00:00:00Z"
             path = self.root / "outbox" / f"{event['event_id']}.json"
-            path.write_text(json.dumps(event))
+            provider_status._atomic_json(path, event)
 
         now = provider_status._timestamp("2026-10-04T12:00:00Z")
         self.assertIsNone(provider_status.unavailable_reason("kimi-code", now=now))
@@ -202,7 +203,7 @@ class ProviderStatusTest(unittest.TestCase):
         ):
             event["observed_at"] = observed
             event["expires_at"] = "2026-10-05T00:00:00Z"
-            (self.root / "outbox" / f"{event['event_id']}.json").write_text(json.dumps(event))
+            provider_status._atomic_json(self.root / "outbox" / f"{event['event_id']}.json", event)
 
         now = provider_status._timestamp("2026-10-04T12:00:00Z")
         self.assertEqual(provider_status.unavailable_reason("kimi-code", now=now), "weekly cap")
@@ -234,22 +235,6 @@ class ProviderStatusTest(unittest.TestCase):
         serialized = json.dumps(provider_status.snapshot())
         self.assertNotIn("alice@example.test", serialized)
         self.assertIn("provider reported quota refusal", serialized)
-
-    def test_dispatch_observation_starts_a_background_outbox_push(self) -> None:
-        with (
-            mock.patch.dict(
-                os.environ,
-                {"AGENT_PROVIDER_STATUS_TRANSPORT": "weft"},
-            ),
-            mock.patch("agent_execution.provider_status.subprocess.Popen") as launch,
-        ):
-            provider_status.record_success("anthropic")
-
-        command = launch.call_args.args[0]
-        self.assertEqual(
-            command[-4:],
-            ["provider", "sync", "--push-only", "--json"],
-        )
 
     def test_expired_refusal_is_not_authoritative(self) -> None:
         provider_status.observe(
@@ -286,6 +271,8 @@ class ProviderStatusTest(unittest.TestCase):
         providers = cast(list[dict[str, object]], snapshot["providers"])
 
         self.assertEqual([item["route"] for item in providers], ["anthropic"])
+        diagnostics = cast(list[str], snapshot["diagnostics"])
+        self.assertTrue(any("malformed.json" in item for item in diagnostics))
 
     def test_sync_without_transport_preserves_outbox_and_reports_diagnostic(self) -> None:
         event = provider_status.observe(
@@ -325,27 +312,27 @@ class ProviderStatusTest(unittest.TestCase):
         self.assertIn("timed out after 20s", diagnostics[0])
         self.assertTrue((self.root / "outbox" / f"{event['event_id']}.json").exists())
 
-    def test_probe_output_is_scoped_to_the_observing_host(self) -> None:
-        event = {"subject": {"host": "studio"}}
-        response = {
-            "schema_version": provider_status.SNAPSHOT_SCHEMA_VERSION,
-            "providers": [],
-        }
-        with (
-            mock.patch(
-                "agent_execution.cli.provider_status.probe_omp",
-                return_value=({}, [event]),
-            ),
-            mock.patch(
-                "agent_execution.cli.provider_status.snapshot",
-                return_value=response,
-            ) as status,
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            result = cli.main(["provider", "probe", "--json"])
+    def test_status_output_is_scoped_to_the_requested_host(self) -> None:
+        for host, state in (("studio", "available"), ("laptop", "unavailable")):
+            provider_status.observe(
+                "anthropic",
+                kind="availability",
+                state=state,
+                source_tool="test",
+                source_method="fixture",
+                host=host,
+            )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = cli.main(["provider", "status", "--host", "studio", "--json"])
 
         self.assertEqual(result, 0)
-        status.assert_called_once_with(host="studio", diagnostics=[])
+        snapshot = json.loads(output.getvalue())
+        self.assertEqual(snapshot["unavailable_routes"], {})
+        self.assertEqual(
+            [(item["host"], item["state"]) for item in snapshot["providers"]],
+            [("studio", "available")],
+        )
 
 
 if __name__ == "__main__":

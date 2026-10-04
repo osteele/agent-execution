@@ -150,6 +150,15 @@ remain in the local outbox. An R2 outage never blocks model execution.
 Account names and credential values are excluded. Credential identities become
 HMAC fingerprints, which allow observations about one account to remain
 separate from another without publishing either identity.
+Fingerprints use a persistent host-local salt by default. Set the same
+`AGENT_PROVIDER_STATUS_SALT` on participating hosts only when exact account
+identities should produce comparable fingerprints. Observations retain their
+host and OS-user provenance even when fingerprints match.
+Probes read exact identities from `omp usage --json` and fingerprint them
+before persistence. Display-redacted identifiers are unsuitable for account
+matching because their masks depend on the other accounts in the report.
+The Python `probe_omp()` API returns the observation list; raw usage reports
+stay inside the probe.
 
 ```sh
 agent-execution provider probe --sync --json
@@ -162,6 +171,46 @@ this CLI contract instead of reading the cache directory. Every observation
 includes its host, OS user, route, billing pool, credential fingerprint,
 provenance, observation time, and expiration time. Stale observations remain
 visible but do not make a route unavailable.
+
+Local reads use a compact projection of the latest raw observation for each
+subject and kind. Warm reads scale with distinct subjects and diagnostics,
+not accumulated event history. Host filtering, expiration, and the 30-day
+retention window are evaluated on every read. Equal observation instants are
+ordered by event ID.
+
+Writers use a shared process lock and validate event-directory inventories.
+With a valid projection, an uncontended write enumerates event names and
+inodes without reading historical event bodies. Workers retained across a
+rolling upgrade can finish using a non-locking runtime; their changes are
+reconciled rather than hidden by the projection.
+
+Before starting consumers with short timeouts, run this once on each host
+to build the projection:
+
+```sh
+agent-execution provider status --json
+```
+
+The initial read, recovery from a missing, incompatible, or corrupt
+`projection.json`, and reconciliation after external event-directory changes
+replay the event log. These operations can exceed a consumer's normal timeout,
+and other readers wait behind a rebuilding process. Updates from retained
+non-locking workers can therefore cause latency spikes during an upgrade.
+
+Cache publication requires a same-filesystem clock observation beyond the
+event directories' recorded change times. If that cannot be established within
+a bounded wait, or enumeration or event reads fail, the incomplete or unverified
+view is not cached. Readers return readable event data with `diagnostics`.
+Writers in this version require the registry lock before publishing observations.
+Event files are immutable; repairs must use atomic replacement or removal,
+not in-place content edits.
+
+Sync reports malformed observations, transport failures, and local cache-write
+failures in `diagnostics` while processing independent observations. Failed
+uploads and failed moves into the local cache retain their outbox files for a
+later sync. Remote observation keys must agree with the event's host and ID;
+local filenames must agree with the event ID. Unreadable local events remain
+on disk and appear in snapshot diagnostics.
 
 ## Checks
 

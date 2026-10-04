@@ -107,7 +107,7 @@ def _run_provider(args: argparse.Namespace) -> int:
         value = provider_status.snapshot(host=args.host, diagnostics=diagnostics)
     elif args.provider_command == "probe":
         try:
-            _, events = provider_status.probe_omp(host=args.host)
+            events = provider_status.probe_omp(host=args.host)
         except (RuntimeError, ValueError) as error:
             print(f"provider probe failed: {error}", file=sys.stderr)
             return 1

@@ -73,6 +73,16 @@ class WorkerResultTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        environment = mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_PROVIDER_STATUS_DIR": str(self.root / "provider-status"),
+                "AGENT_PROVIDER_STATUS_TRANSPORT": "none",
+                "AGENT_PROVIDER_STATUS_SALT": "worker-test-salt",
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
         self.output = Path(worker_evidence_path("model-call-7"))
         self.calls: list[list[str]] = []
 
