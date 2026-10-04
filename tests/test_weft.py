@@ -129,7 +129,10 @@ class SubmissionLookupTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.executable.chmod(0o755)
-        return lookup_submitted_job(KEY, timeout=1, cwd=self.root, executable=str(self.executable))
+        # These tests read the stub's output, not its timing. macOS scans a
+        # freshly written executable on first exec, measured at ~2.5s on studio,
+        # so a 1s budget timed out every case there.
+        return lookup_submitted_job(KEY, timeout=30, cwd=self.root, executable=str(self.executable))
 
     def test_found_returns_receipt_job_and_host(self) -> None:
         result = self.lookup(
