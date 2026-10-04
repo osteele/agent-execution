@@ -356,6 +356,15 @@ class AdmissionTests(unittest.TestCase):
         submitted = next(argv for argv, _, _ in self.calls if argv[1] == "run")
         self.assertEqual(submitted[submitted.index("--project") + 1], "agent-review")
 
+    def test_the_job_reserves_one_core_rather_than_weft_s_default(self) -> None:
+        """Undeclared CPU books 7 of studio's 12 cores, admitting one job at a time."""
+        self.submissions = [CommandResult(0, receipt(), "")]
+        self.run_dispatch()
+        submitted = next(argv for argv, _, _ in self.calls if argv[1] == "run")
+        self.assertEqual(submitted[submitted.index("--cpu-reserve") + 1], "1")
+        # A Weft option, not part of the worker command Weft executes.
+        self.assertLess(submitted.index("--cpu-reserve"), submitted.index("-m"))
+
     def test_queue_enabled_submission_does_not_require_an_online_host(self) -> None:
         self.runner = WeftCommandRunner(
             host="studio",

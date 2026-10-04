@@ -39,6 +39,13 @@ WEFT_HOST_OBSERVATION_TIMEOUT = 10.0
 WEFT_INVENTORY_TAG = "inventory"
 WEFT_AUTO_HOST = "auto"
 WEFT_TOOL_CAPABILITY = "tool:agent-execution"
+#: Cores booked per worker job. A job declaring no CPU is booked at Weft's
+#: default of 7 cores, so only one fits studio's 12-core books and the rest
+#: trickle in through the runner's load path. Workers wait on model APIs: of
+#: 613 sampled jobs, 322 decayed to the runner's ~1.2-core floor and none was
+#: ever raised. An explicit reservation is never reduced, so declare the
+#: measured figure rather than a padded one.
+WEFT_CPU_RESERVE_CORES = 1
 WORKER_PROMPT_PAYLOAD = "execution-prompt"
 SUPPORTED_WORKER_PROTOCOL_VERSIONS = frozenset({1, 2})
 WEFT_LIVE_JOB_STATUSES = frozenset({"draft", "queued", "pending_placement", "starting", "running"})
@@ -1653,6 +1660,8 @@ class WeftCommandRunner:
                     # only for the placement we happened to get.
                     "--tag",
                     WEFT_INVENTORY_TAG,
+                    "--cpu-reserve",
+                    str(WEFT_CPU_RESERVE_CORES),
                     # The installed worker owns its environment; the target
                     # snapshot is evidence, not a project to install.
                     "--setup",
