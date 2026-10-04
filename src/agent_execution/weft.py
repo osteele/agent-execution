@@ -42,6 +42,10 @@ WEFT_TOOL_CAPABILITY = "tool:agent-execution"
 WORKER_PROMPT_PAYLOAD = "execution-prompt"
 SUPPORTED_WORKER_PROTOCOL_VERSIONS = frozenset({1, 2})
 WEFT_LIVE_JOB_STATUSES = frozenset({"draft", "queued", "pending_placement", "starting", "running"})
+# A cancelled job never ran to its result, so an absent artifact is final. A
+# `completed` job with no readable artifact is not: the read may have failed
+# (wb139, ar67), so that outcome offers no acknowledgment.
+WEFT_CANCELLED_JOB_STATUSES = frozenset({"canceled", "cancelled"})
 Clock = Callable[[], float]
 Sleeper = Callable[[float], None]
 InterruptibleWait = Callable[[float], bool]
@@ -228,15 +232,36 @@ class WeftJobFailure:
 
     job_id: str
     detail: str
+    refused: Callable[[], None] | None = None
+
+    def acknowledge_refusal(self) -> None:
+        """Take the job off Weft's unprocessed queue once the failure is recorded.
+
+        Call only after the consumer has durably recorded the failure; the
+        mark is recorded on ``processed`` and ``processing_error`` (ax3).
+        """
+        if self.refused is not None:
+            self.refused()
 
 
 @dataclass(frozen=True)
 class WeftRetrievalOutcome:
-    """A worker artifact was absent and the job observation explains what is known."""
+    """A worker artifact was absent and the job observation explains what is known.
+
+    ``refused`` is set only when the observation is final -- a cancelled job --
+    so a consumer that records it may acknowledge it; pending, unknown, and
+    unreadable-but-completed outcomes leave the job on Weft's queue.
+    """
 
     status: Literal["pending", "unretrievable", "unknown"]
     detail: str
     job_status: str | None = None
+    refused: Callable[[], None] | None = None
+
+    def acknowledge_refusal(self) -> None:
+        """Take a final outcome off Weft's unprocessed queue once it is recorded."""
+        if self.refused is not None:
+            self.refused()
 
 
 @dataclass(frozen=True)
@@ -839,6 +864,22 @@ class WeftCommandRunner:
         if failure is not None:
             execution["processing_error"] = failure
 
+    def _refusal_acknowledgment(
+        self, *, job_id: str, cwd: Path, execution: dict[str, object]
+    ) -> Callable[[], None]:
+        """Build the hook a consumer calls after durably recording a refusal.
+
+        Unlike ``_mark_processed`` it leaves ``processing`` as the consumer
+        wrote it, because consumers classify failures by that state and step.
+        """
+
+        def acknowledge_refusal() -> None:
+            failure = self._acknowledge(job_id=job_id, cwd=cwd, execution=execution)
+            if failure is not None:
+                execution["processing_error"] = failure
+
+        return acknowledge_refusal
+
     def _discard_settled_evidence(self, cwd: Path, execution: dict[str, object]) -> None:
         """Remove the local worker receipt of a cycle its consumer has banked.
 
@@ -1172,11 +1213,6 @@ class WeftCommandRunner:
             self._discard_settled_evidence(cwd, execution)
             self._mark_processed(job_id=job_id, cwd=cwd, execution=execution)
 
-        def acknowledge_refusal() -> None:
-            failure = self._acknowledge(job_id=job_id, cwd=cwd, execution=execution)
-            if failure is not None:
-                execution["processing_error"] = failure
-
         return CommandResult(
             worker.harness.exit_status or 0,
             worker.harness.stdout,
@@ -1184,7 +1220,7 @@ class WeftCommandRunner:
             execution=execution,
             worker_result=worker,
             consumed=mark_consumed,
-            refused=acknowledge_refusal,
+            refused=self._refusal_acknowledgment(job_id=job_id, cwd=cwd, execution=execution),
         )
 
     @property
@@ -1516,6 +1552,9 @@ class WeftCommandRunner:
                 f"Weft job {job_id} is {raw_status} but its worker-result artifact "
                 "could not be read" + (f": {artifact_detail}" if artifact_detail else ""),
                 job_status=raw_status,
+                refused=self._refusal_acknowledgment(job_id=job_id, cwd=cwd, execution=execution)
+                if raw_status in WEFT_CANCELLED_JOB_STATUSES
+                else None,
             )
         # The inspect record owns the cause. Artifact recovery and log reading
         # describe our observations, never why the accepted job failed.
@@ -1539,6 +1578,7 @@ class WeftCommandRunner:
         failure = WeftJobFailure(
             job_id=job_id,
             detail=f"Weft job {job_id} failed: {reason or 'cause not reported by inspect'}",
+            refused=self._refusal_acknowledgment(job_id=job_id, cwd=cwd, execution=execution),
         )
         self._processing(
             execution,

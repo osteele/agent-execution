@@ -660,6 +660,42 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(job_log["unobserved"], "exit 1")
         self.assertLessEqual(len(str(job_log.get("stderr", ""))), 1000)
 
+    def test_a_recorded_job_failure_can_be_acknowledged(self) -> None:
+        """A failed job's recorded failure is its result; it must leave Weft's queue (ax3)."""
+        self.inspect = CommandResult(0, inspect_record("failed"), "")
+        self.artifact_calls = [CommandResult(1, "", "not available")] * 4
+        outcome = self.retrieve()
+        assert isinstance(outcome, WeftJobFailure)
+        self.assertNotIn("processed", self.execution)
+        processing = dict(self.processing())
+        outcome.acknowledge_refusal()
+        self.assertEqual(self.execution["processed"], True)
+        self.assertEqual(self.processing(), processing)
+        marks = [
+            command for command, _, _ in self.calls if command[1:3] == ["job", "mark-processed"]
+        ]
+        self.assertEqual(marks, [["weft", "job", "mark-processed", JOB]])
+
+    def test_only_a_cancelled_job_without_an_artifact_can_be_acknowledged(self) -> None:
+        """A completed job whose artifact did not read may still be read later (ar67)."""
+        for status, final in (
+            ("cancelled", True),
+            ("canceled", True),
+            ("completed", False),
+            ("running", False),
+        ):
+            with self.subTest(status=status):
+                self.calls.clear()
+                self.execution.pop("processed", None)
+                self.inspect = CommandResult(0, inspect_record(status), "")
+                self.artifact_calls = [CommandResult(1, "", "not available")] * 4
+                self.mark = [CommandResult(0, "", "")]
+                outcome = self.retrieve()
+                assert isinstance(outcome, WeftRetrievalOutcome)
+                self.assertEqual(outcome.refused is not None, final)
+                outcome.acknowledge_refusal()
+                self.assertEqual("processed" in self.execution, final)
+
     def test_artifact_retry_respects_deadline(self) -> None:
         self.artifact_calls = [
             CommandResult(1, "", "later"),
