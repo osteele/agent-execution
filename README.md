@@ -81,6 +81,13 @@ for everything else.
 Tool-enabled agy (grounded read-only review or writing) is not supported. The
 deny-all hook is the only enforcement known to work.
 
+## Local process execution
+
+`agent_execution.processes.run_in_process_group` sends prompt strings as UTF-8
+stdin bytes, independent of the host locale or text-stream encoding. Prompt
+delivery shares the harness completion deadline, including when a child does
+not read its input pipe.
+
 ## Worker evidence
 
 Protocol 2 publishes each call's result at

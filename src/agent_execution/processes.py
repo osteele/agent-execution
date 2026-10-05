@@ -40,7 +40,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import IO, TextIO, cast
+from typing import IO, cast
 
 from agent_execution import env
 from agent_execution.timing import current_boot_id
@@ -590,13 +590,15 @@ def run_in_process_group(
     try:
         if process.stdin is not None:
             try:
+                # stdin is a UTF-8 prompt protocol, not the host's text
+                # locale. Keep stdout/stderr on their existing decoding path.
                 # Prompt delivery shares the completion deadline, including
                 # when the harness never reads its input pipe.
                 if prompt:
                     descriptor = process.stdin.fileno()
                     os.set_blocking(descriptor, False)
                     with (
-                        memoryview(prompt.encode(cast(TextIO, process.stdin).encoding)) as payload,
+                        memoryview(prompt.encode("utf-8")) as payload,
                         selectors.DefaultSelector() as selector,
                     ):
                         selector.register(descriptor, selectors.EVENT_WRITE)

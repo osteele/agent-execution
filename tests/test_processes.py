@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import signal
@@ -106,6 +107,40 @@ class ContainmentTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(marker.read_text(), "executed")
+
+    def test_large_utf8_prompt_ignores_host_stdin_text_encoding(self) -> None:
+        prompt = "\u6f22\U00010400" * 25_000
+        self.assertGreater(len(prompt.encode("utf-8")), 131_071)
+        expected = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        sink = "import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())"
+        program = (
+            "import codecs, locale, sys\n"
+            "from pathlib import Path\n"
+            "from agent_execution.processes import run_in_process_group\n"
+            "assert codecs.lookup(locale.getpreferredencoding(False)).name == 'ascii'\n"
+            "prompt = '\\u6f22\\U00010400' * 25000\n"
+            "for gated in (False, True):\n"
+            f"    result = run_in_process_group([sys.executable, '-c', {sink!r}], "
+            "Path.cwd(), prompt, 10.0, hold_before_exec=gated)\n"
+            "    assert result.returncode == 0, result.stderr\n"
+            "    print(result.stdout.strip())\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            cwd=self.root,
+            env={
+                **os.environ,
+                "LC_ALL": "C",
+                "PYTHONUTF8": "0",
+                "PYTHONCOERCECLOCALE": "0",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.splitlines(), [expected, expected])
 
     def test_prompt_delivery_deadline_kills_the_group(self) -> None:
         program = "import time; time.sleep(2)"
