@@ -22,7 +22,7 @@ from typing import Literal, cast
 from agent_execution.agy_execution import validate_agy_command
 from agent_execution.command import CommandResult, CommandRunner, ProgressCallback, run_command
 from agent_execution.costs import validate_max_cost_usd
-from agent_execution.identity import source_sha256, worker_evidence_path
+from agent_execution.identity import source_sha256, source_worker_executable, worker_evidence_path
 from agent_execution.omp_execution import omp_transcript, validate_omp_command
 from agent_execution.weft_protocol import WEFT_HOST_LIST_COMMAND, parse_weft_host_capabilities
 from agent_execution.worker import (
@@ -349,7 +349,7 @@ def parse_worker_command(command: object) -> dict[str, str]:
         for token in argv
     ):
         raise ValueError("accepted command contains shell composition")
-    if argv[:2] != ["agent-execution-worker", "execute"] or "--" not in argv:
+    if len(argv) < 3 or argv[1] != "execute" or "--" not in argv:
         raise ValueError("accepted command is not a worker execution")
     worker_args = argv[2 : argv.index("--")]
     # Only flag/value pairs are emitted; values cannot impersonate worker flags.
@@ -374,6 +374,10 @@ def parse_worker_command(command: object) -> dict[str, str]:
         if flag not in allowed_flags or flag in options or not value or value.startswith("--"):
             raise ValueError("accepted command has ambiguous worker arguments")
         options[flag] = value
+    if argv[0] != "agent-execution-worker":
+        expected = options.get("--expect-source-sha256", "")
+        if argv[0] != source_worker_executable(expected):
+            raise ValueError("accepted command is not the expected retained worker")
     return options
 
 
@@ -468,6 +472,7 @@ class WeftCommandRunner:
         max_cost_usd: float | None = None,
         allow_queue: bool = False,
         project: str = WORKER_PROJECT,
+        worker_executable: str = "agent-execution-worker",
     ) -> None:
         self.host = host
         self.agent = agent
@@ -480,6 +485,14 @@ class WeftCommandRunner:
         self.executable = executable
         self.progress = progress
         self.expected_source_sha256 = expected_source_sha256 or source_sha256()
+        if (
+            worker_executable != "agent-execution-worker"
+            and worker_executable != source_worker_executable(self.expected_source_sha256)
+        ):
+            raise ValueError(
+                "worker executable must be agent-execution-worker or match the expected source"
+            )
+        self.worker_executable = worker_executable
         self.owner_description = owner_description or f"agent-execution model call {model_call_id}"
         self.readiness = readiness
 
@@ -620,7 +633,7 @@ class WeftCommandRunner:
         ctx_timeout = max(1.0, evidence_reserve / 3.0)
         return shlex.join(
             [
-                "agent-execution-worker",
+                self.worker_executable,
                 "execute",
                 "--provider",
                 self.agent,

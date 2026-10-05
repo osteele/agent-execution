@@ -24,6 +24,18 @@ def worker_evidence_path(model_call_id: str) -> str:
     return f".agent-execution/results/{model_call_id}.json"
 
 
+def source_worker_executable(source_digest: str) -> str:
+    """Public retained worker name, portable across hosts and installation roots.
+
+    Installers bind this name directly to a verified immutable environment, never
+    through their active-release pointer. The source handshake still authenticates
+    the worker; a command name alone is not identity evidence.
+    """
+    if not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", source_digest):
+        raise ValueError("worker source must be a lowercase SHA-256 digest")
+    return f"agent-execution-worker-{source_digest}"
+
+
 def source_sha256(package_root: Path | None = None) -> str:
     """Hash the shared package, without a repository or generated install marker.
 

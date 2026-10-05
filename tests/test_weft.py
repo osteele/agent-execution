@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 
 from agent_execution.command import CommandResult
-from agent_execution.identity import worker_evidence_path
+from agent_execution.identity import source_worker_executable, worker_evidence_path
 from agent_execution.omp_execution import omp_transcript
 from agent_execution.weft import (
     ARTIFACT_RETRIEVAL_SECONDS,
@@ -27,6 +27,7 @@ from agent_execution.weft import (
     WeftPlacementRefused,
     WeftRunReceipt,
     lookup_submitted_job,
+    parse_worker_command,
     submitted_job_from_listing,
 )
 from agent_execution.worker import WORKER_PROTOCOL_VERSION, HarnessOutcome, WorkerResult
@@ -442,6 +443,17 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.payloads, ["review"])
 
     def test_writer_dispatch_receipt_survives_retrieval_and_recovery(self) -> None:
+        self.runner = WeftCommandRunner(
+            host="studio",
+            agent="omp",
+            model_call_id=KEY,
+            fallback=self.fallback,
+            invoke=self.invoke,
+            clock=lambda: self.now,
+            sleep=self.sleep,
+            expected_source_sha256=SOURCE,
+            worker_executable=source_worker_executable(SOURCE),
+        )
         for route in ("receipt", "probe", "submission_timeout", "lost_watcher"):
             with self.subTest(route=route):
                 self.calls.clear()
@@ -769,6 +781,7 @@ class AdmissionTests(unittest.TestCase):
         submitted = next(command for command, _, _ in self.calls if command[1] == "run")
         self.assertNotIn(prompt, " ".join(submitted))
         worker = shlex.split(submitted[-1])
+        self.assertEqual(worker[0], "agent-execution-worker")
         self.assertNotIn("--model", worker)
         self.assertIn("--harness-model", worker)
         self.assertEqual(
@@ -866,6 +879,55 @@ class ReceiptTests(unittest.TestCase):
 
 
 class JobAttributionTests(unittest.TestCase):
+    def test_runner_refuses_an_unattributable_worker_before_submission(self) -> None:
+        for executable in ("unrelated-worker", source_worker_executable("b" * 64)):
+            with self.subTest(executable=executable), self.assertRaises(ValueError):
+                WeftCommandRunner(
+                    host="studio",
+                    agent="omp",
+                    model_call_id=KEY,
+                    fallback=None,
+                    expected_source_sha256=SOURCE,
+                    worker_executable=executable,
+                )
+
+    def test_retained_command_requires_a_full_source_digest(self) -> None:
+        for source in ("", "a" * 63, "a" * 65, "A" * 64, "../worker"):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                source_worker_executable(source)
+
+    def test_retained_command_is_attributable_only_to_its_exact_source(self) -> None:
+        command = dispatch_command().replace(
+            "agent-execution-worker", source_worker_executable(SOURCE), 1
+        )
+        options = parse_worker_command(command)
+        self.assertEqual(options["--expect-source-sha256"], SOURCE)
+        self.assertEqual(
+            submitted_job_from_listing(
+                listing({"job_id": "wj42", "command": command}), model_call_id=KEY
+            ),
+            "wj42",
+        )
+        for executable in (
+            "agent-execution-worker-",
+            "agent-execution-worker-" + "g" * 64,
+            source_worker_executable("b" * 64),
+            "/other/" + source_worker_executable(SOURCE),
+            source_worker_executable(SOURCE) + "-extra",
+        ):
+            with self.subTest(executable=executable), self.assertRaises(ValueError):
+                parse_worker_command(
+                    command.replace(source_worker_executable(SOURCE), executable, 1)
+                )
+
+    def test_retained_command_still_rejects_shell_composition(self) -> None:
+        command = dispatch_command().replace(
+            "agent-execution-worker", source_worker_executable(SOURCE), 1
+        )
+        for suffix in ("; echo other", " && false", "\ntrue"):
+            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                parse_worker_command(command + suffix)
+
     def test_exact_unique_worker_identity_is_required(self) -> None:
         correct: dict[str, object] = {"job_id": "wj42", "command": dispatch_command()}
         self.assertEqual(submitted_job_from_listing(listing(correct), model_call_id=KEY), "wj42")

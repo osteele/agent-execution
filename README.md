@@ -123,6 +123,17 @@ must not share an execution snapshot.
 
 ## Weft admission receipts
 
+`WeftCommandRunner` accepts `worker_executable` to pin a queued call to a retained
+worker. Use `agent_execution.identity.source_worker_executable(source_digest)`
+with the same digest as `expected_source_sha256`. The host's installer must bind
+that command directly to a verified immutable environment and retain it while
+jobs reference it; Agent Review's paired installer provides these bindings.
+The default command, `agent-execution-worker`, selects the host's active worker.
+Other command names and source-addressed names with a different digest are
+refused before submission.
+Source-addressed commands retain the source, protocol, and prompt checks, and
+retrieval rejects a command name that contradicts its dispatched source digest.
+
 The transport normalizes `weft.run.receipt.v1` into `WeftRunReceipt`.
 A validated `not_accepted` receipt permits bounded admission retries and then
 local fallback only when it claims no durable job: its job ID is absent or empty,
