@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 from agent_execution import costs
@@ -44,12 +45,11 @@ class AntigravityTest(unittest.TestCase):
                         ).selector,
                         selector,
                     )
-                    self.assertEqual(
-                        omp_transcript(omp_output(cwd=directory, selector=selector))["header"][
-                            "selector"
-                        ],
-                        selector,
+                    header = cast(
+                        dict[str, object],
+                        omp_transcript(omp_output(cwd=directory, selector=selector))["header"],
                     )
+                    self.assertEqual(header["selector"], selector)
             for selector in (gemini, opus):
                 with self.subTest(writer=selector):
                     validate_omp_command(
