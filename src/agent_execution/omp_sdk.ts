@@ -22,6 +22,100 @@ export function requireAntigravityOAuth(credentials: { hasOAuth(provider: string
 		throw new Error("Restricted OMP Antigravity execution requires stored OAuth credentials");
 }
 
+/** The SDK credential-store surface consulted by restricted execution. */
+export interface WriterCredentials {
+	hasOAuth(provider: string): boolean;
+	has(provider: string): boolean;
+}
+
+/** The exact-lookup surface of the SDK model registry. */
+export interface ExactModelRegistry<M extends { provider: string; id: string }> {
+	find(provider: string, modelId: string): M | undefined | null;
+}
+
+export interface WriterReadinessRow {
+	selector: string;
+	model_available: boolean;
+	credential_available: boolean;
+	available: boolean;
+	detail: string;
+}
+
+/** Providers whose restricted execution refuses every non-OAuth credential. */
+const OAUTH_ONLY_PROVIDERS = new Set(["anthropic", "google-antigravity"]);
+
+/** Match the actual restricted execution credential path, not generic sign-in. */
+export function writerCredentialAvailable(
+	provider: string,
+	credentials: WriterCredentials,
+	environment: Record<string, string | undefined>,
+): boolean {
+	if (OAUTH_ONLY_PROVIDERS.has(provider)) return credentials.hasOAuth(provider);
+	if (provider === "zhipu-coding-plan")
+		return Boolean(environment.ZAI_API_KEY) || credentials.has(provider);
+	return credentials.has(provider);
+}
+
+export function splitExactSelector(selector: string): [string, string] {
+	const [provider, modelId, extra] = selector.split("/");
+	if (
+		!provider ||
+		!modelId ||
+		extra !== undefined ||
+		!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(selector)
+	)
+		throw new Error("Restricted OMP requires an exact provider/model selector");
+	return [provider, modelId];
+}
+
+/** Exact registry lookup: a substituted provider or model is absence, not a match. */
+export function findExactModel<M extends { provider: string; id: string }>(
+	registry: ExactModelRegistry<M>,
+	provider: string,
+	modelId: string,
+): M | undefined {
+	const model = registry.find(provider, modelId);
+	return model && model.provider === provider && model.id === modelId
+		? model
+		: undefined;
+}
+
+/**
+ * Per-selector writer readiness from the pinned SDK registry and credential
+ * store, using the same exact-model and credential policy as execution.
+ * Observation only: no generation, quota, network or token-freshness claim.
+ */
+export function writerReadiness(
+	selectors: readonly string[],
+	registry: ExactModelRegistry<{ provider: string; id: string }>,
+	credentials: WriterCredentials,
+	environment: Record<string, string | undefined>,
+): WriterReadinessRow[] {
+	if (selectors.length === 0 || new Set(selectors).size !== selectors.length)
+		throw new Error("Restricted OMP writer probe requires unique exact selectors");
+	return selectors.map((selector) => {
+		const [provider, modelId] = splitExactSelector(selector);
+		const modelAvailable = !!findExactModel(registry, provider, modelId);
+		const credentialAvailable = writerCredentialAvailable(
+			provider,
+			credentials,
+			environment,
+		);
+		const detail = !modelAvailable
+			? `Model unavailable in pinned OMP SDK: ${selector}`
+			: !credentialAvailable
+				? `No execution-eligible credentials observed for ${provider}`
+				: "Pinned SDK model and execution-eligible credentials observed";
+		return {
+			selector,
+			model_available: modelAvailable,
+			credential_available: credentialAvailable,
+			available: modelAvailable && credentialAvailable,
+			detail,
+		};
+	});
+}
+
 /**
  * The credential OMP's Antigravity stream accepts: it parses `apiKey` as JSON
  * holding the OAuth token and the Cloud project (parseGeminiCliCredentials in
@@ -45,7 +139,8 @@ export const READ_TOOLS = [
 ];
 export const WRITE_TOOLS = [...READ_TOOLS, "execution_write", "execution_edit"];
 export const TOOLS = READ_TOOLS;
-const MAX_BYTES = 512 * 1024;
+const MAX_RESULT_BYTES = 512 * 1024;
+const MAX_WRITE_BYTES = 2 * 1024 * 1024;
 // A source file can be larger than its bounded read or search result.
 const MAX_READ_BYTES = 4 * 1024 * 1024;
 const FORBIDDEN_METADATA = new Set([
@@ -183,7 +278,7 @@ async function files(root: string, base: string): Promise<string[]> {
 }
 
 function checkResultSize(bytes: number): void {
-	if (bytes > MAX_BYTES)
+	if (bytes > MAX_RESULT_BYTES)
 		throw new Error(
 			"Tool result exceeds 512 KiB; narrow the path, pattern, or line range",
 		);
@@ -216,7 +311,7 @@ async function atomicTextReplace(
 	mode: number = 0o600,
 ): Promise<void> {
 	const encoded = new TextEncoder().encode(text);
-	if (encoded.length > MAX_BYTES) throw new Error("Write exceeds 512 KiB");
+	if (encoded.length > MAX_WRITE_BYTES) throw new Error("Write exceeds 2 MiB");
 	const permissions = mode & 0o777;
 	await assertSafeParent(root, path);
 	const temporary = join(
@@ -420,6 +515,7 @@ async function main(): Promise<void> {
 			"packet-only-no-tools",
 			"workspace-write-no-shell",
 			"--auth-status",
+			"--probe-writers",
 		].includes(policy)
 	) {
 		throw new Error("Invalid restricted OMP invocation");
@@ -449,12 +545,55 @@ async function main(): Promise<void> {
 		throw new Error("OMP snapshot cwd is missing");
 	const cwd = await realpath(snapshotCwd);
 	process.chdir(cwd);
-	const [provider, modelId, extra] = selector.split("/");
-	if (!provider || !modelId || extra) {
-		throw new Error("Restricted OMP requires an exact provider/model selector");
-	}
 	const authStorage = await sdk.discoverAuthStorage();
 	try {
+		if (policy === "--probe-writers") {
+			const parsed: unknown = JSON.parse(selector);
+			if (
+				!Array.isArray(parsed) ||
+				parsed.some((value) => typeof value !== "string")
+			)
+				throw new Error("Restricted OMP writer probe requires exact selectors");
+			const requested = parsed as string[];
+			const settings = sdk.Settings.isolated({
+				"advisor.enabled": false,
+				"memory.backend": "off",
+				"memories.enabled": false,
+				"autolearn.enabled": false,
+				"compaction.enabled": false,
+				"branchSummary.enabled": false,
+				"retry.modelFallback": false,
+				"retry.usageAwareFallback": false,
+				"retry.fallbackChains": {},
+				"plan.enabled": false,
+				"goal.enabled": false,
+				"tools.xdev": false,
+				externalThinking: false,
+				includeWorkspaceTree: false,
+				"secrets.enabled": false,
+				"startup.checkUpdate": false,
+				"task.maxRecursionDepth": 0,
+				enabledModels: requested,
+			});
+			const registry = new sdk.ModelRegistry(authStorage, undefined, {
+				settings,
+				ignoreLocalModelConfig: true,
+			});
+			const writers = writerReadiness(
+				requested,
+				registry,
+				authStorage.credentials,
+				process.env,
+			);
+			await writeOutput(
+				`${JSON.stringify({
+					schema_version: "agent-execution.omp-writer-readiness/v1",
+					writers,
+				})}\n`,
+			);
+			return;
+		}
+		const [provider, modelId] = splitExactSelector(selector);
 		if (policy === "--auth-status") {
 			const credentialType = authStorage.credentials.hasOAuth(provider)
 				? "oauth"
@@ -506,9 +645,8 @@ async function main(): Promise<void> {
 			settings,
 			ignoreLocalModelConfig: true,
 		});
-		const model = registry.find(provider, modelId);
-		if (!model || model.provider !== provider || model.id !== modelId)
-			throw new Error(`Unavailable exact OMP model: ${selector}`);
+		const model = findExactModel(registry, provider, modelId);
+		if (!model) throw new Error(`Unavailable exact OMP model: ${selector}`);
 		const allowed =
 			policy === "read-only-no-shell"
 				? READ_TOOLS

@@ -38,7 +38,53 @@ Consumers that embed the worker install it into their own environment
   Luna and Astra are also admitted as explicit read-only selectors. Its
   write/edit tools refuse VCS and harness metadata such as `.omp`, preserve
   existing ordinary-file permission bits on replacement, and create new files
-  with conservative permissions.
+  with conservative permissions. Writes and edits accept UTF-8 output files up to
+  2 MiB; read, glob, and search tool results remain capped at 512 KiB (readable
+  source files may be up to 4 MiB).
+
+## OMP writer readiness
+
+Check the active pinned OMP SDK's exact writer catalog without generating a
+model response:
+
+```sh
+agent-execution-worker probe-writers
+agent-execution-worker probe-writers --selector openai-codex/gpt-6-sol \
+  --selector anthropic/claude-opus-5-5 --timeout 30
+```
+
+The installed Python API is
+`agent_execution.worker_cli.probe_writers(*, selectors: list[str] | None = None, timeout: float = 30) -> dict`.
+With no selectors it checks every `OMP_WRITER_SELECTORS` entry; explicit
+selectors are exact, unique, and must be members of that catalog. Malformed
+selectors or a non-finite/non-positive timeout are rejected with `ValueError`
+before the SDK is launched. The result uses schema
+`agent-execution.writer-readiness/v1` and has three keys:
+
+- `schema_version`: `"agent-execution.writer-readiness/v1"`.
+- `worker_identity`: the same `agent-execution.worker-identity/v1` object that
+  `agent-execution-worker identity` prints (package and protocol version,
+  source digest, and `version_spec`).
+- `writers`: one row per requested selector, in request order, for example
+
+```json
+{"selector":"kimi-code/k3","model_available":true,"credential_available":false,"available":false,"detail":"No execution-eligible credentials observed for kimi-code"}
+```
+
+Each row's `detail` is a nonempty human-readable explanation; its wording is
+not a stable interface. If the pinned SDK or Bun is not installed, every row is
+unavailable and `detail` carries the installation error. Malformed SDK
+evidence (bad JSON or schema, missing, duplicate or unrequested rows,
+non-boolean flags, an inconsistent `available`, or an empty `detail`) and a
+failed or timed-out helper are errors, not rows.
+
+`available` is true only when the exact provider/model exists in the installed,
+pinned OMP SDK registry and the credential path admitted by restricted execution
+was observed (OAuth-only for Anthropic and Antigravity; the coding-plan
+`ZAI_API_KEY` route is included). The bounded probe uses the same scrubbed SDK
+launch and does not load local OMP model configuration or inspect another tool's
+private state. These are point-in-time observations only: they do not establish
+quota, network reachability, token freshness, or successful generation.
 
 ## Packet-only agy (Antigravity CLI)
 

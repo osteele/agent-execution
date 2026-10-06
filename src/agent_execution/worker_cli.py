@@ -15,7 +15,11 @@ from pathlib import Path
 from agent_execution.agy_execution import AGY_MODELS
 from agent_execution.credentials import observe_credential_basis
 from agent_execution.identity import worker_evidence_path
-from agent_execution.omp_execution import require_omp_sdk
+from agent_execution.omp_execution import (
+    probe_omp_writers,
+    require_omp_sdk,
+    validate_writer_probe_request,
+)
 from agent_execution.processes import install_termination_guard
 from agent_execution.worker import (
     SUPPORTED_WORKER_PROVIDERS,
@@ -35,6 +39,11 @@ def _parser() -> argparse.ArgumentParser:
     probe.add_argument("--provider", required=True, choices=sorted(SUPPORTED_WORKER_PROVIDERS))
     probe.add_argument("--harness-model")
     probe.add_argument("--timeout", type=float, default=60.0)
+    writers = commands.add_parser(
+        "probe-writers", help="Observe exact OMP writer readiness without generating"
+    )
+    writers.add_argument("--selector", action="append", dest="selectors")
+    writers.add_argument("--timeout", type=float, default=30.0)
 
     execute = commands.add_parser("execute", help="Run one resolved harness and export evidence")
     execute.add_argument("--provider", required=True)
@@ -115,6 +124,36 @@ def probe_worker(
     }
 
 
+def probe_writers(*, selectors: list[str] | None = None, timeout: float = 30) -> dict[str, object]:
+    """Report exact pinned-SDK OMP model and writer credential readiness.
+
+    This is a registry and credential observation only: it performs no
+    generation and makes no claim about quota or live network availability.
+    """
+    # Unsupported or malformed requests fail here, before any SDK launch.
+    selected, bounded = validate_writer_probe_request(selectors, timeout)
+    try:
+        require_omp_sdk()
+    except ValueError as error:
+        rows = [
+            {
+                "selector": selector,
+                "model_available": False,
+                "credential_available": False,
+                "available": False,
+                "detail": str(error),
+            }
+            for selector in selected
+        ]
+    else:
+        rows = probe_omp_writers(selected, timeout=bounded)
+    return {
+        "schema_version": "agent-execution.writer-readiness/v1",
+        "worker_identity": installed_worker_identity().to_dict(),
+        "writers": rows,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     install_termination_guard()
@@ -126,6 +165,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             from agent_execution.omp_install import install_omp_runtime
 
             install_omp_runtime()
+            return 0
+        if args.command == "probe-writers":
+            print(
+                json.dumps(
+                    probe_writers(selectors=args.selectors, timeout=args.timeout),
+                    sort_keys=True,
+                )
+            )
             return 0
         if args.command == "probe":
             print(

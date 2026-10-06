@@ -14,16 +14,146 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import type { WriterCredentials } from "../src/agent_execution/omp_sdk";
 import {
 	antigravityOAuthCredential,
 	confinedPath,
 	readTools,
 	requireAntigravityOAuth,
 	SDK_VERSION,
+	writerReadiness,
 	writeTools,
 } from "../src/agent_execution/omp_sdk";
 
 const temporary: string[] = [];
+
+/** SDK-registry stand-in answering exact lookups for only the listed models. */
+function registryOf(...selectors: string[]) {
+	const models = selectors.map((selector) => {
+		const [provider, id] = selector.split("/");
+		return { provider, id };
+	});
+	return {
+		find: (provider: string, id: string) =>
+			models.find((model) => model.provider === provider && model.id === id),
+	};
+}
+
+/** SDK credential-store stand-in: OAuth entries also count as stored credentials. */
+function credentialsOf({
+	oauth = [],
+	stored = [],
+}: { oauth?: string[]; stored?: string[] }): WriterCredentials {
+	return {
+		hasOAuth: (provider) => oauth.includes(provider),
+		has: (provider) => oauth.includes(provider) || stored.includes(provider),
+	};
+}
+
+test("an exact model absent from the SDK registry is unavailable despite valid auth", () => {
+	const selector = "openai-codex/gpt-6.1-sol";
+	const [row] = writerReadiness(
+		[selector],
+		registryOf("openai-codex/gpt-6-sol"),
+		credentialsOf({ oauth: ["openai-codex"] }),
+		{},
+	);
+	expect(row).toMatchObject({
+		selector,
+		model_available: false,
+		credential_available: true,
+		available: false,
+	});
+	expect(row.detail.trim()).not.toBe("");
+});
+
+test("a registry answering with another provider or model is not the requested model", () => {
+	const credentials = credentialsOf({ oauth: ["openai-codex"] });
+	for (const substitute of [
+		{ provider: "openai", id: "gpt-6.1-sol" },
+		{ provider: "openai-codex", id: "gpt-6-sol" },
+	]) {
+		const [row] = writerReadiness(
+			["openai-codex/gpt-6.1-sol"],
+			{ find: () => substitute },
+			credentials,
+			{},
+		);
+		expect(row.model_available).toBe(false);
+		expect(row.available).toBe(false);
+	}
+});
+
+test("a registered model without execution-eligible credentials is unavailable", () => {
+	const selector = "kimi-code/k3";
+	const [row] = writerReadiness(
+		[selector],
+		registryOf(selector),
+		credentialsOf({ stored: ["openai-codex"] }),
+		{},
+	);
+	expect(row).toMatchObject({
+		model_available: true,
+		credential_available: false,
+		available: false,
+	});
+	expect(row.detail.trim()).not.toBe("");
+});
+
+test("OAuth-only writer routes refuse an API-key-only identity", () => {
+	const selectors = [
+		"anthropic/claude-opus-5-5",
+		"google-antigravity/gemini-3.1-pro",
+	];
+	const registry = registryOf(...selectors);
+	const keyOnly = writerReadiness(
+		selectors,
+		registry,
+		credentialsOf({ stored: ["anthropic", "google-antigravity"] }),
+		{ ANTHROPIC_API_KEY: "metered-key" },
+	);
+	for (const row of keyOnly) {
+		expect(row.model_available).toBe(true);
+		expect(row.credential_available).toBe(false);
+		expect(row.available).toBe(false);
+	}
+	const oauth = writerReadiness(
+		selectors,
+		registry,
+		credentialsOf({ oauth: ["anthropic", "google-antigravity"] }),
+		{},
+	);
+	expect(oauth.every((row) => row.available)).toBe(true);
+});
+
+test("coding-plan ZAI_API_KEY makes only the Zhipu coding-plan route eligible", () => {
+	const zhipu = "zhipu-coding-plan/glm-5.3-flash";
+	const kimi = "kimi-code/k3";
+	const registry = registryOf(zhipu, kimi);
+	const none = credentialsOf({});
+	const [withoutKey] = writerReadiness([zhipu], registry, none, {});
+	expect(withoutKey.available).toBe(false);
+	const withKey = writerReadiness([zhipu, kimi], registry, none, {
+		ZAI_API_KEY: "coding-plan-key",
+	});
+	expect(withKey.map((row) => [row.selector, row.available])).toEqual([
+		[zhipu, true],
+		[kimi, false],
+	]);
+});
+
+test("writer readiness refuses inexact or duplicate selectors", () => {
+	const registry = registryOf("kimi-code/k3");
+	const credentials = credentialsOf({});
+	for (const selectors of [
+		[],
+		["kimi-code"],
+		["kimi-code/k3/extra"],
+		["kimi-code/k3", "kimi-code/k3"],
+	])
+		expect(() => writerReadiness(selectors, registry, credentials, {})).toThrow();
+});
+
 afterEach(async () => {
 	await Promise.all(
 		temporary.splice(0).map((path) => rm(path, { recursive: true })),
@@ -115,7 +245,7 @@ test("read, glob and literal search expose served paths but neither execute nor 
 	);
 });
 
-test("ranged reads and literal search inspect large sources without widening writes", async () => {
+test("ranged reads and literal search inspect large sources", async () => {
 	const root = await snapshot();
 	const source = "padding\n".repeat(70_000) + "large-source-marker\n";
 	await writeFile(join(root, "large.txt"), source);
@@ -144,16 +274,6 @@ test("ranged reads and literal search inspect large sources without widening wri
 	});
 	expect(searched.content[0].text).toContain(":70001: large-source-marker");
 	expect(searched.details.paths).toEqual([join(root, "large.txt")]);
-	const write = writeTools(sdk.z, root).find(
-		(tool) => tool.name === "execution_write",
-	)!;
-	await expect(
-		write.execute("large-write", {
-			path: "large.txt",
-			content: source + "changed\n",
-		}),
-	).rejects.toThrow();
-	expect(await readFile(join(root, "large.txt"), "utf8")).toBe(source);
 });
 
 test("read and search bound emitted UTF-8 bytes even for one long line", async () => {
@@ -385,4 +505,46 @@ test("workspace-write replacement preserves existing executable mode", async () 
 	});
 	expect(await readFile(script, "utf8")).toBe("#!/bin/sh\necho newer\n");
 	expect((await stat(script)).mode & 0o777).toBe(beforeMode);
+});
+
+test("workspace-write edits and writes UTF-8 files through the 2 MiB byte limit", async () => {
+	const root = await snapshot();
+	const sdkRoot =
+		process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
+		join(homedir(), ".local/share/agent-execution/omp-sdk", SDK_VERSION);
+	// The SDK root is runtime-selected, so a static package import cannot select it.
+	const sdk = await import(
+		pathToFileURL(
+			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
+		).href
+	);
+	const tools = writeTools(sdk.z, root);
+	const write = tools.find((tool) => tool.name === "execution_write")!;
+	const edit = tools.find((tool) => tool.name === "execution_edit")!;
+
+	const largeSource = "padding\n".repeat(70_000) + "unique-marker\n";
+	await writeFile(join(root, "large-edit.txt"), largeSource);
+	await edit.execute("large-splice", {
+		path: "large-edit.txt",
+		old_text: "unique-marker",
+		new_text: "edited-marker",
+	});
+	const edited = await readFile(join(root, "large-edit.txt"));
+	expect(edited).toEqual(Buffer.from(largeSource.replace("unique-marker", "edited-marker")));
+
+	const exactLimit = "é".repeat(1024 * 1024);
+	await write.execute("write-exact-limit", {
+		path: "boundary.txt",
+		content: exactLimit,
+	});
+	expect(await readFile(join(root, "boundary.txt"))).toEqual(Buffer.from(exactLimit));
+
+	const oversized = exactLimit + "a";
+	await expect(
+		write.execute("write-over-limit", {
+			path: "boundary.txt",
+			content: oversized,
+		}),
+	).rejects.toThrow();
+	expect(await readFile(join(root, "boundary.txt"))).toEqual(Buffer.from(exactLimit));
 });

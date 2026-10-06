@@ -9,11 +9,12 @@ unrestricted CLI. The dependency root is provisioned only by the explicit runtim
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -126,6 +127,135 @@ def require_omp_sdk(*, environment: Mapping[str, str] | None = None) -> tuple[Pa
     if not bun:
         raise ValueError("OMP SDK execution requires bun on PATH")
     return root, bun
+
+
+OMP_WRITER_READINESS_SCHEMA = "agent-execution.omp-writer-readiness/v1"
+_EXACT_SELECTOR = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+
+
+def validate_writer_probe_request(selectors: object, timeout: object) -> tuple[list[str], float]:
+    """Normalize a public writer-probe request before any SDK launch.
+
+    ``None`` selects the complete writer catalog. Malformed public inputs raise
+    ``ValueError`` rather than leaking ``TypeError`` from validation.
+    """
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("OMP writer probe timeout must be a finite positive number")
+    try:
+        bounded = float(timeout)
+    except OverflowError as error:
+        raise ValueError("OMP writer probe timeout must be finite and positive") from error
+    if not math.isfinite(bounded) or bounded <= 0:
+        raise ValueError("OMP writer probe timeout must be finite and positive")
+    if selectors is None:
+        requested: Sequence[object] = sorted(OMP_WRITER_SELECTORS)
+    elif isinstance(selectors, (list, tuple)):
+        requested = list(selectors)
+    else:
+        raise ValueError("OMP writer probe selectors must be a list of strings")
+    if not requested:
+        raise ValueError("OMP writer probe requires at least one selector")
+    selected: list[str] = []
+    for selector in requested:
+        if not isinstance(selector, str) or not re.fullmatch(_EXACT_SELECTOR, selector):
+            raise ValueError("OMP writer probe selectors must be exact provider/model strings")
+        selected.append(selector)
+    if len(set(selected)) != len(selected):
+        raise ValueError("OMP writer probe selectors must be unique")
+    unsupported = sorted(set(selected) - OMP_WRITER_SELECTORS)
+    if unsupported:
+        raise ValueError(f"unsupported OMP writer selector: {', '.join(unsupported)}")
+    return selected, bounded
+
+
+def validate_writer_probe_evidence(output: str, selectors: list[str]) -> list[dict[str, object]]:
+    """Validate SDK readiness evidence: exactly one consistent row per selector."""
+    try:
+        evidence = json.loads(output)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise ValueError("OMP writer probe returned malformed JSON") from error
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("schema_version") != OMP_WRITER_READINESS_SCHEMA
+    ):
+        raise ValueError("OMP writer probe returned unsupported evidence")
+    rows = evidence.get("writers")
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict) or not isinstance(row.get("selector"), str) for row in rows
+    ):
+        raise ValueError("OMP writer probe returned malformed rows")
+    by_selector: dict[str, dict[str, object]] = {}
+    for row in cast(list[dict[str, object]], rows):
+        selector = cast(str, row["selector"])
+        if selector in by_selector:
+            raise ValueError(f"OMP writer probe returned duplicate rows for {selector}")
+        by_selector[selector] = row
+    if set(by_selector) != set(selectors):
+        raise ValueError("OMP writer probe rows do not match the requested selectors")
+    validated: list[dict[str, object]] = []
+    for selector in selectors:
+        row = by_selector[selector]
+        model = row.get("model_available")
+        credential = row.get("credential_available")
+        available = row.get("available")
+        detail = row.get("detail")
+        if type(model) is not bool or type(credential) is not bool or type(available) is not bool:
+            raise ValueError(f"OMP writer probe returned non-boolean evidence for {selector}")
+        if available is not (model and credential):
+            raise ValueError(f"OMP writer probe returned inconsistent availability for {selector}")
+        if not isinstance(detail, str) or not detail.strip():
+            raise ValueError(f"OMP writer probe returned no detail for {selector}")
+        validated.append(
+            {
+                "selector": selector,
+                "model_available": model,
+                "credential_available": credential,
+                "available": available,
+                "detail": detail,
+            }
+        )
+    return validated
+
+
+def omp_writer_probe_command(
+    selectors: list[str], *, environment: Mapping[str, str] | None = None
+) -> list[str]:
+    """Build the scrubbed, non-generating pinned-SDK writer readiness command."""
+    if not selectors or any(
+        not isinstance(selector, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", selector)
+        for selector in selectors
+    ):
+        raise ValueError("OMP writer probe requires exact provider/model selectors")
+    root, bun = require_omp_sdk(environment=environment)
+    return [
+        sys.executable,
+        "-I",
+        str(Path(__file__).resolve()),
+        "--exec",
+        str(root),
+        bun,
+        json.dumps(selectors, separators=(",", ":")),
+        "--probe-writers",
+        "",
+    ]
+
+
+def probe_omp_writers(selectors: list[str], *, timeout: float = 30.0) -> list[dict[str, object]]:
+    """Observe pinned-SDK model and execution-eligible credential availability.
+
+    The scrubbed SDK helper runs in its own process group, bounded by
+    ``timeout``; ``subprocess.TimeoutExpired`` propagates after group cleanup.
+    """
+    selected, bounded = validate_writer_probe_request(selectors, timeout)
+    from agent_execution.processes import run_in_process_group
+
+    command = omp_writer_probe_command(selected)
+    completed = run_in_process_group(command, Path.cwd(), "", bounded)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise ValueError(f"OMP writer probe failed: {detail or completed.returncode}")
+    return validate_writer_probe_evidence(completed.stdout, selected)
 
 
 def omp_auth_status_command(
@@ -531,6 +661,20 @@ def _exec_sdk() -> None:
         raise SystemExit("grounded OMP selector is not registered")
     if policy == _WRITER and selector not in OMP_WRITER_SELECTORS:
         raise SystemExit("writer OMP selector is not registered")
+    if policy == "--probe-writers":
+        try:
+            selectors = json.loads(selector)
+        except json.JSONDecodeError as error:
+            raise SystemExit("writer probe selectors are malformed") from error
+        if (
+            not isinstance(selectors, list)
+            or not selectors
+            or any(
+                not isinstance(value, str) or value not in OMP_WRITER_SELECTORS
+                for value in selectors
+            )
+        ):
+            raise SystemExit("writer probe selector is not registered")
     environment = omp_launch_environment()
     snapshot_cwd = os.getcwd()
     # Bun reads bunfig.toml before our code runs: bootstrap only in the trusted
