@@ -34,3 +34,16 @@ omp-runtime:
     uv run agent-execution-worker install-omp
 
 check: lint typecheck test
+
+# There is no local install recipe: agent-review's paired release and
+# agent-offload's build each bundle this package, and agent-review owns the
+# agent-execution-worker entry point. Installing it here would relink that name
+# outside the pair.
+
+# Install on Studio through agent-host-sync; account is agent or osteele.
+deploy account="agent":
+    agent-host-sync --account {{account}} apply --stage tools --tool agent-execution
+
+# Show what deploying to Studio would change, without changing anything.
+deploy-status account="agent":
+    agent-host-sync --account {{account}} plan --stage tools --tool agent-execution
