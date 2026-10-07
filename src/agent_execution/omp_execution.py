@@ -218,9 +218,12 @@ def validate_writer_probe_evidence(output: str, selectors: list[str]) -> list[di
 
 
 def omp_writer_probe_command(
-    selectors: list[str], *, environment: Mapping[str, str] | None = None
+    selectors: list[str],
+    *,
+    environment: Mapping[str, str] | None = None,
+    writer_only: bool = True,
 ) -> list[str]:
-    """Build the scrubbed, non-generating pinned-SDK writer readiness command."""
+    """Build a scrubbed pinned-SDK catalog and credential probe."""
     if not selectors or any(
         not isinstance(selector, str)
         or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", selector)
@@ -236,7 +239,7 @@ def omp_writer_probe_command(
         str(root),
         bun,
         json.dumps(selectors, separators=(",", ":")),
-        "--probe-writers",
+        "--probe-writers" if writer_only else "--probe-models",
         "",
     ]
 
@@ -675,6 +678,17 @@ def _exec_sdk() -> None:
             )
         ):
             raise SystemExit("writer probe selector is not registered")
+    if policy == "--probe-models":
+        selectors = json.loads(selector)
+        if (
+            not isinstance(selectors, list)
+            or not selectors
+            or any(
+                not isinstance(item, str) or not re.fullmatch(_EXACT_SELECTOR, item)
+                for item in selectors
+            )
+        ):
+            raise SystemExit("model probe requires exact selectors")
     environment = omp_launch_environment()
     snapshot_cwd = os.getcwd()
     # Bun reads bunfig.toml before our code runs: bootstrap only in the trusted

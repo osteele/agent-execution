@@ -5,7 +5,7 @@
 --
 -- Scope: the worker execution contract — dispatch admission, harness
 -- execution, evidence, the durable worker-result record — plus worker
--- identity and the optional durable Weft transport.
+-- identity, exact execution observations, and the optional durable Weft transport.
 -- Excludes: OMP SDK and ctx internals (external systems), process-group
 -- mechanics, credential and clock helpers (infrastructure).
 
@@ -447,8 +447,39 @@ surface WorkerCommand {
     provides:
         IdentityReported()
         DependenciesProbed(provider)
+        ExecutionStatusReported(context, fresh)
+        ProviderGenerationObserved(context, outcome)
         DispatchExecuted(dispatch)
         OmpRuntimeProvisioned()
+
+    @guarantee ExactObservationIdentity
+        -- execution-status/v1 binds harness, surface, exact selector, tool policy,
+        -- requester/executor host and OS user, transport, execution source digest,
+        -- profile and launch fingerprint. Billing pool and credential identity
+        -- are independent; unidentified credentials never imply a cross-context join.
+        -- CLI and Python boundaries validate schema, coverage and freshness.
+
+    @guarantee IndependentFacts
+        -- Capability, authentication, quota, generation and transport have separate
+        -- states, provenance, observation times, expiry and age. Missing evidence
+        -- is unknown; expired evidence retains its state and is marked stale.
+        -- Credential billing basis is independent of authentication. No universal
+        -- ready flag exists. Native wrapper auth bypasses generation routing:
+        -- its sign-in cannot prove that route or authorize subscription billing.
+
+    @guarantee FreshPinnedAdmission
+        -- The actual worker re-probes before generation. OMP requires current
+        -- capability/authentication/transport and refuses a current quota denial.
+        -- Native Claude is not a Weft worker; read-only OMP selectors need not
+        -- belong to the writer roster. Existing cost ceilings remain fail-closed.
+
+    @guarantee ProviderOutcomesOnly
+        -- Generation is recorded only after an actual provider answer or refusal,
+        -- with typed quota/auth/network/unknown conditions. Preflight, packet-size,
+        -- missing SDK and local evidence errors are not provider generation failures.
+        -- Login cannot erase generation failure. Success does not assert headroom.
+        -- Immutable exact events share the provider registry and lock, but their
+        -- namespace cannot poison a retained worker's route-wide observations.
 
     @guarantee DatabaseIncapability
         -- The worker command surface reads no review state and holds no

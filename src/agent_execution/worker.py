@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -20,13 +21,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from agent_execution import __version__, provider_status
+from agent_execution import __version__, execution_status, provider_status
 from agent_execution.agy_execution import (
     AGY_ROUTE,
     AGY_STDIN_PROMPT_MARKER,
     AgyInvocation,
     AgyStatusError,
-    agy_billing_pool,
     agy_envelope,
     require_agy_argv_prompt,
     run_agy_command,
@@ -636,47 +636,50 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-#: Outcomes that say something about the provider rather than about this
-#: worker. A preflight failure means the worker was misconfigured; a stopped
-#: harness means the local environment refused. Neither is evidence about the
-#: route, and recording them would cool a healthy provider.
-_PROVIDER_ATTRIBUTABLE = {"harness_failed", "evidence_failed"}
-
-
-def _publish_provider_status(
-    result: WorkerResult,
-    *,
-    route: str,
-    model: str | None = None,
-    billing_pool: str | None = None,
-) -> None:
-    """Share what this call observed about its provider route.
-
-    The worker is the only component that watches a provider refuse. Without
-    this, agent-review cuts reviewer anchors and the delegate picker chooses
-    delegates while blind to a cap that this process already read in the
-    provider's own words.
-
-    Publication first commits an immutable local observation. Central sync is
-    deliberately separate: an unavailable registry must never turn a completed
-    model call into a failed one.
-    """
-    if not route:
+def _publish_provider_status(result: WorkerResult, subject: dict | None) -> None:
+    """Record provider outcomes, never local preflight or evidence failures."""
+    if subject is None:
         return
-    # Only what this caller knows: the OMP Antigravity route names its model,
-    # agy names its pool, and every other route passes neither.
-    pool: dict[str, str] = {}
-    if model is not None and route == "google-antigravity":
-        pool["model"] = model
-    if billing_pool is not None:
-        pool["billing_pool"] = billing_pool
+    succeeded = result.status == "completed"
+    refusal = None
+    if not succeeded and result.provider in {"omp", "omp-packet"}:
+        for line in result.harness.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "message_end":
+                continue
+            message = event.get("message")
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and message.get("stopReason") == "error"
+            ):
+                refusal = str(message.get("errorMessage", "Provider refused generation"))
+    elif not succeeded and result.provider == "agy":
+        try:
+            envelope = json.loads(result.harness.stdout)
+        except json.JSONDecodeError:
+            envelope = None
+        if (
+            isinstance(envelope, dict)
+            and isinstance(envelope.get("status"), str)
+            and envelope["status"] != "SUCCESS"
+        ):
+            refusal = " ".join(
+                str(envelope.get(key, "")) for key in ("error", "message", "response")
+            )
+    if not succeeded and refusal is None:
+        return
     try:
-        if result.status == "completed":
-            provider_status.record_success(route, **pool)
-        elif result.status in _PROVIDER_ATTRIBUTABLE and result.failure:
-            provider_status.record_refusal(route, result.failure, **pool)
-    except OSError:
-        return
+        execution_status.record_generation(
+            subject,
+            succeeded=succeeded,
+            condition=provider_status.classify(refusal)[0] if refusal is not None else None,
+        )
+    except OSError as error:
+        print(f"agent-execution: could not record provider observation: {error}", file=sys.stderr)
 
 
 def _write_result(path: Path, result: WorkerResult, *, cwd: Path) -> None:
@@ -766,6 +769,9 @@ def execute_worker(
     expect_prompt_sha256: str | None = None,
     harness_model: str | None = None,
     max_cost_usd: float | None = None,
+    execution_transport: str = "local",
+    requester_host: str | None = None,
+    requester_user: str | None = None,
     invoke: CommandRunner = run_worker_command,
     invoke_prompt: PromptCommandRunner = run_command_with_prompt,
     which: Which = shutil.which,
@@ -782,15 +788,7 @@ def execute_worker(
     prompt = ""
     prompt_sha256 = ""
     harness_started_at: float | None = None
-    # The provider route this call resolved to, for shared status reporting.
-    # A one-element list rather than a closed-over name: `finish` is defined
-    # here but `omp_invocation` is not bound until the harness is validated far
-    # below, and every preflight failure returns through `finish` before that.
-    selected_route = [""]
-    selected_model = [""]
-    # The quota pool within that route, when the harness names one. Empty means
-    # the route itself is the pool, which is the registry's default.
-    selected_pool = [""]
+    status_subject: dict | None = None
 
     def finish(
         status: str,
@@ -825,12 +823,7 @@ def execute_worker(
             harness_started_at=harness_started_at,
             omp_evidence=omp_evidence,
         )
-        _publish_provider_status(
-            result,
-            route=selected_route[0] or provider,
-            model=selected_model[0] or None,
-            billing_pool=selected_pool[0] or None,
-        )
+        _publish_provider_status(result, status_subject)
         _write_result(output, result, cwd=working_directory)
         return result
 
@@ -906,10 +899,6 @@ def execute_worker(
         try:
             logical_command = [*command, *(["--model", harness_model] if harness_model else [])]
             omp_invocation = validate_omp_command(logical_command, working_directory)
-            # `provider` is the harness (omp); the quota belongs to the credential
-            # behind the route, so report the route rather than the harness.
-            selected_route[0] = omp_invocation.selector.split("/", 1)[0]
-            selected_model[0] = omp_invocation.selector
             expected_policies = (
                 {"read-only-no-shell", "workspace-write-no-shell"}
                 if provider == "omp"
@@ -928,8 +917,6 @@ def execute_worker(
             # Validation refuses every tool policy except packet-only-no-tools
             # and every model outside the admitted list.
             agy_invocation = validate_agy_command(logical_command)
-            selected_route[0] = AGY_ROUTE
-            selected_pool[0] = agy_billing_pool(agy_invocation.model)
             if prompt_payload is not None:
                 if agy_invocation.prompt != AGY_STDIN_PROMPT_MARKER:
                     raise ValueError("agy payload execution requires the stdin prompt marker")
@@ -978,6 +965,45 @@ def execute_worker(
             require_cost_cap(estimate, max_cost_usd)
     except ValueError as error:
         return finish("preflight_failed", failure=f"cost-cap-refused: {error}")
+    if omp_invocation is not None or agy_invocation is not None:
+        invocation = omp_invocation or agy_invocation
+        assert invocation is not None
+        if omp_invocation is not None:
+            selector = omp_invocation.selector
+        else:
+            assert agy_invocation is not None
+            selector = f"{AGY_ROUTE}/{agy_invocation.model}"
+        surface = "offload-task" if invocation.policy == "workspace-write-no-shell" else "worker"
+        try:
+            status = execution_status.probe_status(
+                harness=provider,
+                surface=surface,
+                selectors=[selector],
+                transport=execution_transport,
+                requester_host=requester_host,
+                requester_user=requester_user,
+                tool_policy=invocation.policy,
+                expected_execution_sha256=worker_source_sha256,
+                timeout=min(timeout or 30.0, 30.0),
+                cwd=working_directory,
+            )
+        except (OSError, ValueError) as error:
+            return finish("preflight_failed", failure=f"execution observation failed: {error}")
+        row = status["rows"][0]
+        facts = row["facts"]
+        required = (
+            ("capability", "transport", "authentication")
+            if omp_invocation
+            else ("capability", "transport")
+        )
+        for name in required:
+            fact = facts[name]
+            if fact["state"] != "available" or fact["stale"]:
+                return finish("preflight_failed", failure=f"execution {name}: {fact['detail']}")
+        quota = facts["quota"]
+        if quota["state"] == "unavailable" and not quota["stale"]:
+            return finish("preflight_failed", failure=f"execution quota: {quota['detail']}")
+        status_subject = row["subject"]
     ctx_version = ""
     if provider == "codex":
         try:

@@ -1132,6 +1132,14 @@ surface SchedulerExecution {
         -- Periodic lightweight host and network observations are allowed.
         -- Non-billed quota and provider-status refreshes are also allowed.
 
+    @guarantee ExecutionObservationAuthority
+        -- agent-execution.execution-status/v1 owns exact harness, surface, selector,
+        -- tool-policy, requester/executor, build and launch-context observations.
+        -- Consumers retain scheduling policy; cached facts are advisory and fresh
+        -- pinned-executor observations precede launch. Capability and login do not
+        -- establish generation or quota. Unknown credential identity forbids joining
+        -- billing evidence across contexts; native wrapper login is not route proof.
+
     @guarantee AttemptContextRecorded
         -- Every provider attempt and status refresh records the observable host,
         -- exit node, routing profile, VPN state, and network-context fingerprint.

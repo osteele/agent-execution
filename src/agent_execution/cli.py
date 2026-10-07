@@ -8,6 +8,7 @@ import sys
 from collections.abc import Sequence
 
 from agent_execution import provider_status
+from agent_execution.execution_status import add_status_parser, run_status
 
 
 def _print_json(value: object) -> None:
@@ -74,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-execution")
     subparsers = parser.add_subparsers(dest="command", required=True)
     _provider_parser(subparsers)
+    add_status_parser(subparsers)
     return parser
 
 
@@ -152,6 +154,12 @@ def _run_provider(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "execution-status":
+        try:
+            return run_status(args)
+        except (OSError, ValueError) as error:
+            print(f"execution status failed: {error}", file=sys.stderr)
+            return 2
     if args.command == "provider":
         return _run_provider(args)
     raise AssertionError(args.command)  # pragma: no cover

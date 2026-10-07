@@ -17,6 +17,12 @@ scrubbed launch environment - not the raw parent environment, where a key that
 the review will never use makes the route look metered. `claude_command_prefix`
 and `claude_launch_environment` are the shared statement of that launch
 environment; the dispatch command and the probe both derive from them.
+
+`observe_claude_auth` exposes the native authentication status from the same
+registered answer, independently of the billing basis: presence of a login is
+not a billing fact, and a billing basis is not an account identity.
+`launch_fingerprint` names the launch configuration (binary, home/config
+selection, routing overrides, credential-variable presence) without a secret.
 """
 
 from __future__ import annotations
@@ -328,6 +334,39 @@ def _claude_status_source(status: dict[str, object]) -> str | None:
     return None
 
 
+def _claude_auth_document(
+    executable: str,
+    *,
+    cwd: Path | None,
+    environment: Mapping[str, str] | None,
+    profile: str | None,
+    timeout: float,
+) -> tuple[int, dict[str, object] | None] | None:
+    """Run the registered `claude auth status` under the scrubbed launch environment.
+
+    Returns the exit status with the parsed JSON object (None when stdout is
+    not one object), or None when the command could not run at all. This is
+    the one implementation behind both the billing basis and the native
+    authentication status.
+    """
+    launch = claude_launch_environment(profile=profile, environment=environment)
+    completed = _run_status_command(
+        [executable, "auth", "status"],
+        cwd=cwd,
+        environment=launch,
+        timeout=timeout,
+    )
+    if completed is None:
+        return None
+    try:
+        decoded = cast(object, json.loads(completed.stdout))
+    except json.JSONDecodeError:
+        return completed.returncode, None
+    if not isinstance(decoded, dict):
+        return completed.returncode, None
+    return completed.returncode, cast(dict[str, object], decoded)
+
+
 def _probe_claude_auth_status(
     executable: str,
     *,
@@ -342,22 +381,12 @@ def _probe_claude_auth_status(
     it reports a subscription route with no key source, and None when it gave
     no answer - a failed observation, never an assertion that no key was used.
     """
-    launch = claude_launch_environment(profile=profile, environment=environment)
-    completed = _run_status_command(
-        [executable, "auth", "status"],
-        cwd=cwd,
-        environment=launch,
-        timeout=timeout,
+    answer = _claude_auth_document(
+        executable, cwd=cwd, environment=environment, profile=profile, timeout=timeout
     )
-    if completed is None or completed.returncode != 0:
+    if answer is None or answer[0] != 0 or answer[1] is None:
         return None
-    try:
-        status = cast(dict[str, object], json.loads(completed.stdout))
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(status, dict):
-        return None
-    return _claude_status_source(status)
+    return _claude_status_source(answer[1])
 
 
 def _probe_codex_login_status(
@@ -697,3 +726,263 @@ def _write_cache_row(path: Path, key: str, observation: CredentialBasis) -> None
         path.write_text(json.dumps(cached, indent=2, sort_keys=True), encoding="utf-8")
     except OSError:
         pass
+
+
+NATIVE_AUTH_SCHEMA = "harness-native-auth/v1"
+
+#: Only documented vocabulary is retained; arbitrary short strings may be tokens.
+_SAFE_STATUS_VALUES = frozenset(
+    {
+        "claude.ai",
+        "apiKey",
+        "oauth",
+        "none",
+        "firstParty",
+        "bedrock",
+        "vertex",
+        "foundry",
+        "max",
+        "pro",
+        "team",
+        "enterprise",
+        "free",
+        *_SOURCE_BASIS,
+    }
+)
+
+
+def _safe_status_value(value: object) -> str | None:
+    if isinstance(value, str) and value in _SAFE_STATUS_VALUES:
+        return value
+    return None
+
+
+@dataclass(frozen=True)
+class NativeAuthStatus:
+    """Native authentication status, independent of the billing basis.
+
+    Read by the same registered, non-generating `claude auth status` command as
+    the billing basis, under the same scrubbed launch environment. Being logged
+    in says nothing about which credential bills, and a subscription basis is
+    not an account identity. Raw account fields (email, organization) are never
+    retained; only short vocabulary labels survive parsing.
+    """
+
+    harness: str
+    executable: str | None
+    answered: bool
+    logged_in: bool | None
+    auth_method: str | None
+    api_provider: str | None
+    subscription_type: str | None
+    api_key_source: str | None
+    observed_at: float
+    basis: CredentialBasis
+
+    @property
+    def state(self) -> str:
+        if self.logged_in is True:
+            return "available"
+        if self.logged_in is False:
+            return "unavailable"
+        return "unknown"
+
+    def detail(self) -> str:
+        if self.executable is None:
+            return f"{self.harness} is not installed on the scrubbed launch PATH"
+        if not self.answered:
+            return f"{self.harness} auth status gave no readable answer"
+        fields = [
+            f"loggedIn={'unknown' if self.logged_in is None else str(self.logged_in).lower()}",
+            f"authMethod={self.auth_method or 'unreported'}",
+            f"apiProvider={self.api_provider or 'unreported'}",
+            f"subscriptionType={self.subscription_type or 'unreported'}",
+            f"apiKeySource={self.api_key_source or 'unreported'}",
+        ]
+        return f"{self.harness} auth status: " + " ".join(fields)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": NATIVE_AUTH_SCHEMA,
+            "harness": self.harness,
+            "answered": self.answered,
+            "logged_in": self.logged_in,
+            "auth_method": self.auth_method,
+            "api_provider": self.api_provider,
+            "subscription_type": self.subscription_type,
+            "api_key_source": self.api_key_source,
+            "observed_at": self.observed_at,
+            "credential_basis": self.basis.to_dict(),
+        }
+
+
+def observe_claude_auth(
+    *,
+    cwd: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    profile: str | None = None,
+    timeout: float | None = None,
+    clock: float | None = None,
+) -> NativeAuthStatus:
+    """Observe native Claude authentication and billing basis from one answer.
+
+    The binary is resolved through the scrubbed launch environment's PATH, so
+    the wrapper and profile a dispatch would use are the ones asked. Nothing is
+    cached and no executable or auth-file heuristic stands in for an answer.
+    """
+    now = time.time() if clock is None else clock
+    launch = claude_launch_environment(profile=profile, environment=environment)
+    resolved = _resolved_status_executable("claude", launch)
+    if resolved is None:
+        return NativeAuthStatus(
+            harness="claude",
+            executable=None,
+            answered=False,
+            logged_in=None,
+            auth_method=None,
+            api_provider=None,
+            subscription_type=None,
+            api_key_source=None,
+            observed_at=now,
+            basis=CredentialBasis(
+                harness="claude",
+                basis=BASIS_UNOBSERVED,
+                reported_source=None,
+                observed_at=now,
+                fingerprint="",
+            ),
+        )
+    effective_cwd = (cwd or Path.cwd()).resolve()
+    answer = _claude_auth_document(
+        resolved,
+        cwd=cwd,
+        environment=environment,
+        profile=profile,
+        timeout=_PROBE_TIMEOUT_SECONDS if timeout is None else timeout,
+    )
+    document = None if answer is None else answer[1]
+    logged_in = None
+    if document is not None and isinstance(document.get("loggedIn"), bool):
+        logged_in = cast(bool, document["loggedIn"])
+    reported = (
+        _claude_status_source(document)
+        if answer is not None and answer[0] == 0 and document is not None
+        else None
+    )
+    return NativeAuthStatus(
+        harness="claude",
+        executable=resolved,
+        answered=document is not None,
+        logged_in=logged_in,
+        auth_method=None if document is None else _safe_status_value(document.get("authMethod")),
+        api_provider=None if document is None else _safe_status_value(document.get("apiProvider")),
+        subscription_type=(
+            None if document is None else _safe_status_value(document.get("subscriptionType"))
+        ),
+        api_key_source=(
+            None if document is None else _safe_status_value(document.get("apiKeySource"))
+        ),
+        observed_at=now,
+        basis=CredentialBasis(
+            harness="claude",
+            basis=basis_for_source(reported),
+            reported_source=reported
+            if reported in _SOURCE_BASIS
+            else "unrecognized"
+            if reported
+            else None,
+            observed_at=now,
+            fingerprint=_cache_fingerprint(
+                resolved,
+                environment=launch,
+                cwd=effective_cwd,
+                profile=profile,
+                env_keys=_CLAUDE_CACHE_ENV_KEYS,
+            ),
+        ),
+    )
+
+
+def harness_launch_environment(
+    harness: str,
+    *,
+    profile: str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The environment a harness launch starts from, as dispatch prepares it.
+
+    Claude is scrubbed and given its wrapper profile exactly as a dispatch is.
+    The restricted OMP helper and agy apply their own minimal allowlists inside
+    their launchers, from this same inherited environment. A wrapper profile
+    belongs to the Claude wrapper only.
+    """
+    if harness == "claude":
+        return claude_launch_environment(profile=profile, environment=environment)
+    if profile:
+        raise ValueError("a wrapper profile applies only to the claude harness")
+    return dict(os.environ if environment is None else environment)
+
+
+_LAUNCH_EXECUTABLES = {"claude": "claude", "codex": "codex", "omp": "bun", "agy": "agy"}
+
+#: Launch-configuration inputs per harness family. Secret-valued keys are
+#: recorded by presence only, never by any digest of their value.
+_LAUNCH_FINGERPRINT_KEYS: dict[str, tuple[str, ...]] = {
+    "claude": (
+        "HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_PROFILE",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        _CLAUDE_DISABLE_EXTRA_ARGS,
+    ),
+    "codex": ("HOME", "CODEX_HOME"),
+    "omp": (
+        "HOME",
+        "AGENT_EXECUTION_OMP_SDK_ROOT",
+        "OMP_AUTH_BROKER_URL",
+        "OMP_AUTH_BROKER_TOKEN",
+        "ZAI_API_KEY",
+    ),
+    "agy": ("HOME",),
+}
+_SECRET_LAUNCH_KEYS = frozenset(
+    {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OMP_AUTH_BROKER_TOKEN", "ZAI_API_KEY"}
+)
+
+
+def launch_fingerprint(harness: str, launch: Mapping[str, str]) -> str:
+    """Fingerprint a harness's launch configuration without carrying a secret.
+
+    Covers the resolved binary (and, for OMP, the provisioned SDK package), the
+    home/config selection, routing overrides, and the presence of credential
+    variables. It describes launch configuration only: it is not a verified
+    credential or account identity and must never be used to join accounts.
+    """
+    family = "omp" if harness in {"omp", "omp-packet"} else harness
+    keys = _LAUNCH_FINGERPRINT_KEYS.get(family)
+    if keys is None:
+        raise ValueError(f"no launch configuration is defined for harness {harness!r}")
+    resolved = shutil.which(_LAUNCH_EXECUTABLES[family], path=launch.get("PATH", os.defpath))
+    parts = [
+        f"harness={family}",
+        f"executable={_executable_identity(resolved) if resolved else 'absent'}",
+    ]
+    if family == "omp":
+        from agent_execution.omp_execution import omp_sdk_root
+
+        package = omp_sdk_root(environment=launch) / (
+            "node_modules/@oh-my-pi/pi-coding-agent/package.json"
+        )
+        parts.append(f"sdk={_executable_identity(str(package))}")
+    for name in keys:
+        value = launch.get(name)
+        if not value:
+            parts.append(f"{name}=absent")
+        elif name in _SECRET_LAUNCH_KEYS:
+            parts.append(f"{name}=present")
+        else:
+            parts.append(f"{name}={_digest(value)}")
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+    return f"launch-sha256:{digest}"

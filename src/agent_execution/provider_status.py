@@ -25,6 +25,18 @@ plus its own writes, under the generations observed with that listing;
 anything else is reconciled by replay. An uncontended mutation pays O(history)
 directory-entry work but reads and stats no historical event. Changing a
 published event file in place is not a supported writer operation.
+
+Exact execution context. An observation may carry ``subject.execution``: the
+harness, surface, selector, tool policy, transport, requester host/user,
+execution build digest, wrapper profile, and launch-environment fingerprint it
+was made under. Every one of those dimensions is part of the projection key, so
+an exact observation never collapses with another context or with a legacy
+unscoped observation, and it never enters the route-global
+``unavailable_routes`` or quota-blocked views. Exact observations describe one
+executor's host-local facts; they are committed directly to ``events/`` and are
+never uploaded, so older readers elsewhere cannot mistake them for route-wide
+evidence. ``capability``, ``generation`` and ``credential-basis`` facts exist
+only in an exact context.
 """
 
 from __future__ import annotations
@@ -45,7 +57,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
@@ -58,8 +70,53 @@ DEFAULT_EVENT_TTL_SECONDS = 10 * 60
 RETENTION_SECONDS = 30 * 24 * 60 * 60
 TRANSPORT_TIMEOUT_SECONDS = 20
 _PROJECTION_SCHEMA_VERSION = "provider-status-projection/v3"
+_EXECUTION_PROJECTION_SCHEMA = "provider-status-execution-projection/v1"
 _REPLAY_ATTEMPTS = 3
 _CLOCK_FENCE_TIMEOUT_SECONDS = 0.05
+
+#: Fact kinds. ``capability``, ``generation`` and ``credential-basis`` are
+#: meaningful only for an exact execution context (see the module docstring).
+FACT_KINDS = frozenset(
+    {
+        "availability",
+        "authentication",
+        "inventory",
+        "quota",
+        "transport",
+        "capability",
+        "generation",
+        "credential-basis",
+    }
+)
+EXACT_ONLY_FACT_KINDS = frozenset({"capability", "generation", "credential-basis"})
+FACT_STATES = frozenset({"available", "unavailable", "unknown"})
+#: Typed refusal conditions, as ``classify`` names them.
+REFUSAL_CONDITIONS = frozenset({"quota", "auth", "network", "unknown"})
+
+#: Exact execution-context vocabulary. The labels are independent: native
+#: Claude and a worker that cannot run Claude are different contexts.
+EXECUTION_HARNESSES = ("claude", "codex", "omp", "omp-packet", "agy")
+EXECUTION_SURFACES = ("native", "worker", "offload-task")
+EXECUTION_TRANSPORTS = ("local", "weft")
+EXECUTION_TOOL_POLICIES = (
+    "packet-only-no-tools",
+    "read-only-no-shell",
+    "workspace-write-no-shell",
+)
+EXECUTION_IDENTITY_FIELDS = (
+    "harness",
+    "surface",
+    "selector",
+    "tool_policy",
+    "transport",
+    "requester_host",
+    "requester_user",
+    "execution_sha256",
+    "profile",
+    "environment_fingerprint",
+    "effective_route",
+)
+EXACT_SELECTOR_PATTERN = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 
 ROUTE_ALIASES = {
     "claude": "anthropic",
@@ -78,6 +135,8 @@ _SIGNATURES: list[tuple[str, str, str | None, int | None]] = [
     ),
     (r"您已达到每周/每月使用上限", "quota", "weekly-or-monthly", 24 * 3600),
     (r"You've reached your (\d+)-hour usage limit", "quota", "session", -1),
+    # The weekly cap identifies a window, not its reset time.
+    (r"You've reached your weekly(?: \(\d+-day\))? usage limit\b", "quota", "weekly", 600),
     (
         r"\bmonthly\b[^.\n]{0,40}\b(?:limit|allowance|quota|cap)\b",
         "quota",
@@ -261,6 +320,45 @@ def classify(signature: str) -> tuple[str, str | None, int, str | None]:
     return "unknown", None, 600, None
 
 
+def validate_execution_identity(value: object) -> dict[str, object]:
+    """Validate exact context before accepting an immutable observation."""
+    if not isinstance(value, dict) or set(value) != set(EXECUTION_IDENTITY_FIELDS):
+        raise ValueError("invalid execution identity fields")
+    for field, choices in (
+        ("harness", EXECUTION_HARNESSES),
+        ("surface", EXECUTION_SURFACES),
+        ("transport", EXECUTION_TRANSPORTS),
+        ("tool_policy", EXECUTION_TOOL_POLICIES),
+    ):
+        if not isinstance(value[field], str) or value[field] not in choices:
+            raise ValueError(f"invalid execution identity {field}")
+    for field in ("requester_host", "requester_user", "environment_fingerprint"):
+        if not isinstance(value[field], str) or not value[field] or len(value[field]) > 512:
+            raise ValueError(f"invalid execution identity {field}")
+    if not isinstance(value["execution_sha256"], str) or not re.fullmatch(
+        r"[0-9a-f]{64}", value["execution_sha256"]
+    ):
+        raise ValueError("invalid execution identity build")
+    selector = value["selector"]
+    if selector is not None and (
+        not isinstance(selector, str) or not re.fullmatch(EXACT_SELECTOR_PATTERN, selector)
+    ):
+        raise ValueError("invalid execution identity selector")
+    for field in ("profile", "effective_route"):
+        item = value[field]
+        if item is not None and (not isinstance(item, str) or not item or len(item) > 128):
+            raise ValueError(f"invalid execution identity {field}")
+    return cast(dict[str, object], value)
+
+
+def _execution_scope(value: object) -> str:
+    return (
+        ""
+        if value is None
+        else json.dumps(validate_execution_identity(value), sort_keys=True, separators=(",", ":"))
+    )
+
+
 def validate_event(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("provider observation has an unsupported schema")
@@ -283,13 +381,7 @@ def validate_event(value: object) -> dict[str, object]:
     fact = value.get("fact")
     if not isinstance(fact, dict):
         raise ValueError("provider observation has no fact")
-    if not isinstance(fact.get("kind"), str) or fact["kind"] not in {
-        "availability",
-        "authentication",
-        "inventory",
-        "quota",
-        "transport",
-    }:
+    if not isinstance(fact.get("kind"), str) or fact["kind"] not in FACT_KINDS:
         raise ValueError("provider observation has invalid fact kind")
     if not isinstance(fact.get("state"), str) or fact["state"] not in {
         "available",
@@ -297,6 +389,11 @@ def validate_event(value: object) -> dict[str, object]:
         "unknown",
     }:
         raise ValueError("provider observation has invalid fact state")
+    execution = subject.get("execution")
+    if execution is not None:
+        validate_execution_identity(execution)
+    elif fact["kind"] in EXACT_ONLY_FACT_KINDS:
+        raise ValueError("exact fact lacks execution identity")
     source = value.get("source")
     if (
         not isinstance(source, dict)
@@ -322,7 +419,14 @@ def observe(
     ttl_seconds: int = DEFAULT_EVENT_TTL_SECONDS,
     detail: dict[str, object] | None = None,
     now: float | None = None,
+    execution_identity: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
+    """Commit one immutable observation.
+
+    ``execution_identity`` scopes the observation to one exact execution
+    context. Such an observation is a host-local executor fact: it is settled
+    directly into the local event log and is never queued for upload.
+    """
     moment = time.time() if now is None else now
     host_name = host or socket.gethostname()
     fingerprint, fingerprint_scope = credential_fingerprint(credential_identity, host=host_name)
@@ -330,23 +434,38 @@ def observe(
     fact: dict[str, object] = {"kind": kind, "state": state}
     if detail:
         fact.update(detail)
+    subject: dict[str, object] = {
+        "route": route_for(route),
+        "billing_pool": billing_pool or billing_pool_for(route, model),
+        "credential_fingerprint": fingerprint,
+        "fingerprint_scope": fingerprint_scope,
+        "host": host_name,
+        "os_user": os_user or getpass.getuser(),
+    }
+    if execution_identity is not None:
+        subject["execution"] = dict(execution_identity)
     event: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "event_id": event_id,
-        "subject": {
-            "route": route_for(route),
-            "billing_pool": billing_pool or billing_pool_for(route, model),
-            "credential_fingerprint": fingerprint,
-            "fingerprint_scope": fingerprint_scope,
-            "host": host_name,
-            "os_user": os_user or getpass.getuser(),
-        },
+        "subject": subject,
         "fact": fact,
         "observed_at": _iso(moment),
         "expires_at": _iso(moment + ttl_seconds),
         "source": {"tool": source_tool, "method": source_method},
     }
     validate_event(event)
+    if execution_identity is not None:
+        cache: list[str] = []
+        with _registry_lock(cache, create=True) as locked:
+            if not locked:
+                raise OSError(cache[-1])
+            projection = _execution_projection(cache, locked=True)
+            (state_dir() / "execution-projection.json").unlink(missing_ok=True)
+            _atomic_json(_events_dir() / "execution" / f"{event_id}.json", event)
+            projection.admit(event)
+            projection.generations = {"execution": _generation(_events_dir() / "execution")}
+            _publish_execution_projection(projection)
+        return event
     with _mutation([], write_snapshot=True) as change:
         path = _outbox_dir() / f"{event_id}.json"
         change.created(path, _atomic_json(path, event))
@@ -517,7 +636,9 @@ def observe_omp_usage(
     return events
 
 
-_Key = tuple[str, str, str, str, str, str]
+# route, billing pool, credential fingerprint, host, OS user, exact execution
+# scope ("" for legacy unscoped events), fact kind.
+_Key = tuple[str, str, str, str, str, str, str]
 _Order = tuple[float, str]
 # Stat fields of each event directory; None while the directory does not exist.
 _Generations = dict[str, list[int] | None]
@@ -534,6 +655,7 @@ def _subject_key(event: dict[str, object]) -> _Key:
         cast(str, subject["credential_fingerprint"]),
         cast(str, subject["host"]),
         cast(str, subject["os_user"]),
+        _execution_scope(subject.get("execution")),
         cast(str, fact["kind"]),
     )
 
@@ -767,11 +889,16 @@ def _replay(*, locked: bool) -> tuple[_Projection, str | None]:
             return projection, reason
 
 
-def _load_projection() -> _Projection:
+def _load_projection(
+    *,
+    path: Path | None = None,
+    schema: str = _PROJECTION_SCHEMA_VERSION,
+    generation_keys: tuple[str, ...] = ("outbox", "events"),
+) -> _Projection:
     """The published projection; raises when it is absent or fails its checks."""
-    with _projection_path().open(encoding="utf-8") as stream:
+    with (path or _projection_path()).open(encoding="utf-8") as stream:
         value = json.load(stream)
-    if not isinstance(value, dict) or value.get("schema_version") != _PROJECTION_SCHEMA_VERSION:
+    if not isinstance(value, dict) or value.get("schema_version") != schema:
         raise ValueError("unsupported schema")
     payload = {key: item for key, item in value.items() if key != "checksum"}
     if value.get("checksum") != _checksum(payload):
@@ -779,7 +906,7 @@ def _load_projection() -> _Projection:
     generations = value.get("generations")
     if (
         not isinstance(generations, dict)
-        or set(generations) != {"outbox", "events"}
+        or set(generations) != set(generation_keys)
         or not all(
             item is None
             or (
@@ -1222,7 +1349,7 @@ def _render(
         if observed_at < moment - RETENTION_SECONDS or (host and key[3] != host):
             continue
         latest[key] = (observed_at, event)
-    successful_at: dict[tuple[str, str, str, str, str], float] = {}
+    successful_at: dict[tuple[str, ...], float] = {}
     for key, (observed_at, event) in latest.items():
         fact = cast(dict[str, object], event["fact"])
         if fact["kind"] == "availability" and fact["state"] == "available":
@@ -1249,12 +1376,26 @@ def _render(
             "stale": stale,
             "source": event["source"],
         }
-        for field in ("condition", "window", "reset_at", "reason", "quota", "quota_observable"):
+        for field in (
+            "condition",
+            "window",
+            "reset_at",
+            "reason",
+            "quota",
+            "quota_observable",
+            "detail",
+            "credential_basis",
+        ):
             if field in fact:
                 provider[field] = fact[field]
         providers.append(provider)
         route = cast(str, subject["route"])
-        if not stale and fact["state"] == "unavailable" and fact["kind"] != "transport":
+        if (
+            not stale
+            and "execution" not in subject
+            and fact["state"] == "unavailable"
+            and fact["kind"] != "transport"
+        ):
             reason = (
                 cast(str | None, fact.get("reason"))
                 or cast(str | None, fact.get("condition"))
@@ -1290,12 +1431,122 @@ def quota_blocked_routes(*, now: float | None = None) -> frozenset[str]:
     routes: set[str] = set()
     for provider in cast(list[dict[str, object]], value["providers"]):
         if (
-            provider["kind"] == "quota"
+            "execution" not in provider
+            and provider["kind"] == "quota"
             and provider["state"] == "unavailable"
             and not provider["stale"]
         ):
             routes.add(cast(str, provider["route"]))
     return frozenset(routes)
+
+
+def _publish_execution_projection(projection: _Projection) -> None:
+    payload = {**projection.payload(), "schema_version": _EXECUTION_PROJECTION_SCHEMA}
+    _atomic_json(
+        state_dir() / "execution-projection.json", {**payload, "checksum": _checksum(payload)}
+    )
+
+
+def _execution_projection(cache: list[str], *, locked: bool) -> _Projection:
+    # One authoritative event store and lock. Exact facts occupy a nested
+    # namespace that immutable older workers cannot read as route-wide facts.
+    # Their derived index also cannot invalidate the legacy workers' cache.
+    directory = _events_dir() / "execution"
+    generations = {"execution": _generation(directory)}
+    try:
+        projection = _load_projection(
+            path=state_dir() / "execution-projection.json",
+            schema=_EXECUTION_PROJECTION_SCHEMA,
+            generation_keys=("execution",),
+        )
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as error:
+        _note(cache, f"execution projection unusable: {_describe(error)}")
+    else:
+        if projection.generations == generations:
+            return projection
+    projection = _Projection(generations)
+    for entry in _event_entries(directory):
+        try:
+            event = validate_event(json.loads(Path(entry.path).read_text()))
+            if entry.name != f"{event['event_id']}.json" or "execution" not in cast(
+                dict, event["subject"]
+            ):
+                raise ValueError("invalid exact event identity")
+            projection.admit(event)
+        except (OSError, ValueError) as error:
+            _note(projection.diagnostics, f"execution event {entry.name}: {_describe(error)}")
+    if locked and _generation(directory) == generations["execution"]:
+        _publish_execution_projection(projection)
+    return projection
+
+
+def exact_observations(
+    *,
+    route: str,
+    billing_pool: str,
+    host: str,
+    os_user: str,
+    execution: Mapping[str, object],
+    now: float | None = None,
+) -> tuple[dict[str, dict[str, object]], list[str]]:
+    """The latest observation of each fact kind for one exact execution context.
+
+    Only exact observations with the unidentified host-scoped credential
+    fingerprint match: they never join another host, user, context, or a
+    legacy unscoped observation. Expired observations are returned (the caller
+    reports them stale); events beyond retention are not. Returns the
+    observations by kind and the registry diagnostics of the read.
+    """
+    moment = time.time() if now is None else now
+    validate_execution_identity(dict(execution))
+    cache: list[str] = []
+    with _registry_lock(cache, create=False) as locked:
+        projection = _execution_projection(cache, locked=locked)
+    fingerprint = credential_fingerprint(None, host=host)[0]
+    if execution["harness"] == "claude" and execution["effective_route"] is None:
+        candidates = []
+        for (observed_at, _), event in projection.latest.values():
+            subject = cast(dict[str, object], event["subject"])
+            scope = cast(dict[str, object], subject["execution"])
+            if observed_at < moment - RETENTION_SECONDS or any(
+                subject[field] != value
+                for field, value in (
+                    ("route", route_for(route)),
+                    ("host", host),
+                    ("os_user", os_user),
+                    ("credential_fingerprint", fingerprint),
+                )
+            ):
+                continue
+            if all(
+                scope[key] == execution[key]
+                for key in EXECUTION_IDENTITY_FIELDS
+                if key != "effective_route"
+            ):
+                candidates.append((observed_at, subject))
+        if candidates:
+            subject = max(candidates, key=lambda item: item[0])[1]
+            execution = cast(dict[str, object], subject["execution"])
+            billing_pool = cast(str, subject["billing_pool"])
+    wanted = (
+        route_for(route),
+        billing_pool,
+        fingerprint,
+        host,
+        os_user,
+        _execution_scope(dict(execution)),
+    )
+    found: dict[str, dict[str, object]] = {}
+    for key, ((observed_at, _), event) in projection.latest.items():
+        if key[:-1] != wanted or observed_at < moment - RETENTION_SECONDS:
+            continue
+        found[key[-1]] = event
+    diagnostics: list[str] = []
+    for diagnostic in (*projection.diagnostics, *cache):
+        _note(diagnostics, diagnostic)
+    return found, diagnostics
 
 
 def healthy_routes(candidates: list[str], *, now: float | None = None) -> list[str]:

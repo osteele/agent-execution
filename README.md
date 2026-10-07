@@ -42,49 +42,95 @@ Consumers that embed the worker install it into their own environment
   2 MiB; read, glob, and search tool results remain capped at 512 KiB (readable
   source files may be up to 4 MiB).
 
-## OMP writer readiness
+## Execution observations
 
-Check the active pinned OMP SDK's exact writer catalog without generating a
-model response:
+Inspect capabilities and credentials without generating a model response:
 
 ```sh
-agent-execution-worker probe-writers
-agent-execution-worker probe-writers --selector openai-codex/gpt-6-sol \
-  --selector anthropic/claude-opus-5-5 --timeout 30
+agent-execution-worker execution-status --harness omp --surface offload-task   --selector anthropic/claude-opus-5-5 --transport weft --json
+agent-execution execution-status --harness omp --surface worker   --selector kimi-code/kimi-k2.5 --cached --json
 ```
 
-The installed Python API is
-`agent_execution.worker_cli.probe_writers(*, selectors: list[str] | None = None, timeout: float = 30) -> dict`.
-With no selectors it checks every `OMP_WRITER_SELECTORS` entry; explicit
-selectors are exact, unique, and must be members of that catalog. Malformed
-selectors or a non-finite/non-positive timeout are rejected with `ValueError`
-before the SDK is launched. The result uses schema
-`agent-execution.writer-readiness/v1` and has three keys:
+The command observes the machine on which it runs. `--transport` describes the
+requested execution context; it does not submit a job. `--requester-host` and
+`--requester-user` distinguish the caller from the executor. The default
+requester is the local host/user. Both command entrypoints implement the same
+`agent-execution.execution-status/v1` contract.
 
-- `schema_version`: `"agent-execution.writer-readiness/v1"`.
-- `worker_identity`: the same `agent-execution.worker-identity/v1` object that
-  `agent-execution-worker identity` prints (package and protocol version,
-  source digest, and `version_spec`).
-- `writers`: one row per requested selector, in request order, for example
+The envelope contains `generated_at`, `worker_identity`, the actual
+`observer` host/user, one `rows` entry per exact selector, and `diagnostics`.
+Each row contains:
 
-```json
-{"selector":"kimi-code/k3","model_available":true,"credential_available":false,"available":false,"detail":"No execution-eligible credentials observed for kimi-code"}
-```
+- `subject`: harness, surface, exact selector, tool policy, requested route,
+  billing pool, executor host/user, transport, requester host/user, source digest,
+  profile, launch-environment fingerprint, observed effective route, and the
+  credential fingerprint/scope. A configuration fingerprint is not an account
+  identity. Unknown account fingerprints never join evidence across contexts.
+- `facts`: separate `capability`, `authentication`, `quota`, `generation`, and
+  `transport` observations. Each has `state`, `observed_at`, `expires_at`,
+  `age_seconds`, `stale`, `source` (`tool`, `method`), `detail`, and an optional
+  typed refusal `condition` (`quota`, `auth`, `network`, `unknown`).
+- `credential_basis`: an independent `harness-credential-basis/v1` observation
+  with expiry, age, and staleness, or null when absent. Authentication presence
+  does not establish subscription billing.
 
-Each row's `detail` is a nonempty human-readable explanation; its wording is
-not a stable interface. If the pinned SDK or Bun is not installed, every row is
-unavailable and `detail` carries the installation error. Malformed SDK
-evidence (bad JSON or schema, missing, duplicate or unrequested rows,
-non-boolean flags, an inconsistent `available`, or an empty `detail`) and a
-failed or timed-out helper are errors, not rows.
+States are `available`, `unavailable`, or `unknown`. Absent facts have null
+timestamps/age and `stale: true`. Expired facts retain their observed state and
+age; they do not become successful observations. There is no universal ready
+flag. Login cannot clear a generation failure, and a successful generation does
+not establish remaining quota. Current explicit quota refusals remain distinct
+from absent quota measurements.
 
-`available` is true only when the exact provider/model exists in the installed,
-pinned OMP SDK registry and the credential path admitted by restricted execution
-was observed (OAuth-only for Anthropic and Antigravity; the coding-plan
-`ZAI_API_KEY` route is included). The bounded probe uses the same scrubbed SDK
-launch and does not load local OMP model configuration or inspect another tool's
-private state. These are point-in-time observations only: they do not establish
-quota, network reachability, token freshness, or successful generation.
+OMP capability uses the active pinned SDK's exact model registry; authentication
+uses the credentials eligible for its restricted launch (OAuth-only for
+Anthropic and Antigravity, including the coding-plan `ZAI_API_KEY` route).
+Read-only Review selectors are checked independently of the writer roster.
+Native Claude sign-in is probed with the scrubbed environment, selected profile,
+and working directory. The wrapper's auth command bypasses generation routing,
+so sign-in cannot establish the effective generation route or its billing basis.
+Those native execution facts remain explicitly unobserved; they neither grant
+zero-cost permission nor affect OMP facts. Native Claude is not a supported
+Weft-worker transport, and native Codex worker execution is retired.
+
+Python consumers use `agent_execution.execution_status`:
+
+- `probe_status(*, harness, surface, selectors=None, transport="local", ... )`
+  performs fresh local non-generating probes.
+- `cached_status(...)` reads retained observations without probing.
+- `probe_remote_status(*, host, account="agent", harness, surface, selectors=None,
+  transport="weft", bin_dir=None, worker_executable="agent-execution-worker", ...)`
+  queries the executor over bounded SSH. An absolute `bin_dir` selects a pinned
+  build; `expected_execution_sha256` verifies it. Coverage, requester/executor
+  context, schema, and freshness are validated; transport failures raise
+  `ValueError`, never an empty success.
+- `validate_status(value, *, expected_execution_sha256=None)` validates an
+  envelope at a consumer boundary.
+- `record_generation(subject, *, succeeded, condition=None)` records an actual
+  provider outcome against its verified prelaunch subject. It rejects another
+  executor/build and an unverified native route. Workers call it automatically;
+  local preflight, packet-size, and evidence-validation failures are not failed
+  generation observations.
+
+The local APIs accept `tool_policy`, `profile`, `environment`, `cwd`,
+`requester_host`, `requester_user`, `expected_execution_sha256`, and a positive
+finite `timeout`. Remote queries accept profile, tool policy, and working
+directory but never forward the caller's secret environment. CLI equivalents
+include `--tool-policy`, `--profile`, `--cwd`, `--expect-source-sha256`, and
+`--timeout`. Native queries require an explicit tool policy. OMP worker queries
+default to `read-only-no-shell`; task queries use `workspace-write-no-shell`;
+OMP-packet and agy use `packet-only-no-tools`.
+
+Immediately before launch, workers re-observe required facts for their pinned
+source and actual tool policy. OMP requires current capability, authentication,
+and transport; a current explicit quota refusal also blocks launch. Agy has no
+registered auth-status probe: its authentication stays unknown, and its
+independent hard-cash guard refuses an unobservable billing basis.
+
+Exact observations are immutable events in the existing provider-status
+registry's `events/execution/` namespace, under its shared lock. Their derived
+`execution-projection.json` index can be rebuilt; it is not another authority.
+This namespace prevents retained older workers from interpreting scoped facts
+as route-wide availability. Consumers use the versioned API, not these files.
 
 ## Packet-only agy (Antigravity CLI)
 

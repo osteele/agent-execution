@@ -23,6 +23,7 @@ from agent_execution.worker import (
     execute_worker,
 )
 from agent_execution.worker_cli import main
+from tests.execution_status_fixtures import admitted_status
 from tests.support.omp import omp_command, omp_output
 
 
@@ -85,6 +86,11 @@ class WorkerResultTests(unittest.TestCase):
         self.addCleanup(environment.stop)
         self.output = Path(worker_evidence_path("model-call-7"))
         self.calls: list[list[str]] = []
+        observer = mock.patch(
+            "agent_execution.execution_status.probe_status", side_effect=admitted_status
+        )
+        observer.start()
+        self.addCleanup(observer.stop)
 
     def which(self, executable: str) -> str | None:
         return {"ctx": "/tools/ctx", "codex": "/tools/codex"}.get(executable)
@@ -277,35 +283,58 @@ class WorkerResultTests(unittest.TestCase):
         )
         self.assertEqual(stored, result)
 
-    def test_antigravity_dispatch_publishes_its_model_family(self) -> None:
-        for selector in (
-            "google-antigravity/gemini-3.1-pro",
-            "google-antigravity/claude-opus-4-6",
-        ):
-            with (
-                self.subTest(selector=selector),
-                mock.patch(
-                    "agent_execution.worker.require_omp_sdk", return_value=(self.root, "bun")
-                ),
-                mock.patch("agent_execution.worker.provider_status.record_success") as success,
-            ):
-                result = execute_worker(
-                    provider="omp",
-                    model_call_id="antigravity-call",
-                    command=omp_command(str(self.root), selector=selector, writer=True),
-                    invoke=lambda command, cwd, timeout, selector=selector: CommandResult(
-                        0,
-                        omp_output(
-                            cwd=str(cwd), selector=selector, policy="workspace-write-no-shell"
-                        ),
-                        "",
-                    ),
-                    timeout=30.0,
-                    ctx_timeout=10.0,
-                    cwd=self.root,
-                )
-                self.assertEqual(result.status, "completed", result.failure)
-                success.assert_called_once_with("google-antigravity", model=selector)
+    def test_local_evidence_failure_does_not_invent_failed_generation(self) -> None:
+        from agent_execution.execution_status import cached_status
+
+        selector = "anthropic/claude-opus-5-5"
+        with mock.patch("agent_execution.worker.require_omp_sdk", return_value=(self.root, "bun")):
+            result = execute_worker(
+                provider="omp",
+                model_call_id="bad-evidence",
+                command=omp_command(str(self.root), selector=selector),
+                invoke=lambda command, cwd, timeout: CommandResult(0, "invalid transcript", ""),
+                timeout=30.0,
+                ctx_timeout=10.0,
+                cwd=self.root,
+            )
+        self.assertEqual(result.status, "evidence_failed")
+        row = cached_status(harness="omp", surface="worker", selectors=[selector], cwd=self.root)[
+            "rows"
+        ][0]
+        self.assertEqual(row["facts"]["generation"]["state"], "unknown")
+        self.assertEqual(row["facts"]["quota"]["state"], "unknown")
+
+    def test_provider_refusal_records_typed_generation_and_quota(self) -> None:
+        from agent_execution.execution_status import cached_status
+
+        selector = "kimi-code/kimi-k2.5"
+        refusal = json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "error",
+                    "errorMessage": '403 {"error":{"type":"permission_error","message":"You\'ve reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends."},"type":"error"}',
+                },
+            }
+        )
+        with mock.patch("agent_execution.worker.require_omp_sdk", return_value=(self.root, "bun")):
+            result = execute_worker(
+                provider="omp",
+                model_call_id="provider-refusal",
+                command=omp_command(str(self.root), selector=selector),
+                invoke=lambda command, cwd, timeout: CommandResult(1, refusal, ""),
+                timeout=30.0,
+                ctx_timeout=10.0,
+                cwd=self.root,
+            )
+        self.assertEqual(result.status, "harness_failed")
+        row = cached_status(harness="omp", surface="worker", selectors=[selector], cwd=self.root)[
+            "rows"
+        ][0]
+        self.assertEqual(row["facts"]["generation"]["state"], "unavailable")
+        self.assertEqual(row["facts"]["generation"]["condition"], "quota")
+        self.assertEqual(row["facts"]["quota"]["state"], "unavailable")
 
     def test_workspace_writer_admits_opus(self) -> None:
         selector = "anthropic/claude-opus-5-5"

@@ -516,6 +516,7 @@ async function main(): Promise<void> {
 			"workspace-write-no-shell",
 			"--auth-status",
 			"--probe-writers",
+			"--probe-models",
 		].includes(policy)
 	) {
 		throw new Error("Invalid restricted OMP invocation");
@@ -547,7 +548,7 @@ async function main(): Promise<void> {
 	process.chdir(cwd);
 	const authStorage = await sdk.discoverAuthStorage();
 	try {
-		if (policy === "--probe-writers") {
+		if (policy === "--probe-writers" || policy === "--probe-models") {
 			const parsed: unknown = JSON.parse(selector);
 			if (
 				!Array.isArray(parsed) ||

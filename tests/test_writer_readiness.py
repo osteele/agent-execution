@@ -14,7 +14,6 @@ from typing import cast
 from unittest import mock
 
 from agent_execution.omp_execution import probe_omp_writers
-from agent_execution.worker_cli import probe_writers
 
 SELECTOR = "openai-codex/gpt-6.1-sol"
 OTHER = "kimi-code/k3"
@@ -57,23 +56,6 @@ class WriterReadinessTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_requested_selectors_reach_bounded_sdk_launch_and_rows_are_validated(self) -> None:
-        stdout = evidence([row(selector=OTHER, credential=False), row(selector=SELECTOR)])
-        with mock.patch(RUNNER, return_value=completed(stdout)) as runner:
-            response = probe_writers(selectors=[SELECTOR, OTHER], timeout=7)
-        command, _cwd, prompt, timeout = runner.call_args.args
-        self.assertIn("--probe-writers", command)
-        self.assertEqual(
-            json.loads(command[command.index("--probe-writers") - 1]), [SELECTOR, OTHER]
-        )
-        self.assertEqual(prompt, "")
-        self.assertEqual(timeout, 7)
-        self.assertEqual(response["schema_version"], "agent-execution.writer-readiness/v1")
-        rows = response["writers"]
-        assert isinstance(rows, list)
-        self.assertEqual([item["selector"] for item in rows], [SELECTOR, OTHER])
-        self.assertEqual([item["available"] for item in rows], [True, False])
-
     def test_probe_rejects_malformed_evidence(self) -> None:
         payloads = {
             "invalid json": "{not json",
@@ -106,15 +88,6 @@ class WriterReadinessTests(unittest.TestCase):
             probe_omp_writers([SELECTOR])
         self.assertIn("SDK registry failed to load", str(raised.exception))
 
-    def test_probe_timeout_is_forwarded_and_propagates(self) -> None:
-        timeout = subprocess.TimeoutExpired(["bun"], 0.01)
-        with (
-            mock.patch(RUNNER, side_effect=timeout) as runner,
-            self.assertRaises(subprocess.TimeoutExpired),
-        ):
-            probe_omp_writers([SELECTOR], timeout=0.01)
-        self.assertEqual(runner.call_args.args[3], 0.01)
-
     def test_malformed_requests_are_rejected_before_sdk_launch(self) -> None:
         malformed_selectors: list[object] = [
             ["unknown/model"],
@@ -129,10 +102,10 @@ class WriterReadinessTests(unittest.TestCase):
         with mock.patch(RUNNER) as runner:
             for selectors in malformed_selectors:
                 with self.subTest(selectors=selectors), self.assertRaises(ValueError):
-                    probe_writers(selectors=cast("list[str]", selectors), timeout=30)
+                    probe_omp_writers(cast("list[str]", selectors), timeout=30)
             for timeout in malformed_timeouts:
                 with self.subTest(timeout=timeout), self.assertRaises(ValueError):
-                    probe_writers(selectors=[SELECTOR], timeout=cast(float, timeout))
+                    probe_omp_writers([SELECTOR], timeout=cast(float, timeout))
         runner.assert_not_called()
 
 

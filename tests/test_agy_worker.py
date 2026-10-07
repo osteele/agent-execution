@@ -26,8 +26,10 @@ from agent_execution.agy_execution import (
     validate_agy_command,
 )
 from agent_execution.command import CommandResult
+from agent_execution.execution_status import cached_status
 from agent_execution.identity import worker_evidence_path
 from agent_execution.worker import WorkerResult, execute_worker
+from tests.execution_status_fixtures import admitted_status
 
 MODEL = "gemini-3.1-pro-high"
 RESPONSE = "BEGIN-7f3a\nNo blocking findings.\nEND-7f3a"
@@ -121,6 +123,11 @@ class AgyWorkerTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
         self.base = base
+        observer = mock.patch(
+            "agent_execution.execution_status.probe_status", side_effect=admitted_status
+        )
+        observer.start()
+        self.addCleanup(observer.stop)
 
     def run_agy(
         self,
@@ -157,10 +164,6 @@ class AgyWorkerTests(unittest.TestCase):
             (self.root / worker_evidence_path(result.model_call_id)).read_text()
         )
 
-    def published(self) -> list[dict[str, object]]:
-        outbox = self.status_dir / "outbox"
-        return [json.loads(path.read_text()) for path in sorted(outbox.glob("*.json"))]
-
     def test_successful_envelope_completes_and_returns_the_response_text(self) -> None:
         result, calls = self.run_agy(envelope())
         self.assertEqual(result.status, "completed", result.failure)
@@ -176,22 +179,24 @@ class AgyWorkerTests(unittest.TestCase):
         self.assertEqual(agy_final_text(result.harness.stdout), RESPONSE)
         self.assertEqual(self.stored(result), result)
 
-    def test_success_is_published_under_the_antigravity_route_and_model_pool(self) -> None:
+    def test_success_observes_generation_for_the_exact_model_and_billing_pool(self) -> None:
         for model, pool in (
             ("gemini-3.8-flash-high", "google-antigravity/gemini"),
             ("claude-opus-4-6-thinking", "google-antigravity/other"),
         ):
             with self.subTest(model=model):
-                for path in (self.status_dir / "outbox").glob("*.json"):
-                    path.unlink()
                 result, _ = self.run_agy(envelope(), model=model)
                 self.assertEqual(result.status, "completed", result.failure)
-                events = self.published()
-                self.assertEqual(len(events), 1)
-                subject = events[0]["subject"]
-                assert isinstance(subject, dict)
-                self.assertEqual(subject["route"], "google-antigravity")
-                self.assertEqual(subject["billing_pool"], pool)
+                status = cached_status(
+                    harness="agy",
+                    surface="worker",
+                    selectors=[f"google-antigravity/{model}"],
+                    cwd=self.root,
+                )
+                row = status["rows"][0]
+                self.assertEqual(row["subject"]["billing_pool"], pool)
+                self.assertEqual(row["facts"]["generation"]["state"], "available")
+                self.assertEqual(row["facts"]["quota"]["state"], "unknown")
 
     def test_non_success_status_is_a_harness_failure(self) -> None:
         for exit_status in (0, 1):
@@ -430,6 +435,11 @@ class AgyIsolatedHomeTests(unittest.TestCase):
         )
         environment.start()
         self.addCleanup(environment.stop)
+        observer = mock.patch(
+            "agent_execution.execution_status.probe_status", side_effect=admitted_status
+        )
+        observer.start()
+        self.addCleanup(observer.stop)
 
     def execute(self, *, stdout: str, exit_status: int, model_call_id: str) -> WorkerResult:
         prompt = "Review the packet below.\nBEGIN-7f3a ... END-7f3a\n"
