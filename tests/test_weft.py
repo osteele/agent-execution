@@ -131,7 +131,7 @@ class SubmissionLookupTests(unittest.TestCase):
         )
         self.executable.chmod(0o755)
         # These tests read the stub's output, not its timing. macOS scans a
-        # freshly written executable on first exec, measured at ~2.5s on studio,
+        # freshly written executable on first exec, measured at ~2.5s on a worker,
         # so a 1s budget timed out every case there.
         return lookup_submitted_job(KEY, timeout=30, cwd=self.root, executable=str(self.executable))
 
@@ -358,7 +358,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(submitted[submitted.index("--project") + 1], "agent-review")
 
     def test_the_job_reserves_one_core_rather_than_weft_s_default(self) -> None:
-        """Undeclared CPU books 7 of studio's 12 cores, admitting one job at a time."""
+        """Undeclared CPU books 7 of a 12-core worker's cores, admitting one job at a time."""
         self.submissions = [CommandResult(0, receipt(), "")]
         self.run_dispatch()
         submitted = next(argv for argv, _, _ in self.calls if argv[1] == "run")

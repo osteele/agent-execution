@@ -21,7 +21,7 @@ typecheck:
 # ran first rather than a test worth labelling slow — so the load is printed
 # with every run instead of being remembered at the moment a suite goes red.
 # Measured 2026-09-24: one test took 21,496ms at load 272/8 cores and 646ms on
-# studio. See the running-tests skill; offload with `agent-host-sync workspace run`.
+# a remote test host. See the running-tests skill; offload with `agent-host-sync workspace run`.
 load:
     @printf 'load %s on %s cores\n' "$(sysctl -n vm.loadavg | tr -d '{}' | awk '{print $2}')" "$(sysctl -n hw.ncpu)"
 
@@ -40,10 +40,10 @@ check: lint typecheck test
 # agent-execution-worker entry point. Installing it here would relink that name
 # outside the pair.
 
-# Install on Studio through agent-host-sync; account is agent or osteele.
+# Install on the configured remote host; account is agent or osteele.
 deploy account="agent":
     agent-host-sync --account {{account}} apply --stage tools --tool agent-execution
 
-# Show what deploying to Studio would change, without changing anything.
+# Show what the remote deployment would change, without changing anything.
 deploy-status account="agent":
     agent-host-sync --account {{account}} plan --stage tools --tool agent-execution

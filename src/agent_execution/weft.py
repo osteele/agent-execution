@@ -40,7 +40,7 @@ WEFT_INVENTORY_TAG = "inventory"
 WEFT_AUTO_HOST = "auto"
 WEFT_TOOL_CAPABILITY = "tool:agent-execution"
 #: Cores booked per worker job. A job declaring no CPU is booked at Weft's
-#: default of 7 cores, so only one fits studio's 12-core books and the rest
+#: default of 7 cores, so only one fits a 12-core worker and the rest
 #: trickle in through the runner's load path. Workers wait on model APIs: of
 #: 613 sampled jobs, 322 decayed to the runner's ~1.2-core floor and none was
 #: ever raised. An explicit reservation is never reduced, so declare the
@@ -1204,7 +1204,7 @@ class WeftCommandRunner:
         elif worker.status != "completed":
             # Reported by llm-performance-models against wj7222: the record
             # carried one line of `detail` and the bytes that would explain the
-            # crash lived only in a studio-side weft log, which expires. Tails
+            # crash lived only in a worker-side Weft log, which expires. Tails
             # are bounded and kept on the same terms as the local path.
             self._refuse(
                 job_id=job_id,
@@ -1253,9 +1253,9 @@ class WeftCommandRunner:
 
         ``execution["host"]`` is admission-time placement -- the host this
         project requested or the receipt selected. It is not where the job ran:
-        wj6989 was submitted for ``studio``, replanned onto rental ``wi7777``
+        wj6989 was submitted for one host, replanned onto rental ``wi7777``
         after an unplace, and died there with exit 127 while our record still
-        said ``studio``. A consumer reading that field learned our intent and
+        named the requested host. A consumer learned our intent and
         believed it had learned an observation.
 
         The observed host is available on ``weft job list --format json``,
