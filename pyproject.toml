@@ -3,6 +3,7 @@ name = "agent-execution"
 version = "0.1.0"
 description = "Constrained coding-agent execution and optional durable Weft transport"
 requires-python = ">=3.10"
+license = "MIT"
 dependencies = []
 
 [project.scripts]

@@ -35,11 +35,6 @@ omp-runtime:
 
 check: lint typecheck test
 
-# There is no local install recipe: agent-review's paired release and
-# agent-offload's build each bundle this package, and agent-review owns the
-# agent-execution-worker entry point. Installing it here would relink that name
-# outside the pair.
-
 # Install on the configured remote host; account is agent or osteele.
 deploy account="agent":
     agent-host-sync --account {{account}} apply --stage tools --tool agent-execution

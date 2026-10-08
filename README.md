@@ -620,9 +620,6 @@ just test    # unittest suite + bun SDK-policy test
 just check   # lint + typecheck + test
 ```
 
-## Provenance
+## License
 
-Extracted from `agent-review` revision `bafd59657e07`
-(`packages/agent-execution`), with the worker-owned tests
-(`tests/test_worker.py`, `tests/test_omp_install.py`,
-`tests/omp_sdk.test.ts`) and `tests/support/omp.py`.
+MIT. See [LICENSE](LICENSE).

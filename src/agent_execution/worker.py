@@ -1090,10 +1090,8 @@ def execute_worker(
         return detail
 
     if agy_invocation is not None:
-        # The JSON envelope is the evidence. Stdout is kept verbatim, so the
-        # conductor reconstructs the same bytes agent-review's local
-        # AntigravityAdapter unwraps, and its nonce-fenced response extraction
-        # runs unchanged on `response`.
+        # The JSON envelope is the evidence. Stdout is kept verbatim, so a
+        # conductor can unwrap it exactly as it would a local agy run.
         try:
             agy_envelope(command_result.stdout)
         except AgyStatusError as error:

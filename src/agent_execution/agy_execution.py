@@ -6,10 +6,6 @@ policy, ``packet-only-no-tools``. A tool-enabled `agy` (grounded read-only
 review, or writing) is out of scope: read-only enforcement would need its own
 design, and nothing here approximates it.
 
-The design follows agent-review's ``AntigravityAdapter`` and
-``antigravity_reviewer_home``. It is ported, not imported: agent-execution must
-not import agent-review.
-
 - Command: ``agy -p BRIEF --output-format json --print-timeout Ns
   --disable-slash-commands --model M``. A finite print timeout is required.
   ``--mode plan`` is refused because it suppresses the final message.
@@ -30,11 +26,6 @@ not import agent-review.
   ``status`` is ``SUCCESS``, ``response`` is non-empty, and ``num_turns`` is
   positive. A print timeout returns ``SUCCESS`` with ``num_turns`` 0 and an
   empty response, which the turn check refuses.
-
-The home layout and hook format follow agent-review's measured
-``antigravity_reviewer_home`` (``adapters.py``), which found the user's MCP
-servers (a browser, agent mail) offered to the model through
-``.gemini/config``.
 
 Containment rests on the home alone: the deny-all hook, the empty MCP
 configuration, and the rules file. The envelope cannot confirm it. Probed on
@@ -175,9 +166,8 @@ _VALUE_FLAGS = frozenset(
     }
 )
 _BOOLEAN_FLAGS = frozenset({"--disable-slash-commands"})
-#: Flags agent-review deliberately does not use. Refused by name so the
-#: diagnostic says why: plan mode suppresses the final message, and skipping
-#: permissions approves writes.
+#: Refused by name so the diagnostic says why: plan mode suppresses the final
+#: message, and skipping permissions approves writes.
 _REFUSED_FLAGS = frozenset({"--mode", "--dangerously-skip-permissions"})
 
 

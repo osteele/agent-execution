@@ -871,9 +871,9 @@ class WeftCommandRunner:
         The worker artifact was read and judged, which is everything consuming
         it means: reading it again yields the same verdict, and recovery is
         keyed on the consumer's own record of the job id, never on Weft's
-        unprocessed queue (agent-review decision 0050: a proven bad result is
-        terminal). Left unmarked, every refusal stayed in that queue for good
-        -- 258 of 332 unprocessed agent-execution jobs on 2026-10-02 (ax3).
+        unprocessed queue (a proven bad result is terminal). Left unmarked,
+        every refusal stayed in that queue for good -- 258 of 332 unprocessed
+        agent-execution jobs on 2026-10-02 (ax3).
 
         ``processing`` keeps the refusal, because consumers classify failures
         by its ``not_marked`` state and step; the Weft acknowledgment is
