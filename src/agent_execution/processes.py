@@ -27,6 +27,8 @@ whether any exist.
 from __future__ import annotations
 
 import atexit
+import codecs
+import io
 import os
 import selectors
 import signal
@@ -43,6 +45,7 @@ from pathlib import Path
 from typing import IO, cast
 
 from agent_execution import env
+from agent_execution.budget import BudgetClock
 from agent_execution.timing import current_boot_id
 
 #: Seconds a signalled group is given to exit on SIGTERM before SIGKILL.
@@ -157,6 +160,56 @@ class ProcessIdentity:
     process_started_at: float | None
 
 
+class BudgetedCompletedProcess(subprocess.CompletedProcess):
+    """A completed harness result that may carry renewable-budget telemetry.
+
+    ``budget`` is ``None`` unless the run was given a ``BudgetClock``. A typed
+    carrier keeps that telemetry out of ad-hoc attributes while every
+    existing ``CompletedProcess`` contract — field access, equality — holds
+    unchanged for callers that never used a budget. The subscription-free
+    base is deliberate: ``CompletedProcess`` is generic only in type stubs,
+    and a runtime subscript would break this import.
+    """
+
+    budget: dict[str, object] | None
+    stdout: str
+    stderr: str
+
+    def __init__(
+        self,
+        args: Sequence[str],
+        returncode: int,
+        stdout: str = "",
+        stderr: str = "",
+        *,
+        budget: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(args, returncode, stdout, stderr)
+        self.budget = budget
+
+
+class BudgetTimeoutExpired(subprocess.TimeoutExpired):
+    """A harness timeout that may carry renewable-budget telemetry.
+
+    Subclassing keeps every existing ``TimeoutExpired`` handler — output
+    salvage, the 124 exit-status convention, group cleanup — working
+    unchanged, while the recorded budget decision rides along in a typed
+    field instead of a dynamic attribute.
+    """
+
+    def __init__(
+        self,
+        cmd: Sequence[str],
+        timeout: float,
+        output: str | bytes | None = None,
+        stderr: str | bytes | None = None,
+        *,
+        budget: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(cmd, timeout, output, stderr)
+        self.budget = budget
+
+
 def process_started_at(pid: int) -> float | None:
     """Read a process's kernel-reported start time through the public ``ps`` interface."""
     try:
@@ -177,15 +230,90 @@ def process_started_at(pid: int) -> float | None:
     return local.timestamp()
 
 
-def _drain(stream: object, sink: list[str]) -> None:
+#: Bytes requested per background drain read. Buffered ``read1`` returns what
+#: one underlying read made available, so a short flushed event is not withheld
+#: until the buffer fills or EOF.
+DRAIN_READ_CHARS = 65_536
+
+#: Longest line delivered to an output observer. Confined OMP write/edit tools
+#: accept 2 MiB of file content, JSON-escaped inside one event line, so the
+#: bound sits above that envelope. A longer unterminated run keeps every byte
+#: in the sink but is not delivered as a single line.
+MAX_OBSERVED_LINE_CHARS = 24 * 1024 * 1024
+
+
+def _drain(stream: object, sink: list[str], on_line: Callable[[str], None] | None = None) -> None:
     """Collect one pipe to EOF in the background.
 
     Runs in a thread so the caller can stop waiting on it, which is what keeps a
     descendant holding the pipe from extending a finished call.
+
+    With an observer, every complete newline-terminated line is delivered as
+    soon as it arrives: reads use ``read1`` where the stream offers it, so a
+    short flushed event is not withheld until a full read buffer or EOF.
+    Fragmented and multibyte lines are reassembled once, without repeated
+    concatenation. Captured text preserves the process owner's newline and
+    UTF-8 decoding semantics; no output is dropped from the sink or delivered
+    to the observer twice.
     """
     reader = cast("IO[str]", stream)
     try:
-        sink.append(reader.read())
+        if on_line is None:
+            sink.append(reader.read())
+        else:
+            # Pipes are TextIOWrapper objects. Read available bytes rather than
+            # blocking in TextIOWrapper.read(size) until size or EOF. A text-only
+            # reader (including StringIO) uses its ordinary bounded read.
+            binary: io.BufferedReader | None = None
+            if isinstance(reader, io.TextIOWrapper) and isinstance(
+                reader.buffer, io.BufferedReader
+            ):
+                binary = reader.buffer
+            newline_decoder = io.IncrementalNewlineDecoder(
+                codecs.getincrementaldecoder("utf-8")("replace"), translate=True
+            )
+            pending: list[str] = []
+            pending_length = 0
+            discarding = False
+
+            def accept(chunk: str) -> None:
+                nonlocal pending_length, discarding
+                if not chunk:
+                    return
+                sink.append(chunk)
+                segments = chunk.split("\n")
+                for index, segment in enumerate(segments):
+                    if not discarding:
+                        pending_length += len(segment)
+                        if pending_length <= MAX_OBSERVED_LINE_CHARS:
+                            pending.append(segment)
+                        else:
+                            pending.clear()
+                            discarding = True
+                    if index < len(segments) - 1:
+                        if not discarding:
+                            on_line("".join(pending))
+                        pending.clear()
+                        pending_length = 0
+                        discarding = False
+
+            while True:
+                data = b""
+                if binary is None:
+                    chunk = reader.read(DRAIN_READ_CHARS)
+                else:
+                    data = binary.read1(DRAIN_READ_CHARS)
+                    chunk = newline_decoder.decode(data) if data else ""
+                if not chunk:
+                    if binary is not None and data:
+                        continue  # An incomplete UTF-8 sequence or CR at a chunk boundary.
+                    break
+                accept(chunk)
+            if binary is not None:
+                accept(newline_decoder.decode(b"", final=True))
+            # A trailing newline leaves an empty segment, not another line.
+            if pending_length > 0 and not discarding:
+                on_line("".join(pending))
     except (OSError, ValueError):
         pass
     finally:
@@ -465,7 +593,9 @@ def run_in_process_group(
     hold_before_exec: bool = False,
     on_resource_sample: Callable[[Mapping[str, object]], None] | None = None,
     environment: Mapping[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
+    budget_clock: BudgetClock | None = None,
+    on_output_line: Callable[[str], None] | None = None,
+) -> BudgetedCompletedProcess:
     """Run a harness in its own process group, then account for the whole group.
 
     Raises ``subprocess.TimeoutExpired`` on timeout, as ``subprocess.run`` does,
@@ -474,7 +604,21 @@ def run_in_process_group(
     ``environment`` replaces the inherited environment when given; a harness
     that must see an isolated HOME gets it here rather than from a caller's
     ``env HOME=...`` prefix.
+
+    ``budget_clock`` replaces the fixed deadline with a renewable one. The
+    owner loop asks the clock for the remaining budget, and only a decision
+    the clock records — an extension, or a refusal for no recent progress or
+    the absolute cap — may end the attempt as a timeout. The completed result
+    (or the raised ``BudgetTimeoutExpired``) carries the clock's versioned
+    telemetry. ``on_output_line`` receives each complete stdout line as it
+    arrives, which is how an observer turns parsed harness evidence into
+    recorded progress.
     """
+    if budget_clock is not None:
+        if not isinstance(budget_clock, BudgetClock):
+            raise ValueError("budget_clock must be a BudgetClock")
+        if timeout is not None:
+            raise ValueError("renewable budget conflicts with fixed timeout")
     release_read: int | None = None
     release_write: int | None = None
     launch_command = list(command)
@@ -539,7 +683,11 @@ def run_in_process_group(
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     readers = (
-        threading.Thread(target=_drain, args=(process.stdout, stdout_parts), daemon=True),
+        threading.Thread(
+            target=_drain,
+            args=(process.stdout, stdout_parts, on_output_line),
+            daemon=True,
+        ),
         threading.Thread(target=_drain, args=(process.stderr, stderr_parts), daemon=True),
     )
     for reader in readers:
@@ -587,6 +735,8 @@ def run_in_process_group(
                     resource_observation_error = f"{type(error).__name__}: {error}"
 
     deadline = None if timeout is None else time.monotonic() + timeout
+    if budget_clock is not None:
+        deadline = time.monotonic() + budget_clock.remaining()
     try:
         if process.stdin is not None:
             try:
@@ -622,20 +772,39 @@ def run_in_process_group(
         # output pipes, so completion is still defined by the direct child.
         sample_resources()
         while True:
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                kill_kind = _terminate_group(pgid, grace_seconds)
-                timed_out = True
-                process.wait()
-                break
+            if budget_clock is not None:
+                # Only a decision recorded by the clock may end a renewable
+                # attempt, so the refusal or cap a termination reports is the
+                # one the clock actually made.
+                remaining_budget = budget_clock.remaining()
+                deadline = time.monotonic() + remaining_budget
+                if remaining_budget <= 0:
+                    kill_kind = _terminate_group(pgid, grace_seconds)
+                    timed_out = True
+                    process.wait()
+                    break
+                wait_seconds = min(RESOURCE_SAMPLE_SECONDS, remaining_budget)
+            else:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    kill_kind = _terminate_group(pgid, grace_seconds)
+                    timed_out = True
+                    process.wait()
+                    break
+                if remaining is None:
+                    wait_seconds = RESOURCE_SAMPLE_SECONDS
+                else:
+                    wait_seconds = min(RESOURCE_SAMPLE_SECONDS, remaining)
             try:
-                process.wait(
-                    timeout=RESOURCE_SAMPLE_SECONDS
-                    if remaining is None
-                    else min(RESOURCE_SAMPLE_SECONDS, remaining)
-                )
+                process.wait(timeout=wait_seconds)
                 break
             except subprocess.TimeoutExpired:
+                if budget_clock is not None:
+                    # The next remaining() decides: extend on qualifying
+                    # evidence recorded since the last decision, refuse
+                    # without it, and stop at the absolute cap either way.
+                    sample_resources()
+                    continue
                 if deadline is not None and time.monotonic() >= deadline:
                     kill_kind = _terminate_group(pgid, grace_seconds)
                     timed_out = True
@@ -681,9 +850,31 @@ def run_in_process_group(
         _live.discard(pgid)
     stdout = "".join(stdout_parts)
     stderr = "".join(stderr_parts)
+    budget_stats = budget_clock.stats() if budget_clock is not None else None
     if timed_out:
-        assert timeout is not None
-        raise subprocess.TimeoutExpired(
-            cmd=list(command), timeout=timeout, output=stdout, stderr=stderr
+        if timeout is not None:
+            reported_timeout = timeout
+        elif budget_clock is not None:
+            reported_timeout = float(budget_clock.policy.initial_seconds)
+        else:
+            raise RuntimeError("timeout without a deadline")
+        if budget_stats is None:
+            # No renewable policy: the legacy hard deadline raises the exact
+            # exception type it always has.
+            raise subprocess.TimeoutExpired(
+                cmd=list(command), timeout=reported_timeout, output=stdout, stderr=stderr
+            )
+        raise BudgetTimeoutExpired(
+            cmd=list(command),
+            timeout=reported_timeout,
+            output=stdout,
+            stderr=stderr,
+            budget=budget_stats,
         )
-    return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
+    return BudgetedCompletedProcess(
+        list(command),
+        process.returncode,
+        stdout,
+        stderr,
+        budget=budget_stats,
+    )

@@ -160,6 +160,98 @@ and `evidence_failed` are distinct failures, not usable successful output.
 Each run above deliberately creates a new logical call; orchestration code must
 retain and reconcile an existing call identity rather than rerunning it blindly.
 
+## Renewable execution budgets
+
+A fixed harness deadline kills productive writers mid-work. A renewable budget
+replaces it: the attempt starts with `initial_seconds`, the deadline extends by
+`extension_seconds` whenever qualifying progress is younger than
+`progress_window_seconds`, and `max_seconds` is absolute: continuous progress
+never runs past it. Nothing resumes a terminated attempt, retries a call, or
+falls back to another provider. Import the policy from
+`agent_execution.budget`, not the package root:
+
+```python
+import json
+from pathlib import Path
+from uuid import uuid4
+
+from agent_execution.budget import RenewableBudget
+from agent_execution.worker import execute_worker
+
+budget = RenewableBudget(
+    initial_seconds=3600.0,         # first deadline
+    extension_seconds=1800.0,       # granted per qualifying renewal
+    progress_window_seconds=900.0,  # evidence older than this never renews
+    max_seconds=14400.0,            # absolute cap; continuous progress cannot pass it
+)
+call_id = f"offload-{uuid4().hex}"
+brief = "Refactor the reporting module and summarize the change."
+command = [
+    "omp", "-p", brief,  # inline delivery; a `-p -` payload works identically
+    "--mode", "json", "--cwd", ".",
+    "--model", "zhipu-coding-plan/glm-5.3-flash",
+    "--execution-tool-policy", "workspace-write-no-shell",
+]
+result = execute_worker(
+    provider="omp",
+    model_call_id=call_id,
+    command=command,
+    cwd=Path.cwd(),
+    timeout=None,                    # a renewable budget replaces the fixed deadline
+    renewable_budget=budget,
+    ctx_timeout=30.0,
+)
+telemetry = result.budget
+if isinstance(telemetry, dict):
+    print(json.dumps(telemetry, indent=2, sort_keys=True))
+```
+
+Admission rules, enforced at preflight before any model launch:
+
+- The provider must be `omp` running the `workspace-write-no-shell` policy;
+  `omp-packet`, read-only OMP, `agy`, `claude`, and `claude-packet` are refused.
+- `timeout` must be `None`; a fixed deadline and a renewable budget together
+  are a preflight refusal, not a silently ignored policy.
+- Both prompt delivery paths work with the default runners: an inline `-p TEXT`
+  command and a stdin payload (`-p -` with `prompt_payload`). Renewable calls
+  with an injected `invoke` or `invoke_prompt` runner refuse before launch;
+  fixed calls retain their existing runner injection behavior and hard timeout.
+- The `worker` CLI exposes the same policy as four flags that must appear
+  together (`--renewable-initial-seconds`, `--renewable-extension-seconds`,
+  `--renewable-progress-window-seconds`, `--renewable-max-seconds`) and
+  without `--timeout`.
+
+Qualifying progress is observed only from the restricted tool events on the
+native OMP stream, correlated by `toolCallId` between `tool_execution_start`
+(which carries `args`) and `tool_execution_end` (which carries `result` and an
+explicit `isError`, and no arguments):
+
+- A completed successful `execution_write` or `execution_edit` qualifies; the
+  confined tools refuse no-op writes, so success means changed bytes, and the
+  distinct files it reports are counted once each per attempt.
+- Any other restricted tool qualifies only when its exact arguments were never
+  seen before in this attempt, so an identical repeated read renews once and
+  then stops.
+- Token text, heartbeats, repeated identical inputs, failed tools, duplicate
+  completions, and unknown tools never renew. Reaching an observation bound is
+  conservative: further events stop renewing rather than growing memory.
+
+Every attempt reports versioned telemetry in `WorkerResult.budget` on both
+ordinary completion and exhaustion, containing the frozen `policy`,
+the monotonic `duration_seconds`, `termination_reason` (`completed`,
+`absolute_cap`, or `no_recent_progress`), bounded `decisions` entries with
+`evidence_age_seconds`, `qualifying_progress_count`, and the distinct
+`changed_file_count`. `WorkerResult.parse` validates the telemetry and refuses
+malformed records; results from before renewable budgets carry none and are
+never invented. Exhaustion keeps the salvaged partial output, the group
+cleanup, and the `harness_failed` status, with the stderr fallback naming
+whether the attempt stopped at the cap or for lack of recent progress.
+
+Reserve enclosing job time for the absolute cap, process-group cleanup, evidence
+collection, validation, and publication. Offload uses `ceil(max_seconds) + 1020`
+seconds, including up to 900 seconds for its check. Its default four-hour cap
+therefore reserves a 4h17m Weft slot.
+
 ## Requirements
 
 - Python >= 3.10; the package is standard-library-only.
@@ -187,6 +279,7 @@ retain and reconcile an existing call identity rather than rerunning it blindly.
 |---|---|---|
 | `agent_execution.execution_status` | `probe_status`, `cached_status`, `probe_remote_status`, `validate_status` | Query the actual executor and exact context; preserve unknown and stale facts. |
 | `agent_execution.worker` | `execute_worker`, `WorkerResult.parse`, `installed_worker_identity` | Supply the provider, command, unique call ID, deadlines, and retained protocol/source expectations; interpret the returned status and evidence. |
+| `agent_execution.budget` | `RenewableBudget`, `BudgetClock`, `validate_budget_stats` | Supply the policy to `execute_worker(..., renewable_budget=...)` with `timeout=None`; interpret `WorkerResult.budget`. |
 | `agent_execution.identity` | `worker_evidence_path`, `source_worker_executable` | Retain the dispatched evidence path and source-addressed executable with the request. |
 | `agent_execution.weft` | `WeftCommandRunner`, `WeftRunReceipt.parse` | Persist dispatch identity, reconcile accepted or ambiguous work, and acknowledge only after durable consumption. |
 | `agent_execution.command` | `CommandResult.mark_consumed`, `CommandResult.acknowledge_refusal` | Validate and durably record acceptance or refusal before acknowledging. |
@@ -395,7 +488,10 @@ deny-all hook is the only enforcement known to work.
 `agent_execution.processes.run_in_process_group` sends prompt strings as UTF-8
 stdin bytes, independent of the host locale or text-stream encoding. Prompt
 delivery shares the harness completion deadline, including when a child does
-not read its input pipe.
+not read its input pipe. Passing a `agent_execution.budget.BudgetClock`
+replaces the fixed deadline with a renewable one; the completed result (or the
+raised `BudgetTimeoutExpired`) then carries that attempt's versioned budget
+telemetry.
 
 ## Worker evidence
 

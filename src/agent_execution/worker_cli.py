@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from agent_execution.agy_execution import AGY_MODELS
+from agent_execution.budget import RenewableBudget
 from agent_execution.credentials import observe_credential_basis
 from agent_execution.execution_status import add_status_parser, probe_status, run_status
 from agent_execution.identity import worker_evidence_path
@@ -51,6 +52,10 @@ def _parser() -> argparse.ArgumentParser:
     execute.add_argument("--requester-host")
     execute.add_argument("--requester-user")
     execute.add_argument("--ctx-timeout", type=float, default=120.0)
+    execute.add_argument("--renewable-initial-seconds", type=float)
+    execute.add_argument("--renewable-extension-seconds", type=float)
+    execute.add_argument("--renewable-progress-window-seconds", type=float)
+    execute.add_argument("--renewable-max-seconds", type=float)
     execute.add_argument("--expect-protocol", type=int)
     execute.add_argument("--expect-source-sha256")
     execute.add_argument("--prompt-payload")
@@ -137,6 +142,25 @@ def probe_worker(
     }
 
 
+def _renewable_budget(args: argparse.Namespace) -> RenewableBudget | None:
+    """Build the typed renewable policy from its four required-together flags."""
+    values = {
+        "initial_seconds": args.renewable_initial_seconds,
+        "extension_seconds": args.renewable_extension_seconds,
+        "progress_window_seconds": args.renewable_progress_window_seconds,
+        "max_seconds": args.renewable_max_seconds,
+    }
+    given = {name: value for name, value in values.items() if value is not None}
+    if not given:
+        return None
+    if len(given) != len(values):
+        raise ValueError("renewable budgets require all four --renewable-*-seconds flags")
+    try:
+        return RenewableBudget(**given)
+    except ValueError as error:
+        raise ValueError(f"invalid renewable budget: {error}") from error
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     install_termination_guard()
@@ -188,6 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             command=command,
             timeout=args.timeout,
             ctx_timeout=args.ctx_timeout,
+            renewable_budget=_renewable_budget(args),
             max_cost_usd=args.max_cost_usd,
             execution_transport=args.execution_transport,
             requester_host=args.requester_host,

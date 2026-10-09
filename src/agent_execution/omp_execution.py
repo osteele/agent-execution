@@ -8,6 +8,7 @@ unrestricted CLI. The dependency root is provisioned only by the explicit runtim
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -20,9 +21,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from subprocess import CompletedProcess
-
-    from agent_execution.processes import ProcessIdentity
+    from agent_execution.budget import BudgetClock, RenewableBudget
+    from agent_execution.processes import BudgetedCompletedProcess, ProcessIdentity
 
 OMP_SDK_VERSION = "18.4.4"
 #: Earlier pins whose stored transcripts must stay retrievable. A bump moves the
@@ -78,6 +78,19 @@ OMP_TOKEN_BILLING_KEYS = (
 )
 OMP_READ_TOOLS = ("execution_read", "execution_glob", "execution_grep")
 OMP_WRITE_TOOLS = (*OMP_READ_TOOLS, "execution_write", "execution_edit")
+#: Confined tools that change bytes on success. The policy's write/edit tools
+#: refuse no-op writes, so a successful completion is proof of a source change
+#: even when identical arguments ran earlier after an intervening edit — and
+#: never needs an input-novelty check.
+OMP_CHANGE_TOOLS = frozenset({"execution_write", "execution_edit"})
+#: Renewable-budget observation bounds. A hostile or looping event stream
+#: cannot grow observer memory past these. Reaching a bound is conservative —
+#: further events stop renewing — and never drops event bytes, which stay in
+#: the captured output regardless.
+MAX_PENDING_TOOL_CALLS = 256
+MAX_FINISHED_TOOL_CALLS = 4096
+MAX_SEEN_TOOL_INPUTS = 8192
+MAX_CHANGED_PATHS = 8192
 _PACKET = "packet-only-no-tools"
 _GROUNDED = "read-only-no-shell"
 _WRITER = "workspace-write-no-shell"
@@ -353,6 +366,104 @@ def validate_omp_command(
     return OmpInvocation(selector, policy, prompt, values.get("--system-prompt", ""))
 
 
+def _tool_input_fingerprint(tool_name: str, arguments: Mapping[str, object]) -> str:
+    """Digest a tool name with its canonical arguments for novelty checks."""
+    canonical = json.dumps([tool_name, arguments], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _count_changed_paths(details: object, changed_paths: set[str]) -> int:
+    """How many previously unseen paths one successful write reports changing."""
+    if not isinstance(details, dict):
+        return 0
+    paths = details.get("paths")
+    if not isinstance(paths, list):
+        return 0
+    changed = 0
+    for path in paths:
+        if not isinstance(path, str) or not path:
+            continue
+        digest = hashlib.sha256(path.encode()).hexdigest()
+        if digest in changed_paths or len(changed_paths) >= MAX_CHANGED_PATHS:
+            continue
+        changed_paths.add(digest)
+        changed += 1
+    return changed
+
+
+def _renewal_observer(budget: BudgetClock) -> Callable[[str], None]:
+    """Build the stdout observer that records qualifying budget progress.
+
+    Only restricted tool lifecycle events qualify, correlated by
+    ``toolCallId`` between ``tool_execution_start`` — which alone carries
+    ``args`` — and ``tool_execution_end``, which carries ``result`` and an
+    explicit ``isError`` and no arguments. A successful write or edit is
+    changed bytes by construction and always qualifies, counting the distinct
+    files it reports. Every other restricted tool qualifies only when its
+    exact input was never seen in this attempt, so an identical repeated read
+    renews once and then stops. Token text, heartbeats, failures, duplicate
+    completions, and untracked tools never renew.
+    """
+    pending: dict[str, tuple[str, str | None]] = {}
+    finished: set[str] = set()
+    seen_inputs: set[str] = set()
+    changed_paths: set[str] = set()
+
+    def observe(line: str) -> None:
+        try:
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                return
+            call_id = event.get("toolCallId")
+            if not isinstance(call_id, str):
+                return
+            kind = event.get("type")
+            if kind == "tool_execution_start":
+                if (
+                    call_id in finished
+                    or len(finished) >= MAX_FINISHED_TOOL_CALLS
+                    or len(pending) >= MAX_PENDING_TOOL_CALLS
+                ):
+                    return
+                tool_name = event.get("toolName")
+                arguments = event.get("args")
+                if (
+                    not isinstance(tool_name, str)
+                    or tool_name not in OMP_WRITE_TOOLS
+                    or not isinstance(arguments, dict)
+                ):
+                    return
+                fingerprint: str | None = None
+                if tool_name in OMP_READ_TOOLS:
+                    fingerprint = _tool_input_fingerprint(tool_name, arguments)
+                pending[call_id] = (tool_name, fingerprint)
+            elif kind == "tool_execution_end":
+                record = pending.pop(call_id, None)
+                if record is None or call_id in finished:
+                    return
+                finished.add(call_id)
+                tool_name, fingerprint = record
+                if event.get("toolName") != tool_name or event.get("isError") is not False:
+                    return
+                result = event.get("result")
+                if not isinstance(result, dict) or not isinstance(result.get("content"), list):
+                    return
+                if fingerprint is not None and (
+                    fingerprint in seen_inputs or len(seen_inputs) >= MAX_SEEN_TOOL_INPUTS
+                ):
+                    return
+                if fingerprint is not None:
+                    seen_inputs.add(fingerprint)
+                changed = 0
+                if tool_name in OMP_CHANGE_TOOLS:
+                    changed = _count_changed_paths(result.get("details"), changed_paths)
+                budget.progress(changed_files=changed)
+        except (ValueError, TypeError, RecursionError):
+            return
+
+    return observe
+
+
 def run_omp_command(
     command: list[str],
     cwd: Path,
@@ -362,10 +473,23 @@ def run_omp_command(
     on_spawn: Callable[[ProcessIdentity], None] | None = None,
     hold_before_exec: bool = False,
     on_resource_sample: Callable[[Mapping[str, object]], None] | None = None,
-) -> CompletedProcess[str]:
+    renewable_budget: RenewableBudget | None = None,
+) -> BudgetedCompletedProcess:
+    """Run a validated restricted OMP invocation in its own process group.
+
+    With ``renewable_budget``, the native tool-event stream is observed and
+    qualifying evidence renews the attempt through one ``BudgetClock`` that
+    ``run_in_process_group`` owns; the raised ``BudgetTimeoutExpired`` (or the
+    completed result) carries the versioned budget telemetry. Renewable
+    budgets are refused for every other tool policy before launch, because
+    qualifying progress is not observable there.
+    """
+    from agent_execution.budget import BudgetClock
     from agent_execution.processes import run_in_process_group
 
     invocation = validate_omp_command(command, cwd)
+    if renewable_budget is not None and invocation.policy != _WRITER:
+        raise ValueError("renewable budgets require OMP workspace-write-no-shell")
     root, bun = require_omp_sdk()
     resolved_prompt = invocation.prompt if prompt is None else prompt
     if prompt is not None and invocation.prompt != "-":
@@ -384,6 +508,7 @@ def run_omp_command(
         invocation.policy,
         invocation.system_prompt,
     ]
+    budget_clock = BudgetClock(renewable_budget) if renewable_budget is not None else None
     return run_in_process_group(
         launch,
         cwd,
@@ -392,6 +517,8 @@ def run_omp_command(
         on_spawn=on_spawn,
         hold_before_exec=hold_before_exec,
         on_resource_sample=on_resource_sample,
+        budget_clock=budget_clock,
+        on_output_line=None if budget_clock is None else _renewal_observer(budget_clock),
     )
 
 

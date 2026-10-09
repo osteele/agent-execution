@@ -49,6 +49,36 @@ value ProbeObservation {
     observed: String
 }
 
+value RenewableBudget {
+    initial_seconds: Duration
+    extension_seconds: Duration
+    progress_window_seconds: Duration
+    max_seconds: Duration
+
+    invariant PositiveAndOrdered {
+        -- Every value is finite and positive, and none exceeds the absolute cap.
+        initial_seconds <= max_seconds
+        extension_seconds <= max_seconds
+        progress_window_seconds <= max_seconds
+    }
+}
+
+value BudgetTelemetry {
+    -- Versioned per-attempt record carried by a WorkerResult that ran under a
+    -- RenewableBudget, on ordinary completion as well as on exhaustion.
+    schema_version: Integer
+    policy: RenewableBudget
+    duration_seconds: Duration
+    termination_reason: completed | absolute_cap | no_recent_progress
+    decisions: List {
+        at_seconds: Duration
+        evidence_age_seconds: Duration?
+        decision: extended | absolute_cap | no_recent_progress
+    }
+    qualifying_progress_count: Integer
+    changed_file_count: Integer
+}
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -59,6 +89,7 @@ entity Dispatch {
     command_executable: String
     ceiling_usd: Decimal?
     deadline: Duration?
+    renewable_budget: RenewableBudget?
     expected_protocol: Integer?
     expected_source_digest: String?
     expected_prompt_digest: String?
@@ -119,6 +150,7 @@ entity WorkerResult {
     failure_detail: String
     provider_may_have_run: Boolean
     provider_session: String?
+    budget_telemetry: BudgetTelemetry?
 
     is_final: status in {completed, preflight_failed, harness_failed, evidence_failed}
 }
@@ -263,6 +295,44 @@ rule HarnessDeadlineExceeded {
             provider_session: null
         )
         d.result = result
+}
+
+rule RenewableBudgetRequiresObservableProgress {
+    when: d: Dispatch.checked
+    requires: d.renewable_budget != null
+
+    ensures:
+        d.provider = omp
+        d.harness_policy = workspace_write_no_shell
+        d.deadline = null
+
+    @guidance
+        -- A renewable budget is admitted only where qualifying progress is
+        -- observable: the confined OMP writer tools. Any other provider or
+        -- policy, an untyped policy object, or a fixed deadline alongside the
+        -- budget is a preflight refusal before any model launch — never a
+        -- silently ignored policy.
+}
+
+rule RenewableBudgetExtensionAndCap {
+    when: d: Dispatch.checked
+    requires: d.renewable_budget != null
+    requires: d.harness_exceeded_deadline
+
+    ensures:
+        d.result.budget_telemetry.termination_reason in {absolute_cap, no_recent_progress}
+        d.result.budget_telemetry.duration_seconds <= d.renewable_budget.max_seconds
+
+    @guidance
+        -- The deadline extends by extension_seconds only while qualifying
+        -- evidence — a successful confined write or edit, or a novel
+        -- successful restricted tool completion — is younger than
+        -- progress_window_seconds, and one observation cannot renew twice.
+        -- Token text, heartbeats, repeated identical reads, repeated
+        -- failures, and no-op writes never renew. The absolute cap wins even
+        -- with continuous progress. All durations are monotonic. Output
+        -- salvage, group termination, reaping, and cleanup are unchanged, and
+        -- nothing resumes the terminated attempt.
 }
 
 rule HarnessFailureAttributed {

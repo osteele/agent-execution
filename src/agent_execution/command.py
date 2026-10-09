@@ -25,6 +25,9 @@ class CommandResult:
     consumed: Callable[[], None] | None = None
     worker_result: WorkerResult | None = None
     refused: Callable[[], None] | None = None
+    #: Versioned renewable-budget telemetry from the process owner, present
+    #: only when the call ran under an ``agent_execution.budget.RenewableBudget``.
+    budget: dict[str, object] | None = None
 
     def mark_consumed(self) -> None:
         """Acknowledge only after the consumer validates and durably records output."""

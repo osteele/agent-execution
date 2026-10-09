@@ -32,6 +32,7 @@ from agent_execution.agy_execution import (
     run_agy_command,
     validate_agy_command,
 )
+from agent_execution.budget import RenewableBudget, validate_budget_stats
 from agent_execution.claude_execution import (
     ClaudeInvocation,
     ClaudeStatusError,
@@ -49,7 +50,11 @@ from agent_execution.omp_execution import (
     validate_omp_command,
     validate_omp_transcript,
 )
-from agent_execution.processes import run_in_process_group
+from agent_execution.processes import (
+    BudgetedCompletedProcess,
+    BudgetTimeoutExpired,
+    run_in_process_group,
+)
 from agent_execution.worker_transcript import validate_ctx_transcript
 
 WORKER_IDENTITY_SCHEMA = "agent-execution.worker-identity/v1"
@@ -225,16 +230,38 @@ def installed_worker_identity(*, source_sha256: str | None = None) -> WorkerIden
 
 
 def run_command_with_prompt(
-    command: list[str], cwd: Path, prompt: str, timeout: float | None
+    command: list[str],
+    cwd: Path,
+    prompt: str,
+    timeout: float | None,
+    *,
+    renewable_budget: RenewableBudget | None = None,
 ) -> CommandResult:
     """Run a harness with prompt bytes on stdin and process-group cleanup.
 
     `agy` is the exception: whether `agy -p` reads stdin is unverified, so its
     launcher puts the payload back on argv in place of the `-` marker.
+
+    A renewable budget is refused here for every non-OMP harness, before any
+    process starts: an unsupported route must not fall back to silently
+    ignoring the policy.
     """
+    if renewable_budget is not None and (not command or Path(command[0]).name != "omp"):
+        raise ValueError("renewable budgets are supported only for OMP workspace-write-no-shell")
     if command and Path(command[0]).name == "omp":
-        completed = run_omp_command(command, cwd, timeout, prompt=prompt)
-        return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+        completed = run_omp_command(
+            command,
+            cwd,
+            timeout,
+            prompt=prompt,
+            renewable_budget=renewable_budget,
+        )
+        return CommandResult(
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            budget=_budget_telemetry(completed),
+        )
     if command and Path(command[0]).name == "agy":
         completed = run_agy_command(command, cwd, timeout, prompt=prompt)
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
@@ -242,26 +269,63 @@ def run_command_with_prompt(
         completed = run_claude_command(command, cwd, timeout, prompt=prompt)
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
     completed = run_in_process_group(command, cwd, prompt, timeout)
-    return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+    return CommandResult(
+        completed.returncode,
+        completed.stdout,
+        completed.stderr,
+        budget=_budget_telemetry(completed),
+    )
 
 
-def run_worker_command(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
+def run_worker_command(
+    command: list[str],
+    cwd: Path,
+    timeout: float | None,
+    *,
+    renewable_budget: RenewableBudget | None = None,
+) -> CommandResult:
     """Run a worker helper with the same process-group cleanup as the harness.
 
     A timed-out ctx process may leave descendants holding its output pipes. A
     direct-child timeout can then hang while collecting output and keep the
     enclosing Weft slot occupied after the evidence deadline.
+
+    A renewable budget is refused here for every non-OMP helper, before any
+    process starts.
     """
     name = Path(command[0]).name if command else ""
+    if renewable_budget is not None and name != "omp":
+        raise ValueError("renewable budgets are supported only for OMP workspace-write-no-shell")
     if name == "omp":
-        completed = run_omp_command(command, cwd, timeout)
-    elif name == "agy":
+        completed = run_omp_command(command, cwd, timeout, renewable_budget=renewable_budget)
+        return CommandResult(
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            budget=_budget_telemetry(completed),
+        )
+    if name == "agy":
         completed = run_agy_command(command, cwd, timeout)
-    elif name == "claude":
+        return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+    if name == "claude":
         completed = run_claude_command(command, cwd, timeout)
-    else:
-        completed = run_in_process_group(command, cwd, "", timeout)
-    return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+        return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+    completed = run_in_process_group(command, cwd, "", timeout)
+    return CommandResult(
+        completed.returncode,
+        completed.stdout,
+        completed.stderr,
+        budget=_budget_telemetry(completed),
+    )
+
+
+def _budget_telemetry(
+    completed: subprocess.CompletedProcess[str] | BudgetedCompletedProcess,
+) -> dict[str, object] | None:
+    """Typed budget telemetry from a process-owner result, when one ran."""
+    if isinstance(completed, BudgetedCompletedProcess):
+        return completed.budget
+    return None
 
 
 def _text(raw: dict[str, object], name: str, *, allow_empty: bool = False) -> str:
@@ -383,6 +447,11 @@ class WorkerResult:
     harness_started_at: float | None = None
     schema_version: str = WORKER_RESULT_SCHEMA
     omp_evidence: dict[str, object] | None = None
+    #: Versioned renewable-budget telemetry from the process owner, present
+    #: only when the attempt ran under a RenewableBudget — on ordinary
+    #: completion as well as on exhaustion. Parsing validates it and never
+    #: invents it for older records.
+    budget: dict[str, object] | None = None
 
     @classmethod
     def parse(cls, text: str) -> WorkerResult:
@@ -410,6 +479,7 @@ class WorkerResult:
         identity_raw = raw.get("worker_identity")
         identity = WorkerIdentity.from_dict(identity_raw) if identity_raw is not None else None
         worker_protocol_version = _integer(raw, "worker_protocol_version")
+        budget_telemetry = validate_budget_stats(raw["budget"]) if "budget" in raw else None
         result = cls(
             model_call_id=_text(raw, "model_call_id"),
             provider=_text(raw, "provider"),
@@ -449,6 +519,7 @@ class WorkerResult:
                 if isinstance(raw.get("omp_evidence"), dict)
                 else None
             ),
+            budget=budget_telemetry,
         )
         if "omp_evidence" in raw and not isinstance(raw["omp_evidence"], dict):
             raise ValueError("OMP evidence must be an object")
@@ -571,6 +642,8 @@ class WorkerResult:
         }
         if self.omp_evidence is not None:
             payload["omp_evidence"] = self.omp_evidence
+        if self.budget is not None:
+            payload["budget"] = self.budget
         if self.worker_identity is not None:
             payload["worker_identity"] = self.worker_identity.to_dict()
         return payload
@@ -602,6 +675,8 @@ class WorkerResult:
         }
         if self.worker_identity is not None:
             summary["worker_identity"] = self.worker_identity.to_dict()
+        if self.budget is not None:
+            summary["budget"] = self.budget
         return summary
 
 
@@ -795,6 +870,21 @@ def _last_line(text: str) -> str:
     return ""
 
 
+def _timeout_detail(timeout: float | None, budget: dict[str, object] | None) -> str:
+    """Name the limit that fired when a killed harness left stderr blank.
+
+    A fixed deadline reports its seconds; a renewable budget reports the
+    recorded termination reason and monotonic duration, because a bare
+    "exceeded None seconds" explains nothing.
+    """
+    if budget is not None:
+        return (
+            f"harness exceeded renewable budget: {budget['termination_reason']} "
+            f"after {budget['duration_seconds']}s"
+        )
+    return f"harness exceeded {timeout}s"
+
+
 def execute_worker(
     *,
     provider: str,
@@ -802,6 +892,7 @@ def execute_worker(
     command: list[str],
     timeout: float | None,
     ctx_timeout: float,
+    renewable_budget: RenewableBudget | None = None,
     expect_protocol: int | None = None,
     expect_source_sha256: str | None = None,
     prompt_payload: str | None = None,
@@ -828,6 +919,10 @@ def execute_worker(
     prompt_sha256 = ""
     harness_started_at: float | None = None
     status_subject: dict | None = None
+    #: Versioned renewable-budget telemetry from the process owner. Assigned
+    #: once the harness call returns or times out; earlier finishes carry
+    #: none, because nothing ran.
+    budget_telemetry: dict[str, object] | None = None
 
     def finish(
         status: str,
@@ -861,6 +956,7 @@ def execute_worker(
             harness_timeout_seconds=timeout,
             harness_started_at=harness_started_at,
             omp_evidence=omp_evidence,
+            budget=budget_telemetry,
         )
         _publish_provider_status(result, status_subject)
         _write_result(output, result, cwd=working_directory)
@@ -918,6 +1014,27 @@ def execute_worker(
         return finish("preflight_failed", failure=f"unsupported worker provider: {provider}")
     if not command:
         return finish("preflight_failed", failure="worker harness command is empty")
+    if renewable_budget is not None:
+        # One preflight gate for every provider: a policy the route cannot
+        # honor is refused before any model launch, never silently ignored.
+        if not isinstance(renewable_budget, RenewableBudget):
+            return finish("preflight_failed", failure="renewable budget must be a RenewableBudget")
+        if timeout is not None:
+            return finish(
+                "preflight_failed", failure="renewable budget conflicts with fixed timeout"
+            )
+        if provider != "omp":
+            return finish(
+                "preflight_failed",
+                failure=(
+                    "renewable budgets require provider omp with the "
+                    "workspace-write-no-shell policy"
+                ),
+            )
+        # Injected legacy runners have no progress-observer contract. Never
+        # bypass an explicit runner and launch a real model in its place.
+        if invoke is not run_worker_command or invoke_prompt is not run_command_with_prompt:
+            return finish("preflight_failed", failure="renewable budgets require default runners")
     claude_invocation: ClaudeInvocation | None = None
     if provider in {"claude", "claude-packet"}:
         try:
@@ -958,6 +1075,8 @@ def execute_worker(
             )
             if omp_invocation.policy not in expected_policies:
                 raise ValueError("OMP adapter identity disagrees with command tool policy")
+            if renewable_budget is not None and omp_invocation.policy != "workspace-write-no-shell":
+                raise ValueError("renewable budgets require OMP workspace-write-no-shell")
             require_omp_sdk()
         except ValueError as error:
             return finish("preflight_failed", failure=str(error))
@@ -1095,11 +1214,26 @@ def execute_worker(
         if harness_model:
             harness_command.extend(["--model", harness_model])
         harness_started_at = clock()
-        command_result = (
-            invoke_prompt(harness_command, working_directory, prompt, timeout)
-            if prompt_payload is not None
-            else invoke(harness_command, working_directory, timeout)
-        )
+        if renewable_budget is not None:
+            if prompt_payload is not None:
+                command_result = run_command_with_prompt(
+                    harness_command,
+                    working_directory,
+                    prompt,
+                    timeout,
+                    renewable_budget=renewable_budget,
+                )
+            else:
+                command_result = run_worker_command(
+                    harness_command,
+                    working_directory,
+                    timeout,
+                    renewable_budget=renewable_budget,
+                )
+        elif prompt_payload is not None:
+            command_result = invoke_prompt(harness_command, working_directory, prompt, timeout)
+        else:
+            command_result = invoke(harness_command, working_directory, timeout)
     except subprocess.TimeoutExpired as error:
         # A timed-out harness has usually already said why it stopped making
         # progress, and that explanation is on the exception rather than lost:
@@ -1108,6 +1242,7 @@ def execute_worker(
         # held "You've hit your usage limit", so the failure was unattributable,
         # matched no quota marker, and rested no billing account -- automatic
         # selection then kept choosing an account with no headroom.
+        budget_telemetry = error.budget if isinstance(error, BudgetTimeoutExpired) else None
         salvaged_stdout = _decode_stream(error.stdout)
         salvaged_stderr = _decode_stream(error.stderr)
         reported = _last_line(salvaged_stdout) or _last_line(salvaged_stderr)
@@ -1120,7 +1255,7 @@ def execute_worker(
             harness=HarnessOutcome(
                 124,
                 salvaged_stdout,
-                salvaged_stderr or f"harness exceeded {timeout}s",
+                salvaged_stderr or _timeout_detail(timeout, budget_telemetry),
             ),
             failure=failure,
             model_call_started=True,
@@ -1138,6 +1273,10 @@ def execute_worker(
         if agy_invocation is None and claude_invocation is None:
             raise
         return finish("preflight_failed", failure=f"could not start {provider}: {error}")
+    # Budget telemetry, when the attempt ran under a renewable budget, comes
+    # from the process owner's typed result and rides into whichever final
+    # status this attempt reaches — completion, exhaustion, or evidence failure.
+    budget_telemetry = command_result.budget
     harness = HarnessOutcome(
         command_result.exit_status, command_result.stdout, command_result.stderr
     )
