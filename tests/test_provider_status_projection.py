@@ -10,6 +10,7 @@ import multiprocessing
 import os
 import random
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -698,6 +699,48 @@ class ProviderStatusProjectionTest(unittest.TestCase):
             )
         )
         self.assert_projection([event])
+
+    def test_contended_registry_refuses_writes_without_hiding_committed_facts(self) -> None:
+        event = _event(1)
+        _publish(self.root, event)
+        self.assert_projection([event])
+        script = f"""
+import json
+from agent_execution import provider_status
+
+provider_status._LOCK_TIMEOUT_SECONDS = 0.05
+try:
+    provider_status.observe(
+        "openai-codex", kind="availability", state="available",
+        source_tool="test", source_method="contended-writer", now={NOW},
+    )
+except OSError:
+    print(json.dumps(provider_status.snapshot(now={NOW})))
+else:
+    raise AssertionError("a contended writer published without owning the lock")
+"""
+        with (self.root / "projection.lock").open("rb") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            )
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["unavailable_routes"], {"anthropic": "anthropic limited"})
+        self.assertCountEqual(result["providers"], _reference([event], NOW, None)[0])
+        self.assert_projection([event])
+        added = provider_status.observe(
+            "openai-codex",
+            kind="availability",
+            state="available",
+            source_tool="test",
+            source_method="released-writer",
+            now=NOW,
+        )
+        self.assert_projection([event, added])
 
     def test_malformed_event_diagnostic_persists_until_atomic_repair_or_removal(self) -> None:
         previous = _event(1, kind="inventory", state="available")

@@ -26,6 +26,9 @@ anything else is reconciled by replay. An uncontended mutation pays O(history)
 directory-entry work but reads and stats no historical event. Changing a
 published event file in place is not a supported writer operation.
 
+Lock acquisition is bounded. Contended writers fail without publishing; readers
+may reconstruct an unpublished view with a lock-unavailable diagnostic.
+
 Exact execution context. An observation may carry ``subject.execution``: the
 harness, surface, selector, tool policy, transport, requester host/user,
 execution build digest, wrapper profile where applicable, and launch
@@ -74,6 +77,7 @@ _PROJECTION_SCHEMA_VERSION = "provider-status-projection/v3"
 _EXECUTION_PROJECTION_SCHEMA = "provider-status-execution-projection/v1"
 _REPLAY_ATTEMPTS = 3
 _CLOCK_FENCE_TIMEOUT_SECONDS = 0.05
+_LOCK_TIMEOUT_SECONDS = 5.0
 
 #: Fact kinds. ``capability``, ``generation`` and ``credential-basis`` are
 #: meaningful only for an exact execution context (see the module docstring).
@@ -1018,7 +1022,18 @@ def _registry_lock(cache: list[str], *, create: bool) -> Iterator[bool]:
     descriptor = -1
     try:
         descriptor = _open_lock()
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"timed out acquiring provider-status registry lock {_lock_path()}"
+                    ) from None
+                time.sleep(min(0.05, remaining))
     except OSError as error:
         if descriptor >= 0:
             os.close(descriptor)

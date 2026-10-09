@@ -946,10 +946,21 @@ def probe_remote_status(
             timeout=timeout * max(1, len(selected)) * 3 + 15,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise ValueError("execution status SSH observation failed") from error
+    except subprocess.TimeoutExpired as error:
+        stderr = error.stderr
+        detail = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr
+        raise ValueError(
+            f"execution status SSH observation on {target} timed out after {error.timeout:g}s"
+            + (f": {detail.strip()}" if detail and detail.strip() else "")
+        ) from error
+    except OSError as error:
+        raise ValueError(f"execution status SSH observation on {target} failed: {error}") from error
     if result.returncode:
-        raise ValueError(f"execution status probe on {target} exited {result.returncode}")
+        detail = result.stderr.strip()
+        raise ValueError(
+            f"execution status probe on {target} exited {result.returncode}"
+            + (f": {detail}" if detail else "")
+        )
     try:
         document = validate_status(
             json.loads(result.stdout), expected_execution_sha256=expected_execution_sha256

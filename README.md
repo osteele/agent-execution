@@ -292,7 +292,10 @@ Claude worker queries default to `read-only-no-shell`; task queries use
 
 Remote status probes require a working noninteractive SSH connection to the
 executor account and the requested worker executable installed there. They
-observe that environment; they do not provision it.
+observe that environment; they do not provision it. Failures distinguish SSH
+startup, the outer observation deadline, and a worker's nonzero exit, retaining
+available stderr so a registry publication failure is not mistaken for an
+authentication failure.
 
 Immediately before launch, workers re-observe required facts for their pinned
 source and actual tool policy. OMP and native Claude require current capability,
@@ -622,14 +625,18 @@ uv run agent-execution provider status --json
 The initial read, recovery from a missing, incompatible, or corrupt
 `projection.json`, and reconciliation after external event-directory changes
 replay the event log. These operations can exceed a consumer's normal timeout,
-and other readers wait behind a rebuilding process. Updates from retained
-non-locking workers can therefore cause latency spikes during an upgrade.
+and a reader waits at most five seconds for the registry lock before serving
+an unpublished view with a diagnostic. Updates from retained non-locking
+workers can therefore cause latency spikes during an upgrade.
 
 Cache publication requires a same-filesystem clock observation beyond the
 event directories' recorded change times. If that cannot be established within
 a bounded wait, or enumeration or event reads fail, the incomplete or unverified
 view is not cached. Readers return readable event data with `diagnostics`.
-Writers in this version require the registry lock before publishing observations.
+Writers require the registry lock before publishing observations and refuse
+after five seconds of contention without writing an event. A registry-lock
+timeout is not a provider authentication or quota verdict. Inspect the lock's
+owning process rather than deleting the lock file or relaxing admission checks.
 Event files are immutable; repairs must use atomic replacement or removal,
 not in-place content edits.
 
