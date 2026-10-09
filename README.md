@@ -192,13 +192,13 @@ retain and reconcile an existing call identity rather than rerunning it blindly.
 | `agent_execution.command` | `CommandResult.mark_consumed`, `CommandResult.acknowledge_refusal` | Validate and durably record acceptance or refusal before acknowledging. |
 | `agent_execution.processes` | `run_in_process_group` | Use this lower-level process-lifetime primitive only when worker evidence and tool-policy enforcement are not required. |
 
-`execute_worker` admits the adapters `omp`, `omp-packet`, and `agy`, and publishes
-a `WorkerResult` at its protected evidence path. Pass `timeout` for the harness.
-The signature also requires `ctx_timeout`; these adapters use native evidence
-rather than the `ctx` transcript helper. The recorded harness deadline is not a
-total deadline for installation, queueing, or consumer processing. Preflight
-and harness failures are returned as result statuses; a returned object alone
-is not evidence of successful generation.
+`execute_worker` admits `omp`, `omp-packet`, `agy`, `claude`, and `claude-packet`,
+and publishes a `WorkerResult` at its protected evidence path. Pass `timeout`
+for the harness and `ctx_timeout` for evidence collection. Grounded `claude`
+exports its exact persisted session through `ctx`; the other adapters use
+native output evidence. The harness deadline excludes installation, queueing,
+and consumer processing. Preflight and harness failures are returned as result
+statuses; a returned object alone is not evidence of successful generation.
 
 Consumers must retain dispatch expectations separately from results. Parse
 versioned results and compare them with those expectations rather than trusting
@@ -254,12 +254,12 @@ OMP capability uses the active pinned SDK's exact model registry; authentication
 uses credentials eligible for its restricted launch. Anthropic and Antigravity
 use OAuth-only credentials. The Zhipu coding-plan route can use `ZAI_API_KEY`.
 Read-only Review selectors are checked independently of the writer roster.
-Native Claude sign-in is probed with the scrubbed environment, selected profile,
-and working directory. The wrapper's auth command bypasses generation routing,
-so sign-in cannot establish the effective generation route or its billing basis.
-Those native execution facts remain explicitly unobserved; they neither grant
-zero-cost permission nor affect OMP facts. Native Claude is not a supported
-Weft-worker transport, and native Codex worker execution is retired.
+The `native` Claude surface observes the configured wrapper, profile, and
+working directory. Its sign-in probe cannot establish wrapper generation routing
+or billing. Those facts remain unobserved and do not affect OMP observations.
+The `worker` surface instead resolves and launches the physical Claude binary
+with an isolated native route. Both `claude` and `claude-packet` support Weft.
+Native Codex worker execution is retired.
 
 Python consumers use `agent_execution.execution_status`:
 
@@ -285,25 +285,64 @@ The local APIs accept `tool_policy`, `profile`, `environment`, `cwd`,
 finite `timeout`. Remote queries accept profile, tool policy, and working
 directory but never forward the caller's secret environment. CLI equivalents
 include `--tool-policy`, `--profile`, `--cwd`, `--expect-source-sha256`, and
-`--timeout`. Native queries require an explicit tool policy. OMP worker queries
-default to `read-only-no-shell`; task queries use `workspace-write-no-shell`;
-OMP-packet and agy use `packet-only-no-tools`.
+`--timeout`. Native-surface queries require an explicit tool policy. OMP and
+Claude worker queries default to `read-only-no-shell`; task queries use
+`workspace-write-no-shell`; `omp-packet`, `claude-packet`, and `agy` use
+`packet-only-no-tools`.
 
 Remote status probes require a working noninteractive SSH connection to the
 executor account and the requested worker executable installed there. They
 observe that environment; they do not provision it.
 
 Immediately before launch, workers re-observe required facts for their pinned
-source and actual tool policy. OMP requires current capability, authentication,
-and transport; a current explicit quota refusal also blocks launch. Agy has no
-registered auth-status probe: its authentication stays unknown, and its
-independent hard-cash guard refuses an unobservable billing basis.
+source and actual tool policy. OMP and native Claude require current capability,
+authentication, and transport; a current explicit quota refusal also blocks
+launch. Agy has no registered auth-status probe: its authentication stays
+unknown, and its independent hard-cash guard refuses an unobservable billing basis.
 
 Exact observations are immutable events in the existing provider-status
 registry's `events/execution/` namespace, under its shared lock. Their derived
 `execution-projection.json` index can be rebuilt; it is not another authority.
 This namespace prevents retained older workers from interpreting scoped facts
 as route-wide availability. Consumers use the versioned API, not these files.
+
+## Native Claude workers
+
+`claude` exposes exactly `Read,Glob,Grep` in restricted plan mode.
+`claude-packet` exposes no tools and disables session persistence. Both launch
+with `--safe-mode`, disabled slash commands, and an explicit empty strict MCP
+configuration. They bypass wrapper profiles and proxy routing; inherited
+Anthropic key, route, and model overrides are removed. A physical Mach-O or ELF
+executable is required, resolved directly or through `claude wrapper native-binary`.
+
+Logical commands use `claude -p PROMPT --input-format text --output-format json`,
+`--strict-mcp-config --mcp-config '{"mcpServers":{}}'`, an exact native
+`--model` such as `claude-opus-5-5`, and a fresh UUIDv4 `--session-id`.
+Grounded commands add `--permission-mode plan --allowedTools Read,Glob,Grep`.
+Packet commands add `--tools '' --no-session-persistence --system-prompt TEXT`.
+Optional `--effort` accepts `low`, `medium`, `high`, `xhigh`, or `max` and reaches
+the native CLI unchanged. Moving model aliases, duplicate flags, fallback models,
+remote session resume, arbitrary environment prefixes, and nonempty wrapper
+profiles are refused. A consumer-generated profile label must be explicitly
+translated by that consumer; the worker does not reinterpret it.
+
+The prompt travels as a digest-checked Weft payload and reaches Claude on stdin.
+The worker validates the JSON result's error state, exact model usage identity,
+and pinned session. Grounded completion also requires a valid `ctx` transcript
+for that session and working directory. Packet completion carries the native
+JSON output, with no persisted session or `ctx` evidence. Weft retrieval checks
+the original model/session expectations and rejects incomplete native evidence.
+
+Probe the exact remote subject with `probe_remote_status(host="studio",
+account="agent", harness="claude", surface="worker",
+selectors=["anthropic/claude-opus-5-5"], transport="weft")`.
+Native capability reports installed CLI policy support, not successful model
+generation. Authentication and billing come from the physical binary's
+safe-mode `auth status`; OMP's restricted-SDK credentials are a separate subject.
+A hard cash cap admits native Claude only with fresh subscription billing
+evidence. The execution account needs its own Claude sign-in; deployment does
+not copy credentials between accounts.
+
 
 ## Packet-only agy (Antigravity CLI)
 

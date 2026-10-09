@@ -14,7 +14,7 @@ from pathlib import Path
 
 from agent_execution.agy_execution import AGY_MODELS
 from agent_execution.credentials import observe_credential_basis
-from agent_execution.execution_status import add_status_parser, run_status
+from agent_execution.execution_status import add_status_parser, probe_status, run_status
 from agent_execution.identity import worker_evidence_path
 from agent_execution.omp_execution import require_omp_sdk
 from agent_execution.processes import install_termination_guard
@@ -94,6 +94,23 @@ def probe_worker(
         raise ValueError("probe timeout must be finite and positive")
     if provider == "agy":
         return _probe_agy(harness_model)
+    if provider in {"claude", "claude-packet"}:
+        if not harness_model:
+            raise ValueError("Claude probe requires an exact native model ID")
+        status = probe_status(
+            harness=provider,
+            surface="worker",
+            selectors=[f"anthropic/{harness_model}"],
+            timeout=timeout,
+        )
+        return {
+            "schema_version": "agent-execution.worker-probe/v1",
+            "worker_identity": status["worker_identity"],
+            "provider": provider,
+            "harness_model": harness_model,
+            "execution_status": status,
+            "credential_basis": status["rows"][0]["credential_basis"],
+        }
     if not harness_model or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", harness_model):
         raise ValueError("OMP probe requires an exact provider/model selector")
     dependencies: dict[str, object]

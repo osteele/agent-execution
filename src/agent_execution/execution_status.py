@@ -21,6 +21,7 @@ from typing import Any, cast
 
 from agent_execution import credentials, provider_status
 from agent_execution.agy_execution import AGY_MODELS
+from agent_execution.claude_execution import is_exact_claude_model
 from agent_execution.omp_execution import (
     GROUNDED_OMP_SELECTORS,
     OMP_WRITER_SELECTORS,
@@ -76,7 +77,7 @@ def _identity(expected: str | None) -> Json:
 
 def _selectors(harness: str, selectors: list[str] | None) -> list[str | None]:
     if selectors is None:
-        if harness in {"omp", "omp-packet", "agy"}:
+        if harness in {"omp", "omp-packet", "agy", "claude-packet"}:
             raise ValueError("this harness requires an exact selector")
         return [None]
     if not isinstance(selectors, list) or not selectors:
@@ -99,7 +100,7 @@ def _policy(harness: str, surface: str, policy: str | None) -> str:
             "workspace-write-no-shell"
             if surface == "offload-task"
             else "read-only-no-shell"
-            if harness == "omp"
+            if harness in {"omp", "claude"}
             else "packet-only-no-tools"
         )
     if policy not in provider_status.EXECUTION_TOOL_POLICIES:
@@ -127,15 +128,45 @@ def _subject(
         raise ValueError("unknown execution harness or surface")
     if transport not in provider_status.EXECUTION_TRANSPORTS:
         raise ValueError("unknown execution transport")
-    launch = credentials.harness_launch_environment(
-        harness, profile=profile, environment=environment
-    )
-    fingerprint = credentials.launch_fingerprint(harness, launch)
-    if harness == "claude":
+    worker_claude = surface == "worker" and harness in {"claude", "claude-packet"}
+    if worker_claude and profile is not None:
+        raise ValueError("native Claude workers do not support wrapper profiles")
+    if worker_claude and selector is None:
+        raise ValueError("Claude workers require an exact selector")
+    launch_harness = "claude" if harness == "claude-packet" else harness
+    if worker_claude:
+        from agent_execution.claude_execution import native_claude_launch
+
+        inherited = dict(os.environ if environment is None else environment)
+        try:
+            executable, launch = native_claude_launch(environment=inherited)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            executable, launch = "", inherited
+        if executable:
+            path = launch.get("PATH", os.defpath)
+            launch = {**launch, "PATH": f"{Path(executable).parent}{os.pathsep}{path}"}
+            executable_identity = credentials._executable_identity(executable)
+        else:
+            executable_identity = "unavailable"
+        # SSH connection ports and process-local environment values must not
+        # create a new subject on every observation of the same native route.
+        launch_parts = [
+            executable_identity,
+            credentials.launch_fingerprint("claude", launch),
+            f"oauth-token={'present' if launch.get('CLAUDE_CODE_OAUTH_TOKEN') else 'absent'}",
+            f"simple={launch.get('CLAUDE_CODE_SIMPLE', '')}",
+        ]
+        fingerprint = "native-claude:" + hashlib.sha256("|".join(launch_parts).encode()).hexdigest()
+    else:
+        launch = credentials.harness_launch_environment(
+            launch_harness, profile=profile, environment=environment
+        )
+        fingerprint = credentials.launch_fingerprint(launch_harness, launch)
+    if launch_harness == "claude":
         fingerprint = hashlib.sha256(
             f"{fingerprint}:{(cwd or Path.cwd()).resolve()}".encode()
         ).hexdigest()
-    route = selector.split("/", 1)[0] if selector else provider_status.route_for(harness)
+    route = selector.split("/", 1)[0] if selector else provider_status.route_for(launch_harness)
     host, user = socket.gethostname(), getpass.getuser()
     subject: Json = {
         "harness": harness,
@@ -150,9 +181,19 @@ def _subject(
         "requester_host": requester_host or host,
         "requester_user": requester_user or user,
         "execution_sha256": build,
-        "profile": (profile or launch.get("CLAUDE_PROFILE")) if harness == "claude" else None,
+        "profile": (
+            (profile or launch.get("CLAUDE_PROFILE"))
+            if harness == "claude" and not worker_claude
+            else None
+        ),
         "environment_fingerprint": fingerprint,
-        "effective_route": None if harness == "claude" else route,
+        "effective_route": (
+            "anthropic"
+            if worker_claude and executable
+            else None
+            if worker_claude or harness == "claude"
+            else route
+        ),
         "credential_fingerprint": provider_status.credential_fingerprint(None, host=host)[0],
         "fingerprint_scope": "host",
     }
@@ -264,6 +305,14 @@ def _supported(subject: Json) -> bool:
             and policy == "workspace-write-no-shell"
             and selector in OMP_WRITER_SELECTORS
         )
+    if harness in {"claude", "claude-packet"}:
+        expected_policy = "read-only-no-shell" if harness == "claude" else "packet-only-no-tools"
+        return (
+            selector is not None
+            and selector.startswith("anthropic/")
+            and is_exact_claude_model(selector.split("/", 1)[1])
+            and policy == expected_policy
+        )
     if harness == "omp":
         return policy == "read-only-no-shell" and selector in GROUNDED_OMP_SELECTORS
     if harness == "omp-packet":
@@ -274,6 +323,49 @@ def _supported(subject: Json) -> bool:
         and selector is not None
         and selector.split("/", 1)[1] in AGY_MODELS
         and selector.startswith("google-antigravity/")
+    )
+
+
+def _probe_native_claude(
+    environment: Mapping[str, str] | None, cwd: Path | None, timeout: float
+) -> tuple[str, str, Json]:
+    """Observe installed native worker flags without starting a model turn."""
+    from agent_execution.claude_execution import native_claude_launch
+
+    try:
+        executable, launch = native_claude_launch(environment=environment, timeout=timeout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return "unavailable", "Native Claude executable is unavailable", {}
+    launch_path = launch.get("PATH", os.defpath)
+    launch = {**launch, "PATH": f"{Path(executable).parent}{os.pathsep}{launch_path}"}
+    try:
+        result = run_in_process_group(
+            [executable, "--help"], cwd or Path.cwd(), "", timeout, environment=launch
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return (
+            "unknown",
+            "Native Claude capability help probe failed",
+            {"executable": executable, "environment": launch},
+        )
+    if result.returncode:
+        return (
+            "unknown",
+            "Native Claude capability help probe failed",
+            {"executable": executable, "environment": launch},
+        )
+    help_text = result.stdout + result.stderr
+    missing = [flag for flag in ("--safe-mode", "--tools", "--restricted") if flag not in help_text]
+    if missing:
+        return (
+            "unavailable",
+            "Native Claude lacks required worker options: " + ", ".join(missing),
+            {"executable": executable, "environment": launch},
+        )
+    return (
+        "available",
+        "Native Claude worker options observed from the physical binary",
+        {"executable": executable, "environment": launch},
     )
 
 
@@ -307,7 +399,7 @@ def _probe(
     basis: Json | None = None
     if supported:
         harness = subject["harness"]
-        if harness == "claude":
+        if harness in {"claude", "claude-packet"} and subject["surface"] == "native":
             observed = credentials.observe_claude_auth(
                 cwd=cwd, environment=environment, profile=subject["profile"], timeout=timeout
             )
@@ -327,6 +419,37 @@ def _probe(
             )
             basis = observed.basis.to_dict()
             basis.update(basis=credentials.BASIS_UNOBSERVED, reported_source=None)
+        elif harness in {"claude", "claude-packet"}:
+            capability, detail, launch = _probe_native_claude(environment, cwd, timeout)
+            native_environment = launch.get("environment")
+            if isinstance(native_environment, dict):
+                try:
+                    observed = credentials.observe_claude_auth(
+                        cwd=cwd,
+                        environment=native_environment,
+                        timeout=timeout,
+                        native_executable=launch["executable"],
+                    )
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    auth_detail = "Native Claude authentication observation failed"
+                    basis = credentials.CredentialBasis(
+                        "claude", credentials.BASIS_UNOBSERVED, None, time.time(), ""
+                    ).to_dict()
+                else:
+                    auth = observed.state
+                    auth_detail = (
+                        f"Native Claude authentication is {observed.state}"
+                        if observed.answered
+                        else "Native Claude authentication gave no readable answer"
+                    )
+                    basis = observed.basis.to_dict()
+            else:
+                auth_detail = (
+                    "Native Claude executable is unavailable for authentication observation"
+                )
+                basis = credentials.CredentialBasis(
+                    "claude", credentials.BASIS_UNOBSERVED, None, time.time(), ""
+                ).to_dict()
         elif harness in {"omp", "omp-packet"}:
             try:
                 require_omp_sdk(environment=environment)
@@ -564,8 +687,21 @@ def validate_status(value: object, *, expected_execution_sha256: str | None = No
             or re.fullmatch(r"hmac-sha256:[0-9a-f]{64}", fingerprint)
         ):
             raise ValueError("invalid credential fingerprint identity")
-        if subject["harness"] in {"omp", "omp-packet", "agy"} and subject["selector"] is None:
+        if (
+            subject["harness"] in {"omp", "omp-packet", "agy", "claude-packet"}
+            or subject["surface"] == "worker"
+            and subject["harness"] == "claude"
+        ) and subject["selector"] is None:
             raise ValueError("execution harness requires an exact selector")
+        if (
+            subject["surface"] == "worker"
+            and subject["harness"] in {"claude", "claude-packet"}
+            and (
+                subject["profile"] is not None
+                or subject["effective_route"] not in {None, "anthropic"}
+            )
+        ):
+            raise ValueError("invalid native Claude worker execution identity")
         expected_route = (
             subject["selector"].split("/", 1)[0]
             if subject["selector"]
@@ -635,6 +771,13 @@ def validate_status(value: object, *, expected_execution_sha256: str | None = No
                     or fact["stale"] != (end <= now)
                 ):
                     raise ValueError("inconsistent observation freshness")
+        if (
+            subject["surface"] == "worker"
+            and subject["harness"] in {"claude", "claude-packet"}
+            and facts["capability"]["state"] == "available"
+            and (subject["effective_route"] != "anthropic" or not _supported(subject))
+        ):
+            raise ValueError("available native Claude capability requires its enforced route")
         basis = row.get("credential_basis")
         if basis is not None:
             basis = _object(basis, "credential basis")
@@ -650,7 +793,13 @@ def validate_status(value: object, *, expected_execution_sha256: str | None = No
                 }
             ):
                 raise ValueError("invalid credential billing basis")
-            expected_harness = "omp" if subject["harness"] == "omp-packet" else subject["harness"]
+            expected_harness = (
+                "claude"
+                if subject["harness"] in {"claude", "claude-packet"}
+                else "omp"
+                if subject["harness"] in {"omp", "omp-packet"}
+                else subject["harness"]
+            )
             if basis.get("harness") != expected_harness:
                 raise ValueError("credential billing basis names a different harness")
             observed = basis.get("observed_at")

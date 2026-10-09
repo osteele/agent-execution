@@ -28,15 +28,16 @@ published event file in place is not a supported writer operation.
 
 Exact execution context. An observation may carry ``subject.execution``: the
 harness, surface, selector, tool policy, transport, requester host/user,
-execution build digest, wrapper profile, and launch-environment fingerprint it
-was made under. Every one of those dimensions is part of the projection key, so
-an exact observation never collapses with another context or with a legacy
-unscoped observation, and it never enters the route-global
-``unavailable_routes`` or quota-blocked views. Exact observations describe one
-executor's host-local facts; they are committed directly to ``events/`` and are
-never uploaded, so older readers elsewhere cannot mistake them for route-wide
-evidence. ``capability``, ``generation`` and ``credential-basis`` facts exist
-only in an exact context.
+execution build digest, wrapper profile where applicable, and launch
+environment fingerprint it was made under. Native Claude worker fingerprints
+include the resolved physical binary and scrubbed launch environment. Every
+dimension is part of the projection key, so an exact observation never
+collapses with another context or with a legacy unscoped observation, and it
+never enters the route-global ``unavailable_routes`` or quota-blocked views.
+Exact observations describe one executor's host-local facts; they are committed
+directly to ``events/`` and are never uploaded, so older readers elsewhere
+cannot mistake them for route-wide evidence. ``capability``, ``generation``
+and ``credential-basis`` facts exist only in an exact context.
 """
 
 from __future__ import annotations
@@ -95,7 +96,7 @@ REFUSAL_CONDITIONS = frozenset({"quota", "auth", "network", "unknown"})
 
 #: Exact execution-context vocabulary. The labels are independent: native
 #: Claude and a worker that cannot run Claude are different contexts.
-EXECUTION_HARNESSES = ("claude", "codex", "omp", "omp-packet", "agy")
+EXECUTION_HARNESSES = ("claude", "claude-packet", "codex", "omp", "omp-packet", "agy")
 EXECUTION_SURFACES = ("native", "worker", "offload-task")
 EXECUTION_TRANSPORTS = ("local", "weft")
 EXECUTION_TOOL_POLICIES = (

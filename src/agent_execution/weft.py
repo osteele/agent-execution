@@ -7,10 +7,12 @@ to submit again. Product state and result interpretation belong to the consumer.
 
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import re
 import shlex
+import socket
 import subprocess
 import tempfile
 import time
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from agent_execution.agy_execution import validate_agy_command
+from agent_execution.claude_execution import claude_envelope, validate_claude_command
 from agent_execution.command import CommandResult, CommandRunner, ProgressCallback, run_command
 from agent_execution.costs import validate_max_cost_usd
 from agent_execution.identity import source_sha256, source_worker_executable, worker_evidence_path
@@ -84,7 +87,7 @@ DIAGNOSTIC_TAIL_LINES = 200
 
 def harness_capability_name(provider: str) -> str:
     """Worker variants use the same installed physical harness."""
-    return "omp" if provider == "omp-packet" else provider
+    return {"omp-packet": "omp", "claude-packet": "claude"}.get(provider, provider)
 
 
 def _tail(text: str) -> str:
@@ -358,6 +361,9 @@ def parse_worker_command(command: object) -> dict[str, str]:
         "--model-call-id",
         "--harness-model",
         "--max-cost-usd",
+        "--execution-transport",
+        "--requester-host",
+        "--requester-user",
         "--expect-protocol",
         "--expect-source-sha256",
         "--prompt-payload",
@@ -506,6 +512,7 @@ class WeftCommandRunner:
         self.prompt_sha256: str | None = None
         self.omp_selector: str | None = None
         self.omp_policy: str | None = None
+        self.claude_contract: dict[str, object] = {}
         self.last_execution: dict[str, object] | None = None
         self.submitter_session = submitter_session or f"agent-execution/v1/{model_call_id}"
 
@@ -623,6 +630,8 @@ class WeftCommandRunner:
             validate_omp_command(command, cwd)
         if self.agent == "agy":
             validate_agy_command(command)
+        if self.agent in {"claude", "claude-packet"}:
+            command = validate_claude_command(command, provider=self.agent).command
         # Weft establishes the mirrored project as the job's working directory.
         # A local absolute --cd/--dir would otherwise select the wrong user's
         # tree on the worker.
@@ -637,6 +646,12 @@ class WeftCommandRunner:
                 "execute",
                 "--provider",
                 self.agent,
+                "--execution-transport",
+                "weft",
+                "--requester-host",
+                socket.gethostname(),
+                "--requester-user",
+                getpass.getuser(),
                 "--model-call-id",
                 self.model_call_id,
                 *(["--harness-model", harness_model] if harness_model else []),
@@ -786,6 +801,7 @@ class WeftCommandRunner:
                 if self.omp_selector
                 else {}
             ),
+            **self.claude_contract,
             "submitter_session": self.submitter_session,
             "expected_worker_source_sha256": self.expected_source_sha256,
             "expected_worker_protocol_version": WORKER_PROTOCOL_VERSION,
@@ -1188,11 +1204,29 @@ class WeftCommandRunner:
                 return CommandResult(
                     1, worker.harness.stdout, str(error), execution=execution, worker_result=worker
                 )
+        if self.agent in {"claude", "claude-packet"} and worker.status == "completed":
+            try:
+                model = execution.get("claude_model")
+                session = execution.get("claude_session_id")
+                if not isinstance(model, str) or not isinstance(session, str) or not session:
+                    raise ValueError("Claude dispatch receipt lacks its exact model/session")
+                claude_envelope(worker.harness.stdout, model=model, session_id=session)
+            except ValueError as error:
+                self._refuse(
+                    job_id=job_id,
+                    cwd=cwd,
+                    execution=execution,
+                    step="worker_result_validation",
+                    detail=str(error),
+                )
+                return CommandResult(
+                    1, worker.harness.stdout, str(error), execution=execution, worker_result=worker
+                )
         # For agy the envelope IS the evidence: an evidence failure (recorded
         # tool use, empty response, no model turn) is a refused review, not a
         # missing secondary export, so it never reaches the consumer as success.
         evidence_unavailable = (
-            self.agent not in {"omp", "agy"}
+            self.agent not in {"omp", "agy", "claude", "claude-packet"}
             and worker.status == "evidence_failed"
             and worker.harness.exit_status == 0
         )
@@ -1390,6 +1424,13 @@ class WeftCommandRunner:
                 harness.extend(["--model", options["--harness-model"]])
             invocation = validate_omp_command(harness, Path("."), historical=protocol == 1)
             contract.update(omp_selector=invocation.selector, omp_policy=invocation.policy)
+        if self.agent in {"claude", "claude-packet"}:
+            argv = shlex.split(cast(str, record["command"]))
+            harness = argv[argv.index("--") + 1 :]
+            if "--harness-model" in options:
+                harness.extend(["--model", options["--harness-model"]])
+            native = validate_claude_command(harness, provider=self.agent)
+            contract.update(claude_model=native.model, claude_session_id=native.session_id)
         return contract
 
     def _unknown_contract(
@@ -1766,6 +1807,7 @@ class WeftCommandRunner:
                 if self.omp_selector
                 else {}
             ),
+            **self.claude_contract,
             "expected_worker_source_sha256": self.expected_source_sha256,
             "expected_worker_protocol_version": WORKER_PROTOCOL_VERSION,
             "worker_result_path": self.worker_result_path,
@@ -1786,6 +1828,7 @@ class WeftCommandRunner:
             worker_result_path=execution["worker_result_path"],
             omp_selector=self.omp_selector,
             omp_policy=self.omp_policy,
+            **self.claude_contract,
             survives_process_exit=True,
         )
         return execution
@@ -1908,6 +1951,13 @@ class WeftCommandRunner:
         # but never submit or fall back locally for a new native Codex call.
         if self.agent == "codex":
             raise ValueError("native Codex execution is unsupported; use OpenAI models via OMP")
+        if self.agent in {"claude", "claude-packet"}:
+            native = validate_claude_command(command, provider=self.agent)
+            command = native.command
+            self.claude_contract = {
+                "claude_model": native.model,
+                "claude_session_id": native.session_id,
+            }
         deadline = self.clock() + (REMOTE_OBSERVATION_SECONDS if timeout is None else timeout)
         # The brief the worker will be handed, located by shape rather than by
         # position: hashing `command[-1]` pinned a trailing flag for any harness
@@ -1990,6 +2040,7 @@ class WeftCommandRunner:
                             if self.omp_selector
                             else {}
                         ),
+                        **self.claude_contract,
                         "expected_worker_source_sha256": self.expected_source_sha256,
                         "diagnostics": {"submission_error": str(error)},
                         "processing": {
@@ -2061,6 +2112,7 @@ class WeftCommandRunner:
                         if self.omp_selector
                         else {}
                     ),
+                    **self.claude_contract,
                     "expected_worker_source_sha256": self.expected_source_sha256,
                     "diagnostics": {
                         "unreadable_receipt": str(error),
@@ -2171,6 +2223,7 @@ class WeftCommandRunner:
             worker_result_path=execution["worker_result_path"],
             omp_selector=self.omp_selector,
             omp_policy=self.omp_policy,
+            **self.claude_contract,
             survives_process_exit=True,
         )
         return self._await_accepted_job(

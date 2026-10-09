@@ -32,6 +32,13 @@ from agent_execution.agy_execution import (
     run_agy_command,
     validate_agy_command,
 )
+from agent_execution.claude_execution import (
+    ClaudeInvocation,
+    ClaudeStatusError,
+    claude_envelope,
+    run_claude_command,
+    validate_claude_command,
+)
 from agent_execution.command import CommandResult, CommandRunner
 from agent_execution.costs import estimate_execution_cost, require_cost_cap, validate_max_cost_usd
 from agent_execution.identity import source_sha256, worker_evidence_path
@@ -57,14 +64,21 @@ Version 1 artifacts remain parseable for historical read-only retrieval.
 #: New execution excludes native Codex; historical evidence remains parseable.
 #: `agy` is packet-only (see agy_execution): its one admitted tool policy is
 #: `packet-only-no-tools`, enforced by a deny-all hook in a throwaway HOME.
-SUPPORTED_WORKER_PROVIDERS = frozenset({"omp", "omp-packet", "agy"})
+SUPPORTED_WORKER_PROVIDERS = frozenset({"omp", "omp-packet", "agy", "claude", "claude-packet"})
 #: The binary each provider means. A provider is an adapter variant and need
 #: not be a program name: `omp-packet` is OMP under a packet-only tool policy,
 #: and the binary is `omp`. The consistency check below compares the command
 #: against this rather than against the provider string, because what it exists
 #: to prevent is a record naming one harness while another ran -- not a
 #: spelling difference between a policy variant and its executable.
-_PROVIDER_EXECUTABLES = {"codex": "codex", "omp": "omp", "omp-packet": "omp", "agy": "agy"}
+_PROVIDER_EXECUTABLES = {
+    "codex": "codex",
+    "omp": "omp",
+    "omp-packet": "omp",
+    "agy": "agy",
+    "claude": "claude",
+    "claude-packet": "claude",
+}
 #: Providers whose transcript is recoverable as a provider-owned session, which
 #: is what the session-evidence path reads. Codex writes a `thread.started`
 #: event and keeps a session; a packet-only OMP review is dispatched with
@@ -75,7 +89,7 @@ _PROVIDER_EXECUTABLES = {"codex": "codex", "omp": "omp", "omp-packet": "omp", "a
 #: For a session-less provider the harness output IS the evidence: the
 #: conductor reconstructs the command result from the recorded stdout and
 #: parses the response out of it, exactly as it does locally.
-_SESSION_EVIDENCE_PROVIDERS = frozenset({"codex"})
+_SESSION_EVIDENCE_PROVIDERS = frozenset({"codex", "claude"})
 WORKER_STATUSES = frozenset({"completed", "preflight_failed", "harness_failed", "evidence_failed"})
 
 Which = Callable[[str], str | None]
@@ -224,6 +238,9 @@ def run_command_with_prompt(
     if command and Path(command[0]).name == "agy":
         completed = run_agy_command(command, cwd, timeout, prompt=prompt)
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+    if command and Path(command[0]).name == "claude":
+        completed = run_claude_command(command, cwd, timeout, prompt=prompt)
+        return CommandResult(completed.returncode, completed.stdout, completed.stderr)
     completed = run_in_process_group(command, cwd, prompt, timeout)
     return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
@@ -240,6 +257,8 @@ def run_worker_command(command: list[str], cwd: Path, timeout: float | None) -> 
         completed = run_omp_command(command, cwd, timeout)
     elif name == "agy":
         completed = run_agy_command(command, cwd, timeout)
+    elif name == "claude":
+        completed = run_claude_command(command, cwd, timeout)
     else:
         completed = run_in_process_group(command, cwd, "", timeout)
     return CommandResult(completed.returncode, completed.stdout, completed.stderr)
@@ -513,6 +532,19 @@ class WorkerResult:
             # The envelope is the evidence. A stored "completed" agy result
             # must still show SUCCESS, a response, a model turn, and no tools.
             agy_envelope(result.harness.stdout)
+        if result.provider in {"claude", "claude-packet"} and status == "completed":
+            claude_envelope(
+                result.harness.stdout,
+                session_id=result.session_id if result.provider == "claude" else None,
+            )
+            if result.provider == "claude":
+                assert evidence is not None
+                validate_ctx_transcript(
+                    evidence.transcript,
+                    provider="claude",
+                    session_id=result.session_id,
+                    remote_cwd=result.worker_cwd,
+                )
         return result
 
     def to_dict(self) -> dict[str, object]:
@@ -670,6 +702,13 @@ def _publish_provider_status(result: WorkerResult, subject: dict | None) -> None
             refusal = " ".join(
                 str(envelope.get(key, "")) for key in ("error", "message", "response")
             )
+    elif not succeeded and result.provider in {"claude", "claude-packet"}:
+        try:
+            claude_envelope(result.harness.stdout)
+        except ClaudeStatusError as error:
+            refusal = str(error)
+        except ValueError:
+            pass  # Malformed evidence is not a provider refusal.
     if not succeeded and refusal is None:
         return
     try:
@@ -879,6 +918,19 @@ def execute_worker(
         return finish("preflight_failed", failure=f"unsupported worker provider: {provider}")
     if not command:
         return finish("preflight_failed", failure="worker harness command is empty")
+    claude_invocation: ClaudeInvocation | None = None
+    if provider in {"claude", "claude-packet"}:
+        try:
+            logical_command = [*command, *(["--model", harness_model] if harness_model else [])]
+            claude_invocation = validate_claude_command(logical_command, provider=provider)
+            command = claude_invocation.command
+            harness_model = None  # The normalized command carries its validated model.
+            if prompt_payload is not None and claude_invocation.prompt != "-":
+                raise ValueError("Claude payload execution requires the stdin prompt marker")
+            if prompt_payload is None and claude_invocation.prompt == "-":
+                raise ValueError("Claude stdin prompt marker requires a prompt payload")
+        except ValueError as error:
+            return finish("preflight_failed", failure=str(error))
     expected_executable = _PROVIDER_EXECUTABLES[provider]
     if Path(command[0]).name != expected_executable:
         return finish(
@@ -890,7 +942,7 @@ def execute_worker(
         )
     ctx = which("ctx")
     executable = which(command[0])
-    if ctx is None and provider == "codex":
+    if ctx is None and provider in _SESSION_EVIDENCE_PROVIDERS:
         return finish("preflight_failed", failure="ctx is not installed on the worker")
     if executable is None and provider == "codex":
         return finish("preflight_failed", failure=f"{provider} is not installed on the worker")
@@ -928,9 +980,11 @@ def execute_worker(
             return finish("preflight_failed", failure=str(error))
         if executable is None:
             return finish("preflight_failed", failure="agy is not installed on the worker")
+    if claude_invocation is not None:
+        executable = "claude"  # The launcher resolves the physical native binary.
     try:
         max_cost_usd = validate_max_cost_usd(max_cost_usd)
-        if max_cost_usd is not None:
+        if max_cost_usd is not None and claude_invocation is None:
             # The actual selector is authoritative, including inline commands.
             if omp_invocation is not None:
                 model = omp_invocation.selector
@@ -965,11 +1019,13 @@ def execute_worker(
             require_cost_cap(estimate, max_cost_usd)
     except ValueError as error:
         return finish("preflight_failed", failure=f"cost-cap-refused: {error}")
-    if omp_invocation is not None or agy_invocation is not None:
-        invocation = omp_invocation or agy_invocation
+    if omp_invocation is not None or agy_invocation is not None or claude_invocation is not None:
+        invocation = omp_invocation or agy_invocation or claude_invocation
         assert invocation is not None
         if omp_invocation is not None:
             selector = omp_invocation.selector
+        elif claude_invocation is not None:
+            selector = f"anthropic/{claude_invocation.model}"
         else:
             assert agy_invocation is not None
             selector = f"{AGY_ROUTE}/{agy_invocation.model}"
@@ -993,7 +1049,7 @@ def execute_worker(
         facts = row["facts"]
         required = (
             ("capability", "transport", "authentication")
-            if omp_invocation
+            if omp_invocation or claude_invocation
             else ("capability", "transport")
         )
         for name in required:
@@ -1004,8 +1060,15 @@ def execute_worker(
         if quota["state"] == "unavailable" and not quota["stale"]:
             return finish("preflight_failed", failure=f"execution quota: {quota['detail']}")
         status_subject = row["subject"]
+        if claude_invocation is not None and max_cost_usd is not None:
+            basis = row["credential_basis"]
+            if basis is None or basis["basis"] != "subscription" or basis["stale"]:
+                return finish(
+                    "preflight_failed",
+                    failure="cost-cap-refused: native Claude has no current subscription billing proof",
+                )
     ctx_version = ""
-    if provider == "codex":
+    if provider in _SESSION_EVIDENCE_PROVIDERS:
         try:
             version_result = invoke(
                 [cast(str, ctx), "--version"], working_directory, min(ctx_timeout, 10.0)
@@ -1072,9 +1135,9 @@ def execute_worker(
         # Building agy's throwaway HOME (copying ~/.gemini, reading its
         # settings) and exec itself fail before any model call. Record that
         # durably instead of exiting with no result.
-        if agy_invocation is None:
+        if agy_invocation is None and claude_invocation is None:
             raise
-        return finish("preflight_failed", failure=f"could not start agy: {error}")
+        return finish("preflight_failed", failure=f"could not start {provider}: {error}")
     harness = HarnessOutcome(
         command_result.exit_status, command_result.stdout, command_result.stderr
     )
@@ -1088,6 +1151,39 @@ def execute_worker(
                 f"{command_failure_detail(command_result)}; evidence collection failed: {detail}"
             )
         return detail
+
+    native_session_id = ""
+    if claude_invocation is not None:
+        try:
+            envelope = claude_envelope(
+                command_result.stdout,
+                model=claude_invocation.model,
+                session_id=claude_invocation.session_id,
+            )
+        except ClaudeStatusError as error:
+            return finish(
+                "harness_failed",
+                harness=harness,
+                model_call_started=True,
+                failure=f"Claude refused generation: {error}",
+            )
+        except ValueError as error:
+            return finish(
+                "harness_failed" if command_result.exit_status else "evidence_failed",
+                harness=harness,
+                model_call_started=True,
+                failure=evidence_failure(f"invalid Claude execution evidence: {error}"),
+            )
+        native_session_id = cast(str, envelope["session_id"])
+        if command_result.exit_status:
+            return finish(
+                "harness_failed",
+                harness=harness,
+                model_call_started=True,
+                failure=f"Claude exited {command_result.exit_status} despite a success envelope",
+            )
+        if provider == "claude-packet":
+            return finish("completed", harness=harness, model_call_started=True)
 
     if agy_invocation is not None:
         # The JSON envelope is the evidence. Stdout is kept verbatim, so a
@@ -1180,7 +1276,7 @@ def execute_worker(
 
     assert ctx is not None
 
-    session_id = codex_session_id(command_result.stdout)
+    session_id = native_session_id or codex_session_id(command_result.stdout)
     if session_id is None:
         if command_result.exit_status:
             return finish(

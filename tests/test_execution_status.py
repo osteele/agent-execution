@@ -140,14 +140,189 @@ class ExecutionStatusTests(unittest.TestCase):
         writer = self.fresh(selectors=["kimi-code/kimi-k2.5"])
         self.assertEqual(writer["rows"][0]["facts"]["capability"]["state"], "unavailable")
 
-    def test_native_worker_transport_cannot_be_inferred_from_local_auth(self):
-        document = execution_status.probe_status(
-            harness="claude", surface="worker", transport="weft"
-        )
+    def test_native_worker_requires_exact_model_and_reports_transport_independently(self):
+        with (
+            mock.patch(
+                "agent_execution.claude_execution.native_claude_launch",
+                side_effect=FileNotFoundError,
+            ),
+            self.assertRaisesRegex(ValueError, "exact selector"),
+        ):
+            execution_status.probe_status(harness="claude", surface="worker", transport="weft")
+        with mock.patch(
+            "agent_execution.claude_execution.native_claude_launch",
+            side_effect=FileNotFoundError,
+        ):
+            document = execution_status.probe_status(
+                harness="claude",
+                surface="worker",
+                selectors=[SELECTOR],
+                transport="weft",
+            )
         facts = document["rows"][0]["facts"]
         self.assertEqual(facts["capability"]["state"], "unavailable")
-        self.assertEqual(facts["transport"]["state"], "unavailable")
+        self.assertEqual(facts["transport"]["state"], "available")
         self.assertEqual(facts["authentication"]["state"], "unknown")
+        self.assertEqual(document["rows"][0]["credential_basis"]["basis"], "unobserved")
+
+    def test_native_claude_worker_support_matrix_and_independent_observations(self):
+        executable = self.root / "claude-native"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        launch = {"PATH": str(self.root), "HOME": str(self.root)}
+        basis = credentials.CredentialBasis(
+            "claude", credentials.BASIS_SUBSCRIPTION, "none", time.time(), "safe-fingerprint"
+        )
+        observed = mock.Mock(state="unavailable", answered=True, basis=basis)
+        with (
+            mock.patch(
+                "agent_execution.claude_execution.native_claude_launch",
+                return_value=(str(executable), launch),
+            ),
+            mock.patch(
+                "agent_execution.execution_status.run_in_process_group",
+                return_value=subprocess.CompletedProcess(
+                    ["claude", "--help"], 0, "--safe-mode --tools --restricted", ""
+                ),
+            ),
+            mock.patch(
+                "agent_execution.credentials.observe_claude_auth", return_value=observed
+            ) as auth,
+        ):
+            readonly = execution_status.probe_status(
+                harness="claude",
+                surface="worker",
+                selectors=[SELECTOR],
+                transport="weft",
+                requester_host="requester",
+                requester_user="reviewer",
+            )
+            packet = execution_status.probe_status(
+                harness="claude-packet",
+                surface="worker",
+                selectors=[SELECTOR],
+                transport="weft",
+                requester_host="requester",
+                requester_user="reviewer",
+            )
+            mismatched = execution_status.probe_status(
+                harness="claude-packet",
+                surface="worker",
+                selectors=[SELECTOR],
+                tool_policy="read-only-no-shell",
+                transport="weft",
+            )
+            offload = execution_status.probe_status(
+                harness="claude",
+                surface="offload-task",
+                selectors=[SELECTOR],
+                tool_policy="workspace-write-no-shell",
+            )
+        self.assertEqual(readonly["rows"][0]["subject"]["tool_policy"], "read-only-no-shell")
+        self.assertEqual(readonly["rows"][0]["subject"]["effective_route"], "anthropic")
+        self.assertEqual(readonly["rows"][0]["facts"]["capability"]["state"], "available")
+        self.assertEqual(readonly["rows"][0]["facts"]["transport"]["state"], "available")
+        self.assertEqual(readonly["rows"][0]["facts"]["authentication"]["state"], "unavailable")
+        self.assertEqual(readonly["rows"][0]["credential_basis"]["basis"], "subscription")
+        self.assertEqual(packet["rows"][0]["subject"]["tool_policy"], "packet-only-no-tools")
+        self.assertEqual(packet["rows"][0]["facts"]["capability"]["state"], "available")
+        self.assertEqual(packet["rows"][0]["credential_basis"]["harness"], "claude")
+        self.assertEqual(mismatched["rows"][0]["facts"]["capability"]["state"], "unavailable")
+        self.assertEqual(offload["rows"][0]["facts"]["capability"]["state"], "unavailable")
+        self.assertEqual(auth.call_count, 2)
+
+    def test_native_worker_refuses_profiles_and_non_native_selectors(self):
+        with self.assertRaisesRegex(ValueError, "wrapper profiles"):
+            execution_status.probe_status(
+                harness="claude",
+                surface="worker",
+                selectors=[SELECTOR],
+                profile="review",
+            )
+        with mock.patch(
+            "agent_execution.claude_execution.native_claude_launch",
+            side_effect=FileNotFoundError,
+        ):
+            document = execution_status.probe_status(
+                harness="claude",
+                surface="worker",
+                selectors=["anthropic/opus"],
+                transport="weft",
+            )
+        self.assertEqual(document["rows"][0]["facts"]["capability"]["state"], "unavailable")
+
+    def test_malformed_native_auth_stays_unknown_without_erasing_capability_or_basis(self):
+        executable = self.root / "claude"
+        executable.write_text("#!/bin/sh\nprintf '%s' '{\"loggedIn\":true'\n")
+        executable.chmod(0o755)
+        launch = {"PATH": str(self.root), "HOME": str(self.root)}
+        with (
+            mock.patch(
+                "agent_execution.claude_execution.native_claude_launch",
+                return_value=(str(executable), launch),
+            ),
+            mock.patch(
+                "agent_execution.execution_status.run_in_process_group",
+                return_value=subprocess.CompletedProcess(
+                    ["claude", "--help"], 0, "--safe-mode --tools --restricted", ""
+                ),
+            ),
+        ):
+            document = execution_status.probe_status(
+                harness="claude-packet",
+                surface="worker",
+                selectors=[SELECTOR],
+                transport="weft",
+            )
+        row = document["rows"][0]
+        self.assertEqual(row["facts"]["capability"]["state"], "available")
+        self.assertEqual(row["facts"]["authentication"]["state"], "unknown")
+        self.assertEqual(row["credential_basis"]["basis"], "unobserved")
+        self.assertEqual(row["credential_basis"]["harness"], "claude")
+
+    def test_native_fingerprint_tracks_resolved_binary_and_scrubbed_environment(self):
+        first = self.root / "native-one"
+        second = self.root / "native-two"
+        first.write_text("#!/bin/sh\n")
+        second.write_text("#!/bin/sh\n")
+        first.chmod(0o755)
+        second.chmod(0o755)
+        with mock.patch(
+            "agent_execution.claude_execution.native_claude_launch",
+            side_effect=[
+                (str(first), {"PATH": str(self.root), "HOME": str(self.root / "home-a")}),
+                (str(second), {"PATH": str(self.root), "HOME": str(self.root / "home-b")}),
+            ],
+        ):
+            one = execution_status._subject(
+                "claude", "worker", SELECTOR, "weft", None, None, "a" * 64, None, None, {}, None
+            )
+            two = execution_status._subject(
+                "claude", "worker", SELECTOR, "weft", None, None, "a" * 64, None, None, {}, None
+            )
+        self.assertNotEqual(one["environment_fingerprint"], two["environment_fingerprint"])
+
+    def test_native_quota_observation_survives_a_new_ssh_connection(self):
+        executable = self.root / "claude"
+        executable.write_text("#!/bin/sh\n")
+        executable.chmod(0o755)
+        launch = {"PATH": str(self.root), "HOME": str(self.root)}
+        with mock.patch(
+            "agent_execution.claude_execution.native_claude_launch",
+            side_effect=[
+                (str(executable), {**launch, "SSH_CONNECTION": "client 1000 server 22"}),
+                (str(executable), {**launch, "SSH_CONNECTION": "client 2000 server 22"}),
+            ],
+        ):
+            subject = execution_status.cached_status(
+                harness="claude", surface="worker", selectors=[SELECTOR], transport="weft"
+            )["rows"][0]["subject"]
+            execution_status.record_generation(subject, succeeded=False, condition="quota")
+            row = execution_status.cached_status(
+                harness="claude", surface="worker", selectors=[SELECTOR], transport="weft"
+            )["rows"][0]
+        self.assertEqual(row["facts"]["quota"]["state"], "unavailable")
+        self.assertFalse(row["facts"]["quota"]["stale"])
 
     def test_exact_observations_do_not_rewrite_the_legacy_projection(self):
         provider_status.record_success("anthropic")

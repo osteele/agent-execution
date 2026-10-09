@@ -341,6 +341,7 @@ def _claude_auth_document(
     environment: Mapping[str, str] | None,
     profile: str | None,
     timeout: float,
+    safe_mode: bool = False,
 ) -> tuple[int, dict[str, object] | None] | None:
     """Run the registered `claude auth status` under the scrubbed launch environment.
 
@@ -349,9 +350,13 @@ def _claude_auth_document(
     the one implementation behind both the billing basis and the native
     authentication status.
     """
-    launch = claude_launch_environment(profile=profile, environment=environment)
+    launch = (
+        dict(environment or {})
+        if safe_mode
+        else claude_launch_environment(profile=profile, environment=environment)
+    )
     completed = _run_status_command(
-        [executable, "auth", "status"],
+        [executable, *(["--safe-mode"] if safe_mode else []), "auth", "status"],
         cwd=cwd,
         environment=launch,
         timeout=timeout,
@@ -823,16 +828,23 @@ def observe_claude_auth(
     profile: str | None = None,
     timeout: float | None = None,
     clock: float | None = None,
+    native_executable: str | None = None,
 ) -> NativeAuthStatus:
     """Observe native Claude authentication and billing basis from one answer.
 
     The binary is resolved through the scrubbed launch environment's PATH, so
     the wrapper and profile a dispatch would use are the ones asked. Nothing is
     cached and no executable or auth-file heuristic stands in for an answer.
+    A native worker supplies its already-resolved physical executable and exact
+    environment; that probe uses safe mode just like generation.
     """
     now = time.time() if clock is None else clock
-    launch = claude_launch_environment(profile=profile, environment=environment)
-    resolved = _resolved_status_executable("claude", launch)
+    launch = (
+        dict(environment or {})
+        if native_executable is not None
+        else claude_launch_environment(profile=profile, environment=environment)
+    )
+    resolved = native_executable or _resolved_status_executable("claude", launch)
     if resolved is None:
         return NativeAuthStatus(
             harness="claude",
@@ -856,9 +868,10 @@ def observe_claude_auth(
     answer = _claude_auth_document(
         resolved,
         cwd=cwd,
-        environment=environment,
+        environment=launch,
         profile=profile,
         timeout=_PROBE_TIMEOUT_SECONDS if timeout is None else timeout,
+        safe_mode=native_executable is not None,
     )
     document = None if answer is None else answer[1]
     logged_in = None

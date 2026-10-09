@@ -26,7 +26,7 @@ external entity Session {
     active: Boolean
 }
 
--- The provider harness (today OMP) is outside this specification.
+-- Provider harnesses and their credential stores are external to this specification.
 
 ------------------------------------------------------------
 -- Value Types
@@ -55,7 +55,7 @@ value ProbeObservation {
 
 entity Dispatch {
     model_call_id: String
-    provider: omp | omp_packet
+    provider: omp | omp_packet | claude | claude_packet
     command_executable: String
     ceiling_usd: Decimal?
     deadline: Duration?
@@ -111,7 +111,7 @@ entity Dispatch {
 
 entity WorkerResult {
     model_call_id: String
-    provider: omp | omp_packet
+    provider: omp | omp_packet | claude | claude_packet
     status: completed | preflight_failed | harness_failed | evidence_failed
     identity: WorkerIdentity
     prompt_digest: String
@@ -204,15 +204,26 @@ rule PromptPayloadIngested {
 
 rule ProviderAdmitted {
     when: d: Dispatch.checked
-    requires: d.provider in {omp, omp_packet}
+    requires: d.provider in {omp, omp_packet, claude, claude_packet}
     requires: d.command_executable = executable_for(d.provider)
     requires:
-        (d.provider = omp and d.harness_policy = read_only_no_shell) or
-        (d.provider = omp_packet and d.harness_policy = packet_only_no_tools)
+        (d.provider = omp and d.harness_policy in {read_only_no_shell, workspace_write_no_shell}) or
+        (d.provider = omp_packet and d.harness_policy = packet_only_no_tools) or
+        (d.provider = claude and d.harness_policy = read_only_no_shell) or
+        (d.provider = claude_packet and d.harness_policy = packet_only_no_tools)
 
     @guidance
         -- The tool policy the harness is validated under is fixed per
         -- provider variant; a disagreement is a preflight refusal.
+        -- Native Claude executes the physical binary in safe mode, with no wrapper
+        -- profile, customizations, shell, or MCP. Grounded exposes exactly
+        -- Read/Glob/Grep under restricted plan mode; packet exposes no tools.
+        -- Native commands pin an exact versioned model and a fresh UUIDv4 session;
+        -- remote resume is refused. Explicit effort and packet system text survive
+        -- transport unchanged, while prompt bytes reach the process only on stdin.
+        -- Native admission observes capability, authentication and transport for
+        -- this exact worker context. A cash cap additionally requires current
+        -- subscription billing evidence, independent of login and OMP credentials.
 }
 
 rule CostCapRefused {
@@ -291,9 +302,15 @@ rule EvidenceValidated {
             exit_status_recorded: 0,
             failure_detail: "",
             provider_may_have_run: true,
-            provider_session: null
+            provider_session: session_for(d) if d.provider in {omp, claude} else null
         )
         d.result = result
+
+    @guidance
+        -- Native JSON success must corroborate the requested model/session and
+        -- contain a final response. Grounded Claude also requires an exact ctx
+        -- session export with the worker cwd. Packet results persist no session.
+        -- Missing or mismatched evidence remains a failure at Weft retrieval.
 }
 
 rule EvidenceRefused {
