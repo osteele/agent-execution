@@ -329,7 +329,6 @@ rule RenewableBudgetExtensionAndCap {
 
     ensures:
         d.result.budget_telemetry.termination_reason in {absolute_cap, no_recent_progress}
-        d.result.budget_telemetry.duration_seconds <= d.renewable_budget.max_seconds
 
     @guidance
         -- The deadline extends by extension_seconds only while qualifying
@@ -337,10 +336,15 @@ rule RenewableBudgetExtensionAndCap {
         -- successful restricted tool completion — is younger than
         -- progress_window_seconds, and one observation cannot renew twice.
         -- Token text, heartbeats, repeated identical reads, repeated
-        -- failures, and no-op writes never renew. The absolute cap wins even
-        -- with continuous progress. All durations are monotonic. Output
-        -- salvage, group termination, reaping, and cleanup are unchanged, and
-        -- nothing resumes the terminated attempt.
+        -- failures, and no-op writes never renew. Every deadline is bounded by
+        -- the fixed monotonic start time plus max_seconds. At the first budget
+        -- check observing that absolute deadline at or after expiry,
+        -- absolute_cap wins even with continuous progress. Scheduling can
+        -- delay this check. Decision at_seconds records elapsed time at
+        -- observation and can exceed max_seconds. Result duration_seconds
+        -- includes subsequent group termination, output drain, reaping, and
+        -- cleanup, so it can exceed max_seconds too. All durations are
+        -- monotonic; a terminated attempt is never resumed.
 }
 
 rule HarnessFailureAttributed {
