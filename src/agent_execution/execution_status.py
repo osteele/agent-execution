@@ -460,8 +460,13 @@ def _probe(
                     observed_omp = _probe_omp(subject["selector"], environment, timeout)
                     capability = "available" if observed_omp["model_available"] else "unavailable"
                     auth = "available" if observed_omp["credential_available"] else "unavailable"
+                    model_detail = (
+                        str(observed_omp["detail"])
+                        if auth == "available" or not observed_omp["model_available"]
+                        else f"Pinned SDK model observed for {subject['selector']}"
+                    )
                     detail, auth_detail = (
-                        str(observed_omp["detail"]),
+                        model_detail,
                         "Pinned SDK execution-eligible credentials "
                         + ("observed" if auth == "available" else "absent"),
                     )

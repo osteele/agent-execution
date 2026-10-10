@@ -80,7 +80,11 @@ class ExecutionStatusTests(unittest.TestCase):
         document = self.fresh(credential=False)
         facts = document["rows"][0]["facts"]
         self.assertEqual(facts["capability"]["state"], "available")
+        self.assertEqual(facts["capability"]["detail"], f"Pinned SDK model observed for {SELECTOR}")
         self.assertEqual(facts["authentication"]["state"], "unavailable")
+        self.assertEqual(
+            facts["authentication"]["detail"], "Pinned SDK execution-eligible credentials absent"
+        )
         self.assertEqual(facts["quota"]["state"], "unknown")
         self.assertEqual(facts["generation"]["state"], "unknown")
         self.assertEqual(document["rows"][0]["credential_basis"]["basis"], "subscription")
