@@ -16,7 +16,8 @@ import socket
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable
+import unicodedata
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
@@ -83,6 +84,64 @@ ARTIFACT_RETRIEVAL_SECONDS = 300.0
 MARK_PROCESSED_TIMEOUTS = (30.0, 60.0)
 REMOTE_OBSERVATION_SECONDS = 900.0
 DIAGNOSTIC_TAIL_LINES = 200
+#: Public Weft job attributes: at most 32 entries, ASCII keys matching
+#: ^[a-z][a-z0-9_.-]{0,63}$, and values of 1..256 UTF-8 bytes carrying no
+#: Unicode control characters (Cc). Values are sent verbatim; this module
+#: never normalizes, truncates, or defaults them.
+WEFT_ATTRIBUTE_MAX_ENTRIES = 32
+WEFT_ATTRIBUTE_VALUE_MAX_BYTES = 256
+WEFT_ATTRIBUTE_KEY_PATTERN = r"[a-z][a-z0-9_.-]{0,63}"
+_WEFT_ATTRIBUTE_KEY = re.compile(WEFT_ATTRIBUTE_KEY_PATTERN)
+
+
+def validate_weft_attributes(
+    attributes: Mapping[str, str] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Validate optional job attributes once and freeze them as ascending pairs.
+
+    The freeze must happen at construction: every admission of one assignment
+    repeats these exact pairs under the same idempotency key, so a caller that
+    mutates its mapping after dispatch begins cannot change what a resend
+    declares. Validation is total -- a mapping that is invalid anywhere raises
+    here, before any submission, rather than truncating, silently omitting, or
+    normalizing entries.
+    """
+    if attributes is None:
+        return ()
+    if not isinstance(attributes, Mapping):
+        raise ValueError("Weft attributes must be a mapping of string keys to string values")
+    items = list(attributes.items())
+    if len(items) > WEFT_ATTRIBUTE_MAX_ENTRIES:
+        raise ValueError(
+            f"Weft attributes allow at most {WEFT_ATTRIBUTE_MAX_ENTRIES} entries, "
+            f"received {len(items)}"
+        )
+    pairs: list[tuple[str, str]] = []
+    for key, value in items:
+        # fullmatch, not a `$`-anchored search: `$` also matches before a
+        # trailing newline, which is not a legal key character.
+        if not isinstance(key, str) or _WEFT_ATTRIBUTE_KEY.fullmatch(key) is None:
+            raise ValueError(
+                f"Weft attribute key {key!r} must be 1..64 ASCII characters "
+                f"matching ^{WEFT_ATTRIBUTE_KEY_PATTERN}$"
+            )
+        if not isinstance(value, str):
+            raise ValueError(f"Weft attribute {key!r} must carry a string value")
+        try:
+            size = len(value.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise ValueError(
+                f"Weft attribute {key!r} value is not valid Unicode (lone surrogate?)"
+            ) from error
+        if not 1 <= size <= WEFT_ATTRIBUTE_VALUE_MAX_BYTES:
+            raise ValueError(
+                f"Weft attribute {key!r} value must be 1..{WEFT_ATTRIBUTE_VALUE_MAX_BYTES} "
+                f"UTF-8 bytes, received {size}"
+            )
+        if any(unicodedata.category(character) == "Cc" for character in value):
+            raise ValueError(f"Weft attribute {key!r} value carries a Unicode control character")
+        pairs.append((key, value))
+    return tuple(sorted(pairs))
 
 
 def harness_capability_name(provider: str) -> str:
@@ -479,6 +538,7 @@ class WeftCommandRunner:
         allow_queue: bool = False,
         project: str = WORKER_PROJECT,
         worker_executable: str = "agent-execution-worker",
+        attributes: Mapping[str, str] | None = None,
     ) -> None:
         self.host = host
         self.agent = agent
@@ -503,6 +563,11 @@ class WeftCommandRunner:
         self.readiness = readiness
 
         self.max_cost_usd = validate_max_cost_usd(max_cost_usd)
+        # Frozen once, here: every admission of this assignment repeats the
+        # same --attr words under the same idempotency key, so a caller
+        # mutating its mapping after construction cannot change what a resend
+        # declares.
+        self.attributes = validate_weft_attributes(attributes)
         self.allow_queue = allow_queue
         # The Weft project credits the job to its consumer, whose unprocessed
         # list it belongs on: the worker only executes it, and a job filed
@@ -1732,6 +1797,16 @@ class WeftCommandRunner:
                     self.worker_result_path,
                     "--payload",
                     f"{WORKER_PROMPT_PAYLOAD}={payload.name}",
+                    # Optional consumer attributes, frozen at construction and
+                    # emitted as one `--attr key=value` word per pair in a
+                    # stable ascending-key order, so every admission resend of
+                    # this assignment declares identical attributes. A Weft
+                    # option, not part of the worker command Weft executes.
+                    *(
+                        word
+                        for key, value in self.attributes
+                        for word in ("--attr", f"{key}={value}")
+                    ),
                     *([] if self.allow_queue else ["--if-online"]),
                     "--idempotency-key",
                     self.model_call_id,

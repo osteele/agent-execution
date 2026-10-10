@@ -595,6 +595,7 @@ runner = WeftCommandRunner(
     host=os.environ["EXAMPLE_WEFT_HOST"],
     agent="omp", model_call_id=call_id, project="execution-example",
     fallback=None, allow_queue=True, max_cost_usd=0,
+    attributes={"client": "execution-example", "call": call_id},
     expected_source_sha256=source,
     worker_executable=source_worker_executable(source),
 )
@@ -632,6 +633,15 @@ archival; an application must also apply its own output-validation policy.
 If waiting or acknowledgment fails, retain the database and reconcile that
 call's job through `lookup_submitted_job` and `WeftCommandRunner.retrieve`.
 Do not rerun the script to replace an unresolved call with a fresh identity.
+
+`WeftCommandRunner` accepts an optional `attributes` mapping for opaque Weft job
+metadata. It freezes the mapping at construction and emits its entries in sorted
+key order on every admission attempt. Later edits to the caller's mapping do not
+change a resend. `None` and an empty mapping emit no attribute arguments.
+
+At most 32 entries are allowed. Keys must match `[a-z][a-z0-9_.-]{0,63}` in full;
+values must contain 1–256 UTF-8 bytes without Unicode control characters.
+Invalid mappings raise `ValueError` at construction, before invoking Weft.
 
 ### Admission receipts
 
