@@ -290,6 +290,7 @@ therefore reserves a 4h17m Weft slot.
 |---|---|---|
 | `agent_execution.execution_status` | `probe_status`, `cached_status`, `probe_remote_status`, `validate_status` | Query the actual executor and exact context; preserve unknown and stale facts. |
 | `agent_execution.worker` | `execute_worker`, `WorkerResult.parse`, `installed_worker_identity` | Supply the provider, command, unique call ID, deadlines, and retained protocol/source expectations; interpret the returned status and evidence. |
+| `agent_execution.native_evidence` | `recover_native_evidence`, `RecoveredNativeEvidence` | Recover ctx-only evidence for a retained successful native Claude run; pass the exact registered executor/account and original protocol/source expectations. |
 | `agent_execution.budget` | `RenewableBudget`, `BudgetClock`, `validate_budget_stats` | Supply the policy to `execute_worker(..., renewable_budget=...)` with `timeout=None`; interpret `WorkerResult.budget`. |
 | `agent_execution.identity` | `worker_evidence_path`, `source_worker_executable` | Retain the dispatched evidence path and source-addressed executable with the request. |
 | `agent_execution.weft` | `WeftCommandRunner`, `WeftRunReceipt.parse` | Persist dispatch identity, reconcile accepted or ambiguous work, and acknowledge only after durable consumption. |
@@ -444,6 +445,35 @@ and pinned session. Grounded completion also requires a valid `ctx` transcript
 for that session and working directory. Packet completion carries the native
 JSON output, with no persisted session or `ctx` evidence. Weft retrieval checks
 the original model/session expectations and rejects incomplete native evidence.
+
+If the native envelope proves success but ctx observation fails, the retained
+worker result remains `evidence_failed` (unknown for evidence purposes). A
+consumer may call `agent_execution.native_evidence.recover_native_evidence`
+with that immutable result and separately established exact producer executor,
+account, worker protocol, and source digest. Consumers must match the original
+artifact SHA-256 to their retained record. Requested placement (`execution.host`)
+is not producer authority. During explicit targeted retrieval, consumers may
+reuse `WeftCommandRunner.record_observed_host(job_id, cwd, execution)` when the
+original observation was not persisted. It validates the public job-list v1
+surface and selects the exact job row; missing/unsupported/malformed/timeout
+remains unobserved. Resolve `host_observation.observed_host` through the current
+exact registration and retain that observation separately as recovery provenance.
+Never substitute requested placement for missing observation or registration.
+The SDK uses SSH to invoke only public `ctx import` and
+`ctx show session --mode log --format json` on that registered executor, for the
+original provider session. It does not `cd` into the old source directory or
+require it to exist; every observed session-cwd fact must match the original
+worker directory. A matching fact cannot override a conflicting one.
+The SDK validates the public transcript and returns a separate
+`RecoveredNativeEvidence`; it never mutates
+the worker result or reruns the model. Timeout, cancellation, or observation
+failure is not success and must remain unknown. Consumer-specific registration,
+nonce, and manifest policy remains the consumer's responsibility.
+
+Normalized tool activity receives full fidelity only when content is complete
+and its grounding is supported and readable. Unknown capture states,
+unsupported activity, conflicting paths, and unreadable file facts retain
+partial fidelity; provider text cannot override those normalized unknowns.
 
 Probe the exact remote subject with `probe_remote_status(host="studio",
 account="agent", harness="claude", surface="worker",

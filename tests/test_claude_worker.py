@@ -127,7 +127,20 @@ class ClaudeWorkerTests(unittest.TestCase):
                                 "event_type": "tool_call",
                                 "occurred_at": "2026-10-09T00:00:00.000Z",
                                 "content": {"complete": True},
-                                "activity": {"facts": [{"kind": "session_cwd", "value": str(cwd)}]},
+                                "activity": {
+                                    "revision": 1,
+                                    "invocation": {
+                                        "tool": "Read",
+                                        "arguments": {
+                                            "capture_status": "present",
+                                            "value": {"file_path": str(cwd / "sample")},
+                                        },
+                                    },
+                                    "facts": [
+                                        {"kind": "session_cwd", "value": str(cwd)},
+                                        {"kind": "file", "value": str(cwd / "sample")},
+                                    ],
+                                },
                                 "text": json.dumps(
                                     {"name": "Read", "input": {"file_path": str(cwd / "sample")}}
                                 ),
