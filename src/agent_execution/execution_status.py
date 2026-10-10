@@ -338,6 +338,11 @@ def _probe_native_claude(
         return "unavailable", "Native Claude executable is unavailable", {}
     launch_path = launch.get("PATH", os.defpath)
     launch = {**launch, "PATH": f"{Path(executable).parent}{os.pathsep}{launch_path}"}
+    # The physical file's invalidation identity is captured BEFORE the --help
+    # probe runs, from the exact binary that was resolved. A binary replaced
+    # between resolution and observation must never be the one the recorded
+    # facts -- and the launch they admit -- describe.
+    observed_identity = credentials._executable_identity(executable)
     try:
         result = run_in_process_group(
             [executable, "--help"], cwd or Path.cwd(), "", timeout, environment=launch
@@ -346,13 +351,21 @@ def _probe_native_claude(
         return (
             "unknown",
             "Native Claude capability help probe failed",
-            {"executable": executable, "environment": launch},
+            {"executable": executable, "environment": launch, "identity": observed_identity},
         )
     if result.returncode:
         return (
             "unknown",
             "Native Claude capability help probe failed",
-            {"executable": executable, "environment": launch},
+            {"executable": executable, "environment": launch, "identity": observed_identity},
+        )
+    if credentials._executable_identity(executable) != observed_identity:
+        # The binary changed while its help was being read. Nothing about it
+        # was observed, so it is not admitted as observed and nothing binds.
+        return (
+            "unavailable",
+            "Native Claude executable changed during its capability help probe",
+            {"executable": executable, "environment": launch, "identity": observed_identity},
         )
     help_text = result.stdout + result.stderr
     missing = [flag for flag in ("--safe-mode", "--tools", "--restricted") if flag not in help_text]
@@ -360,12 +373,25 @@ def _probe_native_claude(
         return (
             "unavailable",
             "Native Claude lacks required worker options: " + ", ".join(missing),
-            {"executable": executable, "environment": launch},
+            {"executable": executable, "environment": launch, "identity": observed_identity},
         )
+    # This is the worker's own preflight observation of its dispatch surface.
+    # Record the exact executable, scrubbed environment, and the identity
+    # captured before the help probe, so the one launch that follows reuses
+    # them instead of resolving PATH a second time; a fresh resolution could
+    # select a binary these facts never described. Only an "available"
+    # observation binds: a failed help probe validated nothing.
+    from agent_execution.claude_execution import record_native_launch_binding
+
+    record_native_launch_binding(executable, launch, identity=observed_identity)
     return (
         "available",
         "Native Claude worker options observed from the physical binary",
-        {"executable": executable, "environment": launch},
+        {
+            "executable": executable,
+            "environment": launch,
+            "identity": observed_identity,
+        },
     )
 
 
@@ -421,6 +447,7 @@ def _probe(
             basis.update(basis=credentials.BASIS_UNOBSERVED, reported_source=None)
         elif harness in {"claude", "claude-packet"}:
             capability, detail, launch = _probe_native_claude(environment, cwd, timeout)
+            observed_identity = launch.get("identity")
             native_environment = launch.get("environment")
             if isinstance(native_environment, dict):
                 try:
@@ -446,6 +473,27 @@ def _probe(
             else:
                 auth_detail = (
                     "Native Claude executable is unavailable for authentication observation"
+                )
+                basis = credentials.CredentialBasis(
+                    "claude", credentials.BASIS_UNOBSERVED, None, time.time(), ""
+                ).to_dict()
+            if (
+                isinstance(observed_identity, str)
+                and credentials._executable_identity(str(launch["executable"])) != observed_identity
+            ):
+                # The binary changed between the help probe and the
+                # authentication probe. No fact observed in between describes
+                # a binary that still exists, so nothing here is admitted as
+                # observed and the recorded launch binding is dropped.
+                from agent_execution.claude_execution import discard_native_launch_binding
+
+                discard_native_launch_binding()
+                capability = "unavailable"
+                detail = "Native Claude executable changed after its capability help probe"
+                auth = "unknown"
+                auth_detail = (
+                    "Native Claude authentication was not observed for the admitted binary: "
+                    "the executable changed after its capability help probe"
                 )
                 basis = credentials.CredentialBasis(
                     "claude", credentials.BASIS_UNOBSERVED, None, time.time(), ""

@@ -21,16 +21,21 @@ import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast
 
-from agent_execution.agy_execution import validate_agy_command
+from agent_execution.agy_execution import AGY_ROUTE, validate_agy_command
 from agent_execution.claude_execution import claude_envelope, validate_claude_command
 from agent_execution.command import CommandResult, CommandRunner, ProgressCallback, run_command
 from agent_execution.costs import validate_max_cost_usd
 from agent_execution.identity import source_sha256, source_worker_executable, worker_evidence_path
 from agent_execution.omp_execution import omp_transcript, validate_omp_command
-from agent_execution.weft_protocol import WEFT_HOST_LIST_COMMAND, parse_weft_host_capabilities
+from agent_execution.weft_protocol import (
+    WEFT_HOST_LIST_COMMAND,
+    WeftCapabilities,
+    parse_weft_host_capabilities,
+)
 from agent_execution.worker import (
     WORKER_PROJECT,
     WORKER_PROTOCOL_VERSION,
@@ -163,6 +168,31 @@ def validate_weft_attributes(
 def harness_capability_name(provider: str) -> str:
     """Worker variants use the same installed physical harness."""
     return {"omp-packet": "omp", "claude-packet": "claude"}.get(provider, provider)
+
+
+@dataclass(frozen=True)
+class WeftWorkerStatus:
+    """One paired worker's own execution-status envelope, bound to one dispatch host.
+
+    The consumer (today agent-review) obtains this from Agent Execution's
+    versioned status probe of the host's registered SSH address; every fact in
+    the envelope was observed by the worker on that host. `host` is the
+    dispatch host the probe was made for, `account` is that address's SSH
+    account -- which the producer itself verified against the row's OS user --
+    and `expected_execution_sha256` is the paired build the envelope must
+    carry. `destination` is the registered SSH address the envelope was
+    actually observed through: the record is bound to its observation origin,
+    and a record without that origin is unbound -- it never admits anything.
+    The placement filter re-runs Execution's own validation and re-checks
+    every identity at use, so a stale, foreign, or rewritten record
+    authorizes nothing.
+    """
+
+    host: str
+    account: str | None
+    envelope: Mapping[str, object]
+    expected_execution_sha256: str
+    destination: str | None = None
 
 
 def _tail(text: str) -> str:
@@ -556,6 +586,7 @@ class WeftCommandRunner:
         worker_executable: str = "agent-execution-worker",
         attributes: Mapping[str, str] | None = None,
         inputs: Sequence[str] = (),
+        worker_status: WeftWorkerStatus | None = None,
     ) -> None:
         self.host = host
         self.agent = agent
@@ -599,9 +630,20 @@ class WeftCommandRunner:
         self.prompt_sha256: str | None = None
         self.omp_selector: str | None = None
         self.omp_policy: str | None = None
+        #: The tool policy of the validated Claude invocation, captured with
+        #: the selector: the status subject this dispatch may be admitted by
+        #: must match what will actually run, not a per-provider default.
+        self.claude_policy: str | None = None
         self.claude_contract: dict[str, object] = {}
         self.last_execution: dict[str, object] | None = None
         self.submitter_session = submitter_session or f"agent-execution/v1/{model_call_id}"
+        # The exact execution-status subject selector this dispatch will ask
+        # the worker to run, derived from the validated command at call time,
+        # and the paired worker's own status record for the dispatch host.
+        # Both are consumed by the placement filter; the record may also be
+        # attached after construction, at the point its producer observed it.
+        self.status_selector: str | None = None
+        self.worker_status = worker_status
 
     def _progress(self, state: str, **fields: object) -> None:
         if self.progress is not None:
@@ -802,16 +844,47 @@ class WeftCommandRunner:
             if self.host == WEFT_AUTO_HOST
             else tuple(item for item in declarations if item.host == self.host)
         )
-        if any(
+        statically_eligible = any(
             declaration.values is not None
             and all(capability in declaration.values for capability in required)
             for declaration in candidates
-        ):
+        )
+        if statically_eligible:
+            # A valid exact-host status can be used as the authority for
+            # omitting Weft's --agent shorthand even when the manual tag is
+            # also present. A bad/irrelevant record never weakens the existing
+            # static-tag route; auto placement never gets this exception.
+            if self.worker_status is not None and self.host != WEFT_AUTO_HOST:
+                worker_refusal = self._worker_status_refusal(candidates)
+                if worker_refusal is None:
+                    return {
+                        "state": "eligible",
+                        "command": command,
+                        "required_capabilities": list(required),
+                        "capability_basis": "worker-execution-status",
+                    }
             return {
                 "state": "eligible",
                 "command": command,
                 "required_capabilities": list(required),
             }
+
+        # Exact hosts only: the paired worker's own current execution-status
+        # facts can stand in for the manually maintained harness tag, because
+        # those facts were observed by the worker on this exact host for this
+        # exact subject, and the worker revalidates them before any dispatch.
+        # An auto host names no executor, so no pre-observed record can be
+        # exact and the manual tags remain its only route.
+        worker_refusal: str | None = None
+        if self.worker_status is not None and self.host != WEFT_AUTO_HOST:
+            worker_refusal = self._worker_status_refusal(candidates)
+            if worker_refusal is None:
+                return {
+                    "state": "eligible",
+                    "command": command,
+                    "required_capabilities": list(required),
+                    "capability_basis": "worker-execution-status",
+                }
 
         scope = "any inventory host" if self.host == WEFT_AUTO_HOST else f"host {self.host!r}"
         details = [
@@ -820,6 +893,8 @@ class WeftCommandRunner:
                 f"capability ({', '.join(required)})"
             )
         ]
+        if worker_refusal is not None:
+            details.append(worker_refusal)
         if not candidates:
             details.append(
                 "the inventory contains no candidate host for this route; missing capabilities: "
@@ -858,6 +933,168 @@ class WeftCommandRunner:
             "required_capabilities": list(required),
             "detail": "; ".join(details),
         }
+
+    def _dispatch_subject(self) -> tuple[str, str] | None:
+        """The exact (surface, tool_policy) this dispatch will ask the worker to run.
+
+        Derived from the parsed/validated invocation the way the worker's own
+        preflight derives it (`worker.py`): a `workspace-write-no-shell` OMP
+        invocation is the `offload-task` surface; every other supported
+        invocation is the `worker` surface, with the policy the harness
+        validator forced. The status subject that may admit this dispatch is
+        the subject that will actually run -- a fresh read-only envelope can
+        never authorize a workspace-write call, and a write envelope authorizes
+        only the matching write subject.
+        """
+        if self.agent in {"omp", "omp-packet"}:
+            policy = self.omp_policy
+            if policy is None:
+                return None
+            return ("offload-task" if policy == "workspace-write-no-shell" else "worker", policy)
+        if self.agent in {"claude", "claude-packet"}:
+            # validate_claude_command forces the policy per provider variant;
+            # a validated capture agrees with it by construction.
+            fallback = (
+                "packet-only-no-tools" if self.agent == "claude-packet" else "read-only-no-shell"
+            )
+            return ("worker", self.claude_policy or fallback)
+        if self.agent == "agy":
+            return ("worker", "packet-only-no-tools")
+        return None
+
+    def _worker_status_refusal(self, candidates: tuple[WeftCapabilities, ...]) -> str | None:
+        """Why the paired worker's own status cannot admit this dispatch, or None.
+
+        The record substitutes only for the manual `agent:<harness>` tag. The
+        inventory must still declare `tool:agent-execution` -- the worker has
+        to be installed where Weft would place the job -- and the record must
+        be Execution's own validated answer about this exact host, account,
+        paired build and dispatch subject, with the facts this launch needs
+        currently available. Anything else refuses: an unknown, stale, or
+        mismatched observation never authorizes a generation.
+        """
+        record = self.worker_status
+        assert record is not None
+        if record.host != self.host:
+            return f"worker status names host {record.host!r}, not {self.host!r}"
+        if record.expected_execution_sha256 != self.expected_source_sha256:
+            return "worker status names another paired build than this dispatch"
+        if self.status_selector is None:
+            return "worker status requires a derivable dispatch selector"
+        subject_pair = self._dispatch_subject()
+        if subject_pair is None:
+            return "worker status requires a derivable dispatch surface and tool policy"
+        surface, tool_policy = subject_pair
+        # A record is authority only when it is bound to its observation
+        # origin: the registered SSH destination the envelope was actually
+        # observed through, whose account the producer checked against the
+        # row's OS user. An unbound record -- alias string equality alone --
+        # is not proof of anything and fails closed.
+        if not isinstance(record.destination, str) or not record.destination:
+            return "worker status has no registered SSH observation destination"
+        account, separator, endpoint_host = record.destination.partition("@")
+        if (
+            not separator
+            or not account
+            or not endpoint_host
+            or "@" in endpoint_host
+            or any(character.isspace() for character in record.destination)
+        ):
+            return "worker status destination is not a concrete user@host SSH endpoint"
+        if record.account != account:
+            return (
+                f"worker status account {record.account!r} does not match the registered "
+                f"destination account {account!r}"
+            )
+        if len(candidates) != 1:
+            return (
+                f"Weft inventory has {len(candidates)} entries for selected host "
+                f"{self.host!r}; endpoint binding requires exactly one"
+            )
+        inventory_host = candidates[0]
+        if not inventory_host.endpoint_valid:
+            return "selected Weft host has malformed SSH endpoint facts"
+        target = inventory_host.ssh_target
+        if not isinstance(target, str) or not target:
+            return "selected Weft host has no concrete ssh_target endpoint"
+        if target != record.destination:
+            return (
+                f"selected Weft ssh_target {target!r} does not match Review's "
+                f"registered observation origin {record.destination!r}"
+            )
+        from agent_execution import execution_status
+
+        try:
+            envelope = execution_status.validate_status(
+                dict(record.envelope),
+                expected_execution_sha256=record.expected_execution_sha256,
+            )
+        except (TypeError, ValueError) as error:
+            return f"worker status is not a valid execution-status envelope: {error}"
+        expected_subject = {
+            "harness": self.agent,
+            "surface": surface,
+            "selector": self.status_selector,
+            "tool_policy": tool_policy,
+            "transport": "weft",
+        }
+        rows = [
+            row
+            for row in envelope["rows"]
+            if all(
+                value is None or row["subject"].get(name) == value
+                for name, value in expected_subject.items()
+            )
+        ]
+        if len(rows) != 1:
+            return (
+                "worker status carries no single row for this dispatch subject "
+                f"({self.agent} {self.status_selector} {surface}/{tool_policy} [weft])"
+            )
+        subject = rows[0]["subject"]
+        if record.account is not None and subject.get("os_user") != record.account:
+            return (
+                f"worker status observed OS account {subject.get('os_user')!r}, "
+                f"not the registered account {record.account!r}"
+            )
+        if (
+            subject.get("requester_host") != socket.gethostname()
+            or subject.get("requester_user") != getpass.getuser()
+        ):
+            return "worker status was requested by another requester identity"
+        generated = datetime.fromisoformat(
+            str(envelope["generated_at"]).replace("Z", "+00:00")
+        ).timestamp()
+        drift = max(0.0, time.time() - generated)
+        facts = rows[0]["facts"]
+        for name in ("capability", "transport", "authentication"):
+            fact = facts[name]
+            expired = fact["stale"] or (
+                fact["observed_at"] is not None
+                and float(fact["age_seconds"]) + drift >= execution_status.TTL
+            )
+            if fact["state"] != "available" or expired:
+                qualifier = "" if fact["state"] == "available" else f" {fact['state']}"
+                suffix = " (expired)" if expired and fact["state"] == "available" else ""
+                return (
+                    f"worker status does not currently admit {name}:"
+                    f"{qualifier or ' unobserved'}{suffix}: {fact['detail']}"
+                )
+        quota = facts["quota"]
+        quota_fresh = (
+            quota["observed_at"] is not None
+            and float(quota["age_seconds"]) + drift < execution_status.TTL
+        )
+        if quota["state"] == "unavailable" and not quota["stale"] and quota_fresh:
+            return f"worker status reports quota unavailable: {quota['detail']}"
+        declaration = next((item for item in candidates if item.host == self.host), None)
+        if (
+            declaration is None
+            or declaration.values is None
+            or WEFT_TOOL_CAPABILITY not in declaration.values
+        ):
+            return f"host {self.host!r} does not declare {WEFT_TOOL_CAPABILITY}"
+        return None
 
     @staticmethod
     def _attach_placement_diagnostic(
@@ -1760,8 +1997,21 @@ class WeftCommandRunner:
         cwd: Path,
         timeout: float | None,
         deadline: float,
+        *,
+        worker_status_authorized: bool = False,
     ) -> CommandResult:
         route = [] if self.host == WEFT_AUTO_HOST else ["--host", self.host]
+        # `weft run --agent NAME` is shorthand for requiring `agent:NAME`.
+        # The exact-host worker-status path has already validated the full
+        # subject, identity, source and fresh facts in this call; retaining the
+        # shorthand here would make Weft filter out the authorized worker anyway.
+        # Never relax that filter for mere record presence, auto placement, or
+        # the ordinary static-tag route.
+        agent_requirement = (
+            []
+            if worker_status_authorized and self.host != WEFT_AUTO_HOST
+            else ["--agent", harness_capability_name(self.agent)]
+        )
         # The brief, located by shape. `command[-1]` was the third place this
         # file assumed the prompt comes last: for an OMP command it is the
         # trailing `--system-prompt` value, so the payload shipped to the
@@ -1778,14 +2028,7 @@ class WeftCommandRunner:
                     self.executable,
                     "run",
                     *route,
-                    "--agent",
-                    # Weft's agent vocabulary names the harness, not our
-                    # adapter variant: `--agent omp-packet` exits 1 with no
-                    # JSON, which surfaced here as "Weft submission did not
-                    # return JSON" -- a parse complaint for a rejected flag.
-                    # The capability filter below already uses this spelling,
-                    # so the two now agree by construction.
-                    harness_capability_name(self.agent),
+                    *agent_requirement,
                     "--require-capability",
                     WEFT_TOOL_CAPABILITY,
                     # `agent-execution-worker` is deployed per host, so a review
@@ -2060,6 +2303,10 @@ class WeftCommandRunner:
                 "claude_model": native.model,
                 "claude_session_id": native.session_id,
             }
+            self.claude_policy = native.policy
+            self.status_selector = f"anthropic/{native.model}"
+        else:
+            self.status_selector = None
         deadline = self.clock() + (REMOTE_OBSERVATION_SECONDS if timeout is None else timeout)
         # The brief the worker will be handed, located by shape rather than by
         # position: hashing `command[-1]` pinned a trailing flag for any harness
@@ -2070,9 +2317,11 @@ class WeftCommandRunner:
             invocation = validate_omp_command(command, cwd)
             self.omp_selector = invocation.selector
             self.omp_policy = invocation.policy
+            self.status_selector = invocation.selector
         if self.agent == "agy":
             # Refuse before any placement or submission, as for OMP.
-            validate_agy_command(command)
+            agy = validate_agy_command(command)
+            self.status_selector = f"{AGY_ROUTE}/{agy.model}"
         self.last_execution = None
         placement = self._placement_check(cwd, deadline)
         if placement["state"] == "unknown":
@@ -2122,8 +2371,39 @@ class WeftCommandRunner:
         submission: CommandResult | None = None
         for attempt in range(1, len(ADMISSION_RETRY_DELAYS) + 2):
             self._progress("submitting", transport="weft", host=self.host, attempt=attempt)
+            # The worker-status authority is revalidated immediately before
+            # EVERY actual `weft run` attempt, against the same exact host and
+            # inventory and the record's current envelope -- including the
+            # attempt after a proven not_accepted backoff. A basis computed
+            # before the loop is never reused: an authority that has expired,
+            # or that no longer matches, refuses here unless the ordinary
+            # static-tag route currently admits, and the `--agent` filter is
+            # kept whenever the fresh exact status does not pass.
+            authorized = False
+            if self.worker_status is not None and self.host != WEFT_AUTO_HOST:
+                fresh = self._placement_check(cwd, deadline)
+                if fresh["state"] == "refused":
+                    detail = str(fresh["detail"])
+                    self._progress(
+                        "placement_refused",
+                        transport="weft",
+                        host=self.host,
+                        attempt=attempt,
+                        detail=detail,
+                    )
+                    raise WeftPlacementRefused(detail)
+                authorized = (
+                    fresh["state"] == "eligible"
+                    and fresh.get("capability_basis") == "worker-execution-status"
+                )
             try:
-                submission = self._submit(command, cwd, timeout, deadline)
+                submission = self._submit(
+                    command,
+                    cwd,
+                    timeout,
+                    deadline,
+                    worker_status_authorized=authorized,
+                )
             except WeftExecutionAmbiguous as error:
                 # The local `weft run` waiter can consume the entire harness
                 # budget before returning a receipt. Its timeout says nothing

@@ -432,5 +432,135 @@ class ExecutionStatusTests(unittest.TestCase):
             self.assertNotIn("PRIVATE-", path.read_text())
 
 
+class WorkerCliExecutionStatusTests(unittest.TestCase):
+    """The ``execution-status`` CLI surface, against a fake native install.
+
+    This is the versioned, non-generating operation a registered remote status
+    probe invokes on a worker. These cases were previously only printable
+    lines in a local fake-install smoke script; they are real unit tests here,
+    and nothing about them is deployment evidence: no remote probe was run.
+    """
+
+    def setUp(self) -> None:
+        import getpass
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        wrapper = bin_dir / "claude"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "wrapper" ] && [ "$2" = "native-binary" ]; then\n'
+            '    IFS= read -r physical < "$FAKE_NATIVE_POINTER" || exit 70\n'
+            '    echo "$physical"\n'
+            "    exit 0\n"
+            "fi\n"
+            'echo "unsupported wrapper invocation" >&2\n'
+            "exit 64\n"
+        )
+        wrapper.chmod(0o755)
+        pointer = self.root / "pointer.txt"
+        native = self.root / "native-executable"
+        native.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 60)
+        native.chmod(0o755)
+        pointer.write_text(f"{native}\n")
+        environment = mock.patch.dict(
+            os.environ,
+            {
+                "PATH": str(bin_dir),
+                "FAKE_NATIVE_POINTER": str(pointer),
+                "AGENT_PROVIDER_STATUS_DIR": str(self.root / "observations"),
+                "AGENT_PROVIDER_STATUS_TRANSPORT": "none",
+                "ANTHROPIC_API_KEY": "sk-test-cli-secret",
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.account = getpass.getuser()
+
+    def test_cli_exposes_the_validated_no_generation_envelope(self) -> None:
+        import io
+        import socket
+
+        from agent_execution.execution_status import SCHEMA
+        from agent_execution.identity import source_sha256
+        from agent_execution.worker_cli import main
+
+        basis = credentials.CredentialBasis(
+            "claude", credentials.BASIS_SUBSCRIPTION, "none", time.time(), "fixture-fingerprint"
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch(
+                "agent_execution.execution_status.run_in_process_group",
+                return_value=subprocess.CompletedProcess(
+                    ["claude", "--help"], 0, "--safe-mode --tools --restricted", ""
+                ),
+            ),
+            mock.patch(
+                "agent_execution.credentials.observe_claude_auth",
+                return_value=mock.Mock(state="available", answered=True, basis=basis),
+            ),
+            mock.patch("sys.stdout", new=stdout),
+        ):
+            status = main(
+                [
+                    "execution-status",
+                    "--harness",
+                    "claude-packet",
+                    "--surface",
+                    "worker",
+                    "--selector",
+                    SELECTOR,
+                    "--transport",
+                    "weft",
+                    "--tool-policy",
+                    "packet-only-no-tools",
+                    "--json",
+                ]
+            )
+        self.assertEqual(status, 0)
+        text = stdout.getvalue()
+        self.assertNotIn("sk-test-cli-secret", text)
+        envelope = json.loads(text)
+        self.assertEqual(envelope["schema_version"], SCHEMA)
+        # Execution's own validator accepts the exposed answer.
+        execution_status.validate_status(envelope)
+        self.assertEqual(envelope["worker_identity"]["source_sha256"], source_sha256())
+        observer = envelope["observer"]
+        self.assertEqual(observer["host"], socket.gethostname())
+        self.assertEqual(observer["os_user"], self.account)
+        rows = envelope["rows"]
+        self.assertEqual(len(rows), 1)
+        subject = rows[0]["subject"]
+        expected = {
+            "harness": "claude-packet",
+            "surface": "worker",
+            "selector": SELECTOR,
+            "tool_policy": "packet-only-no-tools",
+            "transport": "weft",
+            "requester_host": socket.gethostname(),
+            "requester_user": self.account,
+            "host": socket.gethostname(),
+            "os_user": self.account,
+        }
+        for name, value in expected.items():
+            self.assertEqual(subject.get(name), value, name)
+        facts = rows[0]["facts"]
+        self.assertEqual(
+            set(facts),
+            {"capability", "authentication", "quota", "generation", "transport"},
+        )
+        for name in ("capability", "authentication", "transport"):
+            fact = facts[name]
+            self.assertEqual(fact["state"], "available", name)
+            self.assertFalse(fact["stale"], name)
+        # The operation provably generated nothing.
+        self.assertIsNone(facts["generation"]["observed_at"])
+        self.assertEqual(facts["generation"]["state"], "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()

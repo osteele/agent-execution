@@ -36,8 +36,11 @@ from agent_execution.budget import RenewableBudget, validate_budget_stats
 from agent_execution.claude_execution import (
     ClaudeInvocation,
     ClaudeStatusError,
+    NativeClaudeLaunchBinding,
     claude_envelope,
+    discard_native_launch_binding,
     run_claude_command,
+    take_native_launch_binding,
     validate_claude_command,
 )
 from agent_execution.command import CommandResult, CommandRunner
@@ -236,6 +239,7 @@ def run_command_with_prompt(
     timeout: float | None,
     *,
     renewable_budget: RenewableBudget | None = None,
+    claude_launch: NativeClaudeLaunchBinding | None = None,
 ) -> CommandResult:
     """Run a harness with prompt bytes on stdin and process-group cleanup.
 
@@ -245,6 +249,9 @@ def run_command_with_prompt(
     A renewable budget is refused here for every non-OMP harness, before any
     process starts: an unsupported route must not fall back to silently
     ignoring the policy.
+
+    `claude_launch` is the preflight's own validated native observation; the
+    Claude launch reuses it exactly instead of resolving PATH a second time.
     """
     if renewable_budget is not None and (not command or Path(command[0]).name != "omp"):
         raise ValueError("renewable budgets are supported only for OMP workspace-write-no-shell")
@@ -266,7 +273,7 @@ def run_command_with_prompt(
         completed = run_agy_command(command, cwd, timeout, prompt=prompt)
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
     if command and Path(command[0]).name == "claude":
-        completed = run_claude_command(command, cwd, timeout, prompt=prompt)
+        completed = run_claude_command(command, cwd, timeout, prompt=prompt, launch=claude_launch)
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
     completed = run_in_process_group(command, cwd, prompt, timeout)
     return CommandResult(
@@ -283,6 +290,7 @@ def run_worker_command(
     timeout: float | None,
     *,
     renewable_budget: RenewableBudget | None = None,
+    claude_launch: NativeClaudeLaunchBinding | None = None,
 ) -> CommandResult:
     """Run a worker helper with the same process-group cleanup as the harness.
 
@@ -292,6 +300,9 @@ def run_worker_command(
 
     A renewable budget is refused here for every non-OMP helper, before any
     process starts.
+
+    `claude_launch` is the preflight's own validated native observation; the
+    Claude launch reuses it exactly instead of resolving PATH a second time.
     """
     name = Path(command[0]).name if command else ""
     if renewable_budget is not None and name != "omp":
@@ -308,7 +319,7 @@ def run_worker_command(
         completed = run_agy_command(command, cwd, timeout)
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
     if name == "claude":
-        completed = run_claude_command(command, cwd, timeout)
+        completed = run_claude_command(command, cwd, timeout, launch=claude_launch)
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
     completed = run_in_process_group(command, cwd, "", timeout)
     return CommandResult(
@@ -1149,6 +1160,11 @@ def execute_worker(
             assert agy_invocation is not None
             selector = f"{AGY_ROUTE}/{agy_invocation.model}"
         surface = "offload-task" if invocation.policy == "workspace-write-no-shell" else "worker"
+        if claude_invocation is not None:
+            # A binding left by an earlier probe in this process is not this
+            # attempt's observation. Discard it so only this preflight's own
+            # fresh probe can bind the one launch that follows.
+            discard_native_launch_binding()
         try:
             status = execution_status.probe_status(
                 harness=provider,
@@ -1186,6 +1202,32 @@ def execute_worker(
                     "preflight_failed",
                     failure="cost-cap-refused: native Claude has no current subscription billing proof",
                 )
+    # The preflight probe above recorded the exact native launch it validated.
+    # Consume it here so this attempt's single launch runs that executable and
+    # scrubbed environment -- not a second PATH resolution, which could select
+    # a binary the facts this worker just admitted never described.
+    claude_launch = take_native_launch_binding() if claude_invocation is not None else None
+    if (
+        claude_invocation is not None
+        and claude_launch is None
+        and invoke is run_worker_command
+        and invoke_prompt is run_command_with_prompt
+    ):
+        # The worker's real launch path must never fall back to a fresh PATH
+        # resolution: a binding that is absent or expired at consumption means
+        # this attempt's own validated observation no longer stands behind a
+        # launch, so nothing here may start. `run_claude_command(launch=None)`
+        # keeps resolving afresh for standalone historical callers; it is not
+        # a worker fallback. Injected test runners keep the historical
+        # contract and are not the production launch boundary.
+        return finish(
+            "preflight_failed",
+            failure=(
+                "native Claude launch has no current one-shot binding from this "
+                "preflight: the validated observation expired or was already "
+                "consumed, so no harness may start"
+            ),
+        )
     ctx_version = ""
     if provider in _SESSION_EVIDENCE_PROVIDERS:
         try:
@@ -1214,6 +1256,9 @@ def execute_worker(
         if harness_model:
             harness_command.extend(["--model", harness_model])
         harness_started_at = clock()
+        # The launch keyword is passed only when a binding exists, so injected
+        # test runners with the historical positional contract are untouched.
+        launch_arguments = {"claude_launch": claude_launch} if claude_launch is not None else {}
         if renewable_budget is not None:
             if prompt_payload is not None:
                 command_result = run_command_with_prompt(
@@ -1222,6 +1267,7 @@ def execute_worker(
                     prompt,
                     timeout,
                     renewable_budget=renewable_budget,
+                    **launch_arguments,
                 )
             else:
                 command_result = run_worker_command(
@@ -1229,11 +1275,14 @@ def execute_worker(
                     working_directory,
                     timeout,
                     renewable_budget=renewable_budget,
+                    **launch_arguments,
                 )
         elif prompt_payload is not None:
-            command_result = invoke_prompt(harness_command, working_directory, prompt, timeout)
+            command_result = invoke_prompt(
+                harness_command, working_directory, prompt, timeout, **launch_arguments
+            )
         else:
-            command_result = invoke(harness_command, working_directory, timeout)
+            command_result = invoke(harness_command, working_directory, timeout, **launch_arguments)
     except subprocess.TimeoutExpired as error:
         # A timed-out harness has usually already said why it stopped making
         # progress, and that explanation is on the exception rather than lost:

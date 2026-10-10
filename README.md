@@ -422,6 +422,11 @@ configuration. They bypass wrapper profiles and proxy routing; inherited
 Anthropic key, route, and model overrides are removed. A physical Mach-O or ELF
 executable is required, resolved directly or through `claude wrapper native-binary`.
 
+Worker preflight pins the physical executable and scrubbed environment used by
+its capability and authentication probes. The call consumes that binding once,
+without resolving `PATH` again. An expired binding or a replaced executable
+cannot authorize generation.
+
 Logical commands use `claude -p PROMPT --input-format text --output-format json`,
 `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`, an exact native
 `--model` such as `claude-opus-5-5`, and a fresh UUIDv4 `--session-id`.
