@@ -1168,7 +1168,7 @@ def execute_worker(
         facts = row["facts"]
         required = (
             ("capability", "transport", "authentication")
-            if omp_invocation or claude_invocation
+            if omp_invocation or claude_invocation or agy_invocation
             else ("capability", "transport")
         )
         for name in required:

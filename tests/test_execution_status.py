@@ -431,6 +431,72 @@ class ExecutionStatusTests(unittest.TestCase):
         for path in (self.root / "observations").rglob("*.json"):
             self.assertNotIn("PRIVATE-", path.read_text())
 
+    def test_agy_sign_in_observation_and_independence(self):
+        agy_bin = self.root / "agy"
+        agy_bin.write_text("#!/bin/sh\nexit 0\n")
+        agy_bin.chmod(0o755)
+        launch_env = {"PATH": str(self.root), "HOME": str(self.root)}
+
+        # 1. Signed in
+        with mock.patch(
+            "agent_execution.credentials._run_status_command",
+            return_value=subprocess.CompletedProcess(
+                ["agy", "models"], 0, "gemini-3.1-pro-high\tGemini 3.1 Pro\n", ""
+            ),
+        ):
+            status = execution_status.probe_status(
+                harness="agy",
+                surface="worker",
+                selectors=["google-antigravity/gemini-3.1-pro-high"],
+                tool_policy="packet-only-no-tools",
+                environment=launch_env,
+            )
+            row = status["rows"][0]
+            self.assertEqual(row["facts"]["capability"]["state"], "available")
+            self.assertEqual(row["facts"]["authentication"]["state"], "available")
+            self.assertEqual(
+                row["facts"]["authentication"]["detail"],
+                "Antigravity CLI authentication is available",
+            )
+            self.assertEqual(row["credential_basis"]["basis"], "not_observable")
+
+        # 2. Signed out (please sign in)
+        with mock.patch(
+            "agent_execution.credentials._run_status_command",
+            return_value=subprocess.CompletedProcess(
+                ["agy", "models"], 1, "Error: Please sign in to view available models.\n", ""
+            ),
+        ):
+            status = execution_status.probe_status(
+                harness="agy",
+                surface="worker",
+                selectors=["google-antigravity/gemini-3.1-pro-high"],
+                tool_policy="packet-only-no-tools",
+                environment=launch_env,
+            )
+            row = status["rows"][0]
+            self.assertEqual(row["facts"]["capability"]["state"], "available")
+            self.assertEqual(row["facts"]["authentication"]["state"], "unavailable")
+            self.assertEqual(
+                row["facts"]["authentication"]["detail"],
+                "Antigravity CLI authentication is unavailable",
+            )
+            self.assertEqual(row["credential_basis"]["basis"], "not_observable")
+
+        # 3. agy binary missing
+        empty_env = {"PATH": "/nonexistent", "HOME": str(self.root)}
+        status = execution_status.probe_status(
+            harness="agy",
+            surface="worker",
+            selectors=["google-antigravity/gemini-3.1-pro-high"],
+            tool_policy="packet-only-no-tools",
+            environment=empty_env,
+        )
+        row = status["rows"][0]
+        self.assertEqual(row["facts"]["capability"]["state"], "unavailable")
+        self.assertEqual(row["facts"]["authentication"]["state"], "unavailable")
+        self.assertEqual(row["credential_basis"]["basis"], "not_observable")
+
 
 if __name__ == "__main__":
     unittest.main()

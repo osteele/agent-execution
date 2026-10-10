@@ -484,11 +484,30 @@ def _probe(
                 ).to_dict()
         else:
             launch = credentials.harness_launch_environment(harness, environment=environment)
-            capability = (
-                "available"
-                if shutil.which("agy", path=launch.get("PATH", os.defpath))
-                else "unavailable"
-            )
+            executable = shutil.which("agy", path=launch.get("PATH", os.defpath))
+            if executable:
+                capability = "available"
+                try:
+                    observed = credentials.observe_agy_auth(
+                        cwd=cwd,
+                        environment=launch,
+                        timeout=timeout,
+                        native_executable=executable,
+                    )
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    auth_detail = "Antigravity CLI authentication observation failed"
+                else:
+                    auth = observed.state
+                    auth_detail = (
+                        f"Antigravity CLI authentication is {observed.state}"
+                        if observed.answered
+                        else "Antigravity CLI authentication gave no readable answer"
+                    )
+            else:
+                capability = "unavailable"
+                detail = "Antigravity CLI executable is unavailable"
+                auth = "unavailable"
+                auth_detail = "Antigravity CLI executable is unavailable"
             basis = credentials.observe_credential_basis(
                 "agy", state_root=None, cwd=cwd, environment=environment
             ).to_dict()

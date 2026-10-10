@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -797,6 +798,12 @@ class NativeAuthStatus:
             return f"{self.harness} is not installed on the scrubbed launch PATH"
         if not self.answered:
             return f"{self.harness} auth status gave no readable answer"
+        if self.harness == "agy":
+            if self.logged_in is True:
+                return "Antigravity CLI sign-in observed"
+            if self.logged_in is False:
+                return "Antigravity CLI sign-in is absent"
+            return "Antigravity CLI authentication observation failed"
         fields = [
             f"loggedIn={'unknown' if self.logged_in is None else str(self.logged_in).lower()}",
             f"authMethod={self.auth_method or 'unreported'}",
@@ -912,6 +919,100 @@ def observe_claude_auth(
                 profile=profile,
                 env_keys=_CLAUDE_CACHE_ENV_KEYS,
             ),
+        ),
+    )
+
+
+def observe_agy_auth(
+    *,
+    cwd: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    timeout: float | None = None,
+    clock: float | None = None,
+    native_executable: str | None = None,
+) -> NativeAuthStatus:
+    """Observe Antigravity CLI sign-in state by probing `agy models`.
+
+    `agy models` is non-generating; it verifies whether credentials exist and
+    are accepted. If the user is signed in, it lists models and exits 0. If
+    not signed in, it reports "Please sign in" and exits non-zero.
+    """
+    now = time.time() if clock is None else clock
+    launch = harness_launch_environment("agy", environment=environment)
+    resolved = native_executable or _resolved_status_executable("agy", launch)
+    if resolved is None:
+        return NativeAuthStatus(
+            harness="agy",
+            executable=None,
+            answered=False,
+            logged_in=None,
+            auth_method=None,
+            api_provider=None,
+            subscription_type=None,
+            api_key_source=None,
+            observed_at=now,
+            basis=CredentialBasis(
+                harness="agy",
+                basis=BASIS_NOT_OBSERVABLE,
+                reported_source=None,
+                observed_at=now,
+                fingerprint="",
+            ),
+        )
+    completed = _run_status_command(
+        [resolved, "models"],
+        cwd=cwd,
+        environment=launch,
+        timeout=_PROBE_TIMEOUT_SECONDS if timeout is None else timeout,
+    )
+    if completed is None:
+        return NativeAuthStatus(
+            harness="agy",
+            executable=resolved,
+            answered=False,
+            logged_in=None,
+            auth_method=None,
+            api_provider=None,
+            subscription_type=None,
+            api_key_source=None,
+            observed_at=now,
+            basis=CredentialBasis(
+                harness="agy",
+                basis=BASIS_NOT_OBSERVABLE,
+                reported_source=None,
+                observed_at=now,
+                fingerprint="",
+            ),
+        )
+    output = f"{completed.stdout}\n{completed.stderr}"
+    if "please sign in" in output.casefold() or re.search(
+        r"\bnot (?:logged|signed) in\b", output, re.IGNORECASE
+    ):
+        logged_in = False
+        answered = True
+    elif completed.returncode == 0:
+        logged_in = True
+        answered = True
+    else:
+        logged_in = None
+        answered = False
+
+    return NativeAuthStatus(
+        harness="agy",
+        executable=resolved,
+        answered=answered,
+        logged_in=logged_in,
+        auth_method="oauth" if logged_in else None,
+        api_provider="google-antigravity" if logged_in else None,
+        subscription_type=None,
+        api_key_source=None,
+        observed_at=now,
+        basis=CredentialBasis(
+            harness="agy",
+            basis=BASIS_NOT_OBSERVABLE,
+            reported_source=None,
+            observed_at=now,
+            fingerprint="",
         ),
     )
 
