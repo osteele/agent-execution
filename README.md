@@ -14,6 +14,17 @@ The optional OMP (Oh My Pi) coding-agent runtime exposes three tool policies:
 The writer policy adds confined `execution_write` and `execution_edit` tools;
 it does not grant a shell. Tool confinement is not an operating-system sandbox.
 
+Read confinement admits ordinary relative symlinks that already exist inside
+the snapshot: read, glob, and search resolve file links, paths through linked
+directories, and chained relative links while every resolution step stays
+inside the root, and a linked base path resolves once to its canonical
+in-root target. Absolute targets (even into the root), direct or intermediate
+escapes, cycles, dangling links, and links into VCS or harness metadata are
+refused, and implicit glob and search traversal never follows directory links
+or scans linked entries. Write and edit confinement refuses every symlink,
+including an in-root alias: a link is neither overwritten nor retargeted, and
+its target file is edited only at the target's canonical in-root path.
+
 - [Install and first integration](#install-and-first-integration)
 - [First worker execution](#first-worker-execution)
 - [Python API map](#python-api-map)

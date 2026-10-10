@@ -5,13 +5,14 @@ import {
 	lstat,
 	open,
 	readFile,
+	readlink,
 	realpath,
 	readdir,
 	rename,
 	rm,
 	stat,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type * as OmpSdk from "@oh-my-pi/pi-coding-agent";
 
@@ -165,6 +166,12 @@ function writeOutput(line: string): Promise<void> {
 	return promise;
 }
 
+function pathComponents(value: string): string[] {
+	// POSIX treats backslash as an ordinary filename character. Windows accepts
+	// both slash forms as separators; never reinterpret a POSIX filename.
+	return value.split(sep === "\\" ? /[\\/]+/ : /\/+/);
+}
+
 function rejectUnsafePath(value: string, forbidMetadata: boolean): void {
 	if (
 		!value ||
@@ -176,7 +183,7 @@ function rejectUnsafePath(value: string, forbidMetadata: boolean): void {
 			"Only relative filesystem paths inside the execution snapshot are permitted",
 		);
 	}
-	for (const part of value.split(/[\\/]+/)) {
+	for (const part of pathComponents(value)) {
 		if (part === "..") throw new Error("Path traversal is not permitted");
 		if (forbidMetadata && FORBIDDEN_METADATA.has(part.toLowerCase()))
 			throw new Error("VCS and harness metadata paths are not editable");
@@ -188,45 +195,107 @@ function rejectUnsafePath(value: string, forbidMetadata: boolean): void {
 	}
 }
 
+/**
+ * Explicit finite hop bound for confined read resolution; link chains,
+ * cycles, and deep expansions are refused once resolution exceeds it.
+ */
+const MAX_LINK_HOPS = 32;
+
+/**
+ * The one confinement resolver for every tool path, with an explicit
+ * read-versus-write distinction. Read resolution may traverse existing
+ * relative symlinks while every resolution step stays inside the canonical
+ * snapshot root; write resolution refuses every symlink, including an in-root
+ * alias, so no link is overwritten or retargeted. User-supplied paths always
+ * keep the traversal, URI-device, and absolute refusals of rejectUnsafePath;
+ * only link targets may use `..`, and only while the walk remains inside the
+ * root. Confinement is decided before any content is read: resolution opens
+ * nothing beyond lstat/readlink on in-root candidates.
+ */
 async function safeSnapshotPath(
 	root: string,
 	value: string,
 	{
+		mode,
 		mustExist,
 		forbidMetadata = false,
-	}: { mustExist: boolean; forbidMetadata?: boolean },
+	}: { mode: "read" | "write"; mustExist: boolean; forbidMetadata?: boolean },
 ): Promise<string> {
 	rejectUnsafePath(value, forbidMetadata);
 	const rootReal = await realpath(root);
-	const candidate = resolve(rootReal, value);
-	const rel = relative(rootReal, candidate);
-	if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-		throw new Error("Path escapes the execution snapshot");
-	}
-	const parts = rel ? rel.split(sep) : [];
-	let cursor = rootReal;
-	for (let index = 0; index < parts.length; index++) {
-		cursor = join(cursor, parts[index]);
+	const pending = pathComponents(value).filter((part) => part && part !== ".");
+	const resolved: string[] = [];
+	let hops = 0;
+	let linked = false;
+	while (pending.length) {
+		const part = pending.shift()!;
+		if (part === ".") {
+			const current = join(rootReal, ...resolved);
+			if (!(await lstat(current)).isDirectory())
+				throw new Error("Symlink target requires a directory");
+			continue;
+		}
+		if (part === "..") {
+			// Only link targets reach here; rejectUnsafePath already refused
+			// user-supplied `..`. `resolved` holds lstat-verified non-symlink
+			// names, so its lexical parent is the real parent.
+			if (!resolved.length)
+				throw new Error("Symlink target escapes the execution snapshot");
+			resolved.pop();
+			continue;
+		}
+		const candidate = join(rootReal, ...resolved, part);
+		let info;
 		try {
-			const info = await lstat(cursor);
-			if (info.isSymbolicLink())
-				throw new Error("Symlink paths are not permitted");
-			if (index < parts.length - 1 && !info.isDirectory())
-				throw new Error("Path parent is not a directory");
+			info = await lstat(candidate);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			if (mustExist || index < parts.length - 1)
+			if (mustExist || pending.length)
 				throw new Error("Path parent does not exist safely");
+			resolved.push(part);
+			break;
 		}
+		if (info.isSymbolicLink()) {
+			if (mode === "write")
+				throw new Error("Symlink paths are not permitted");
+			const target = await readlink(candidate);
+			if (isAbsolute(target))
+				throw new Error("Absolute symlink targets are not permitted");
+			if (++hops > MAX_LINK_HOPS)
+				throw new Error("Symlink resolution exceeds the link hop bound");
+			const steps = pathComponents(target).filter(Boolean);
+			if (target.endsWith(sep) || (sep === "\\" && target.endsWith("/")))
+				steps.push(".");
+			if (steps.some((step) => FORBIDDEN_METADATA.has(step.toLowerCase())))
+				throw new Error(
+					"Symlink targets must not name VCS or harness metadata",
+				);
+			linked = true;
+			pending.unshift(...steps);
+			continue;
+		}
+		resolved.push(part);
+		if (pending.length && !info.isDirectory())
+			throw new Error("Path parent is not a directory");
 	}
-	return candidate;
+	if (linked) {
+		const entered = resolved.find((entry) =>
+			FORBIDDEN_METADATA.has(entry.toLowerCase()),
+		);
+		if (entered)
+			throw new Error(
+				"Symlink paths must not resolve into VCS or harness metadata",
+			);
+	}
+	return join(rootReal, ...resolved);
 }
 
+/** Confined read path: existing relative in-root links resolve to their canonical target. */
 export async function confinedPath(
 	root: string,
 	value: string,
 ): Promise<string> {
-	return safeSnapshotPath(root, value, { mustExist: true });
+	return safeSnapshotPath(root, value, { mode: "read", mustExist: true });
 }
 
 async function textFile(
@@ -340,13 +409,14 @@ export function writeTools(z: typeof OmpSdk.z, root: string) {
 			name: "execution_write" as const,
 			label: "Write snapshot",
 			description:
-				"Replace or create one UTF-8 file inside the execution snapshot. Relative paths only; symlinks, traversal, URLs and VCS metadata are refused.",
+				"Replace or create one UTF-8 file inside the execution snapshot. Relative paths only; every symlink including an in-root alias, traversal, URLs and VCS metadata are refused.",
 			parameters: z.object({
 				path: z.string(),
 				content: z.string(),
 			}),
 			async execute(_id: string, args: { path: string; content: string }) {
 				const path = await safeSnapshotPath(root, args.path, {
+					mode: "write",
 					mustExist: false,
 					forbidMetadata: true,
 				});
@@ -371,7 +441,7 @@ export function writeTools(z: typeof OmpSdk.z, root: string) {
 			name: "execution_edit" as const,
 			label: "Edit snapshot",
 			description:
-				"Replace exactly one matching UTF-8 span inside an existing snapshot file. Ambiguous, missing, no-op, symlink and metadata edits are refused.",
+				"Replace exactly one matching UTF-8 span inside an existing snapshot file. Ambiguous, missing, no-op, symlink (including in-root alias) and metadata edits are refused.",
 			parameters: z.object({
 				path: z.string(),
 				old_text: z.string().min(1),
@@ -382,6 +452,7 @@ export function writeTools(z: typeof OmpSdk.z, root: string) {
 				args: { path: string; old_text: string; new_text: string },
 			) {
 				const path = await safeSnapshotPath(root, args.path, {
+					mode: "write",
 					mustExist: true,
 					forbidMetadata: true,
 				});
@@ -412,7 +483,7 @@ export function readTools(z: typeof OmpSdk.z, root: string) {
 			name: "execution_read" as const,
 			label: "Read snapshot",
 			description:
-				"Read a UTF-8 file of at most 4 MiB inside the execution snapshot. Results are limited to 512 KiB. No URLs, internal devices, shell, or document converters. Line offsets start at 1.",
+				"Read a UTF-8 file of at most 4 MiB inside the execution snapshot. Results are limited to 512 KiB. Existing relative in-root symlinks are followed read-only to their canonical target; absolute, escaping, cyclic, dangling and metadata links are refused. No URLs, internal devices, shell, or document converters. Line offsets start at 1.",
 			parameters: z.object({
 				path: z.string(),
 				offset: z.number().int().min(1).optional(),
@@ -439,7 +510,7 @@ export function readTools(z: typeof OmpSdk.z, root: string) {
 			name: "execution_glob" as const,
 			label: "List snapshot",
 			description:
-				"Find snapshot files by glob (relative to path, default snapshot root). Symlinks are not followed.",
+				"Find snapshot files by glob (relative to path, default snapshot root). An explicit linked base path resolves to its canonical in-root target; linked entries inside the tree are never followed or listed.",
 			parameters: z.object({
 				pattern: z.string(),
 				path: z.string().optional(),
@@ -459,7 +530,7 @@ export function readTools(z: typeof OmpSdk.z, root: string) {
 			name: "execution_grep" as const,
 			label: "Search snapshot",
 			description:
-				"Search UTF-8 snapshot files for a literal string (not a regex). File path or directory path is required. Symlinks, binary and files over 4 MiB are not scanned. Results are limited to 512 KiB.",
+				"Search UTF-8 snapshot files for a literal string (not a regex). File path or directory path is required. An explicit linked base path resolves to its canonical in-root target; linked entries are not scanned implicitly, and binary and files over 4 MiB are not scanned. Results are limited to 512 KiB.",
 			parameters: z.object({ pattern: z.string().min(1), path: z.string() }),
 			async execute(_id: string, args: { pattern: string; path: string }) {
 				const base = await confinedPath(root, args.path);

@@ -122,6 +122,14 @@ entity Dispatch {
         -- preserves existing ordinary-file modes on replacement, and never enables
         -- shell, extension discovery, skills, MCP, reviewed-tree configuration,
         -- or unrestricted native CLI tools.
+        -- Reads may traverse existing relative symlinks while every resolution
+        -- step stays inside the snapshot root; absolute targets, direct or
+        -- intermediate escapes, cycles, dangling links, and links into
+        -- VCS/harness metadata are refused, and implicit glob/grep traversal
+        -- never follows directory links. Write and edit refuse every symlink,
+        -- including an in-root alias, so links are neither overwritten nor
+        -- retargeted; ordinary targets remain editable at canonical in-root
+        -- paths.
         -- Protocol 2 worker results live only at
         -- .agent-execution/results/<model-call-id>.json. Write/edit cannot modify
         -- this namespace (case-insensitive) or legacy worker-result filenames.

@@ -2,9 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import {
 	chmod,
 	link,
+	lstat,
 	mkdtemp,
 	mkdir,
 	readFile,
+	readlink,
 	realpath,
 	rm,
 	stat,
@@ -547,4 +549,246 @@ test("workspace-write edits and writes UTF-8 files through the 2 MiB byte limit"
 		}),
 	).rejects.toThrow();
 	expect(await readFile(join(root, "boundary.txt"))).toEqual(Buffer.from(exactLimit));
+});
+
+/** The pinned deployed SDK module that supplies zod for the tool schemas. */
+async function sdkModule() {
+	const sdkRoot =
+		process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
+		join(homedir(), ".local/share/agent-execution/omp-sdk", SDK_VERSION);
+	return import(
+		pathToFileURL(
+			join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/index.ts"),
+		).href
+	);
+}
+
+/**
+ * A snapshot seeded with the ordinary relative in-root links Offload carries
+ * (file, directory, internal parent step, chain) beside every refused shape.
+ */
+async function linkedSnapshot() {
+	const root = await snapshot();
+	await mkdir(join(root, "realdocs"));
+	await mkdir(join(root, "sub"));
+	await mkdir(join(root, ".git"));
+	await writeFile(join(root, "realdocs", "guide.txt"), "guide\nneedle-doc\n");
+	await writeFile(join(root, ".git", "config"), "[core]\n");
+	// Ordinary relative links: file, directory, parent step, chain, mid-target `..`.
+	await symlink("source.txt", join(root, "alias.txt"));
+	await symlink("realdocs", join(root, "docs"));
+	await symlink("../source.txt", join(root, "sub", "up.txt"));
+	await symlink("second.txt", join(root, "first.txt"));
+	await symlink("alias.txt", join(root, "second.txt"));
+	await symlink("realdocs/../source.txt", join(root, "zig.txt"));
+	// Refused shapes.
+	await symlink(join(root, "source.txt"), join(root, "abs-into-root.txt"));
+	await symlink("../secret.txt", join(root, "rel-escape.txt"));
+	await symlink("sub/../../secret.txt", join(root, "indirect-escape.txt"));
+	await symlink("..", join(root, "parent-dir"));
+	await symlink(".git/config", join(root, "meta-link.txt"));
+	await symlink(".git", join(root, "meta-dir"));
+	await symlink("cycle-b.txt", join(root, "cycle-a.txt"));
+	await symlink("cycle-a.txt", join(root, "cycle-b.txt"));
+	await symlink("self.txt", join(root, "self.txt"));
+	await symlink("missing.txt", join(root, "ghost.txt"));
+	await symlink(".", join(root, "loop"));
+	return root;
+}
+
+test("confined reads resolve relative in-root file, directory, parent-step and chained links", async () => {
+	const root = await linkedSnapshot();
+	const sdk = await sdkModule();
+	const tools = readTools(sdk.z, root);
+	const read = tools.find((tool) => tool.name === "execution_read")!;
+
+	const fileLink = await read.execute("read-file-link", { path: "alias.txt" });
+	expect(fileLink.content[0].text).toContain("2: needle");
+	expect(fileLink.details.paths).toEqual([join(root, "source.txt")]);
+
+	const dirLink = await read.execute("read-dir-link", {
+		path: "docs/guide.txt",
+	});
+	expect(dirLink.content[0].text).toContain("2: needle-doc");
+	expect(dirLink.details.paths).toEqual([join(root, "realdocs", "guide.txt")]);
+
+	const parentStep = await read.execute("read-parent-step", {
+		path: "sub/up.txt",
+	});
+	expect(parentStep.content[0].text).toContain("2: needle");
+	expect(parentStep.details.paths).toEqual([join(root, "source.txt")]);
+
+	const chain = await read.execute("read-chain", { path: "first.txt" });
+	expect(chain.content[0].text).toContain("2: needle");
+	expect(chain.details.paths).toEqual([join(root, "source.txt")]);
+
+	const midDotDot = await read.execute("read-mid-dotdot", { path: "zig.txt" });
+	expect(midDotDot.content[0].text).toContain("2: needle");
+	expect(midDotDot.details.paths).toEqual([join(root, "source.txt")]);
+
+	const glob = tools.find((tool) => tool.name === "execution_glob")!;
+	const listed = await glob.execute("glob-linked-base", {
+		path: "docs",
+		pattern: "*.txt",
+	});
+	expect(listed.details.paths).toEqual([join(root, "realdocs", "guide.txt")]);
+
+	const grep = tools.find((tool) => tool.name === "execution_grep")!;
+	const file = await grep.execute("grep-linked-file", {
+		path: "alias.txt",
+		pattern: "needle",
+	});
+	expect(file.content[0].text).toContain(":2: needle");
+	expect(file.details.paths).toEqual([join(root, "source.txt")]);
+	const directory = await grep.execute("grep-linked-dir", {
+		path: "docs",
+		pattern: "needle-doc",
+	});
+	expect(directory.content[0].text).toContain("guide.txt:2: needle-doc");
+	expect(directory.details.paths).toEqual([join(root, "realdocs", "guide.txt")]);
+});
+
+test("confined reads preserve POSIX symlink component and directory semantics", async () => {
+	const root = await linkedSnapshot();
+	const sdk = await sdkModule();
+	const read = readTools(sdk.z, root).find(
+		(tool) => tool.name === "execution_read",
+	)!;
+
+	// There is a lookalike slash path, but POSIX readlink's backslash is literal.
+	await mkdir(join(root, "data"));
+	await writeFile(join(root, "data", "info.txt"), "wrong-file-marker\n");
+	await symlink("data\\info.txt", join(root, "backslash-target"));
+	await expect(
+		read.execute("blocked-backslash-target", { path: "backslash-target" }),
+	).rejects.toThrow();
+
+	// POSIX file/. and file/ both require the target to be a directory.
+	await writeFile(join(root, "agent-launcher"), "not a directory\n");
+	await symlink("agent-launcher/", join(root, "trailing-file-target"));
+	await symlink("agent-launcher/.", join(root, "dot-file-target"));
+	for (const path of ["trailing-file-target", "dot-file-target"])
+		await expect(read.execute(`blocked-${path}`, { path })).rejects.toThrow();
+
+	// Internal dot/trailing separators on a directory are valid; a chain to it
+	// remains resolvable rather than being rejected wholesale.
+	await symlink("realdocs/./", join(root, "dot-dir-target"));
+	await symlink("dot-dir-target", join(root, "dot-dir-chain"));
+	const valid = await read.execute("valid-dot-directory-chain", {
+		path: "dot-dir-chain/guide.txt",
+	});
+	expect(valid.content[0].text).toContain("2: needle-doc");
+	expect(valid.details.paths).toEqual([join(root, "realdocs", "guide.txt")]);
+});
+
+test("confined reads refuse absolute, escaping, indirect, protected, cyclic and dangling links", async () => {
+	const root = await linkedSnapshot();
+	const sdk = await sdkModule();
+	const read = readTools(sdk.z, root).find(
+		(tool) => tool.name === "execution_read",
+	)!;
+	for (const path of [
+		"abs-into-root.txt", // absolute target even though it points inside the root
+		"rel-escape.txt", // relative `..` escape
+		"indirect-escape.txt", // parent steps that leave the root
+		"parent-dir/secret.txt", // directory-link escape through a child path
+		"meta-link.txt", // link into VCS metadata
+		"meta-dir/config", // directory link into VCS metadata
+		"cycle-a.txt", // two-link cycle
+		"self.txt", // self cycle
+		"ghost.txt", // dangling link
+		"docs/../../../secret.txt", // user-supplied traversal via a linked prefix
+	]) {
+		await expect(read.execute(`blocked-read-${path}`, { path })).rejects.toThrow();
+	}
+	await expect(
+		read.execute("blocked-user-traversal", { path: "docs/../source.txt" }),
+	).rejects.toThrow();
+});
+
+test("writes and edits refuse safe aliases and leave link identity and target bytes intact", async () => {
+	const root = await linkedSnapshot();
+	const sdk = await sdkModule();
+	const tools = writeTools(sdk.z, root);
+	const write = tools.find((tool) => tool.name === "execution_write")!;
+	const edit = tools.find((tool) => tool.name === "execution_edit")!;
+
+	const targetBefore = await readFile(join(root, "source.txt"), "utf8");
+	const guideBefore = await readFile(join(root, "realdocs", "guide.txt"), "utf8");
+	for (const path of ["alias.txt", "docs/guide.txt", "sub/up.txt", "first.txt"]) {
+		await expect(
+			write.execute(`blocked-alias-write-${path}`, {
+				path,
+				content: "forged\n",
+			}),
+		).rejects.toThrow();
+		await expect(
+			edit.execute(`blocked-alias-edit-${path}`, {
+				path,
+				old_text: "needle",
+				new_text: "forged",
+			}),
+		).rejects.toThrow();
+	}
+	// Creating a new file through a linked directory parent is equally refused.
+	await expect(
+		write.execute("blocked-alias-create", {
+			path: "docs/created.txt",
+			content: "created\n",
+		}),
+	).rejects.toThrow();
+
+	const expectedTargets: Record<string, string> = {
+		"alias.txt": "source.txt",
+		docs: "realdocs",
+		"sub/up.txt": "../source.txt",
+		"first.txt": "second.txt",
+		"second.txt": "alias.txt",
+	};
+	for (const [link, target] of Object.entries(expectedTargets)) {
+		const path = join(root, ...link.split("/"));
+		expect((await lstat(path)).isSymbolicLink()).toBe(true);
+		expect(await readlink(path)).toBe(target);
+	}
+	expect(await readFile(join(root, "source.txt"), "utf8")).toBe(targetBefore);
+	expect(await readFile(join(root, "realdocs", "guide.txt"), "utf8")).toBe(
+		guideBefore,
+	);
+	expect(await readFile(join(root, "alias.txt"), "utf8")).toBe(targetBefore);
+
+	// Ordinary targets addressed canonically remain editable beside the alias.
+	await edit.execute("canonical-edit", {
+		path: "source.txt",
+		old_text: "needle",
+		new_text: "marker",
+	});
+	expect(await readFile(join(root, "source.txt"), "utf8")).toBe(
+		"first\nmarker\nlast\n",
+	);
+	expect((await lstat(join(root, "alias.txt"))).isSymbolicLink()).toBe(true);
+});
+
+test("implicit glob and search traversal completes without following directory link loops", async () => {
+	const root = await linkedSnapshot();
+	const sdk = await sdkModule();
+	const tools = readTools(sdk.z, root);
+	const glob = tools.find((tool) => tool.name === "execution_glob")!;
+	const grep = tools.find((tool) => tool.name === "execution_grep")!;
+
+	const listed = await glob.execute("glob-loop", { path: ".", pattern: "**/*" });
+	expect(listed.details.paths).toEqual([
+		join(root, "realdocs", "guide.txt"),
+		join(root, "source.txt"),
+	]);
+
+	const searched = await grep.execute("grep-loop", {
+		path: ".",
+		pattern: "needle",
+	});
+	expect(searched.details.paths).toEqual([
+		join(root, "realdocs", "guide.txt"),
+		join(root, "source.txt"),
+	]);
+	expect(searched.content[0].text).toContain("guide.txt:2: needle-doc");
+	expect(searched.content[0].text).toContain("source.txt:2: needle");
 });
