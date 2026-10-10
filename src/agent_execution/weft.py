@@ -7,8 +7,10 @@ to submit again. Product state and result interpretation belong to the consumer.
 
 from __future__ import annotations
 
+import csv
 import getpass
 import hashlib
+import io
 import json
 import re
 import shlex
@@ -17,7 +19,7 @@ import subprocess
 import tempfile
 import time
 import unicodedata
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
@@ -43,6 +45,20 @@ WEFT_HOST_OBSERVATION_TIMEOUT = 10.0
 WEFT_INVENTORY_TAG = "inventory"
 WEFT_AUTO_HOST = "auto"
 WEFT_TOOL_CAPABILITY = "tool:agent-execution"
+
+
+def _encode_weft_input(value: str) -> str:
+    """Encode one value as a Go encoding/csv record for pflag StringSlice."""
+    output = io.StringIO(newline="")
+    csv.writer(output, lineterminator="\n").writerow([value])
+    encoded = output.getvalue()[:-1]
+    # Go's csv.Writer quotes leading and trailing whitespace; Python's
+    # QUOTE_MINIMAL does not. Match that detail while preserving its escaping.
+    if value and (value[0].isspace() or value[-1].isspace()) and not encoded.startswith('"'):
+        encoded = f'"{encoded}"'
+    return encoded
+
+
 #: Cores booked per worker job. A job declaring no CPU is booked at Weft's
 #: default of 7 cores, so only one fits a 12-core worker and the rest
 #: trickle in through the runner's load path. Workers wait on model APIs: of
@@ -539,6 +555,7 @@ class WeftCommandRunner:
         project: str = WORKER_PROJECT,
         worker_executable: str = "agent-execution-worker",
         attributes: Mapping[str, str] | None = None,
+        inputs: Sequence[str] = (),
     ) -> None:
         self.host = host
         self.agent = agent
@@ -568,6 +585,11 @@ class WeftCommandRunner:
         # mutating its mapping after construction cannot change what a resend
         # declares.
         self.attributes = validate_weft_attributes(attributes)
+        # Freeze explicit inputs with the assignment: every admission resend
+        # must declare the same inputs under the same idempotency key.
+        if isinstance(inputs, str):
+            raise ValueError("inputs must be a sequence of references, not a string")
+        self.inputs = tuple(inputs)
         self.allow_queue = allow_queue
         # The Weft project credits the job to its consumer, whose unprocessed
         # list it belongs on: the worker only executes it, and a job filed
@@ -1806,6 +1828,11 @@ class WeftCommandRunner:
                         word
                         for key, value in self.attributes
                         for word in ("--attr", f"{key}={value}")
+                    ),
+                    *(
+                        word
+                        for entry in self.inputs
+                        for word in ("--input", _encode_weft_input(entry))
                     ),
                     *([] if self.allow_queue else ["--if-online"]),
                     "--idempotency-key",

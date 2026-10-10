@@ -654,6 +654,14 @@ At most 32 entries are allowed. Keys must match `[a-z][a-z0-9_.-]{0,63}` in full
 values must contain 1–256 UTF-8 bytes without Unicode control characters.
 Invalid mappings raise `ValueError` at construction, before invoking Weft.
 
+The optional `inputs` sequence carries explicit Weft input references, such as
+`["local:lab-notebook/guide.md"]`; a bare string raises `ValueError` at construction.
+The runner freezes their order and repeats them unchanged across admission resends.
+Each reference is encoded as one CSV field for Weft's `--input` parser,
+preserving commas and quotes in paths. The consumer owns file selection and
+validation against its captured inputs; the SDK does not discover additional
+evidence.
+
 ### Admission receipts
 
 The transport normalizes `weft.run.receipt.v1` into `WeftRunReceipt`.
