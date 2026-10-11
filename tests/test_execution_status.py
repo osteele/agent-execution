@@ -76,6 +76,38 @@ class ExecutionStatusTests(unittest.TestCase):
             arguments.update(overrides)
             return execution_status.probe_status(**arguments)
 
+    def test_shell_writer_policy_is_an_offload_task_capability(self):
+        document = self.fresh(tool_policy="workspace-write-shell")
+        subject = document["rows"][0]["subject"]
+        self.assertEqual(subject["tool_policy"], "workspace-write-shell")
+        self.assertEqual(document["rows"][0]["facts"]["capability"]["state"], "available")
+
+    def test_older_reader_cache_cannot_erase_shell_policy_quota_refusal(self):
+        subject = self.fresh(tool_policy="workspace-write-shell")["rows"][0]["subject"]
+        execution_status.record_generation(subject, succeeded=False, condition="quota")
+        projection = self.root / "observations" / "execution-projection.json"
+        projection.unlink()
+        # A still-running no-shell worker rebuilds the shared index from the
+        # same event log, rejecting policies it cannot interpret.
+        with (
+            mock.patch.object(
+                provider_status,
+                "EXECUTION_TOOL_POLICIES",
+                ("packet-only-no-tools", "read-only-no-shell", "workspace-write-no-shell"),
+            ),
+            mock.patch.object(
+                provider_status,
+                "_EXECUTION_PROJECTION_SCHEMA",
+                "provider-status-execution-projection/v1",
+            ),
+        ):
+            execution_status.cached_status(**self.query())
+        facts = execution_status.cached_status(**self.query(tool_policy="workspace-write-shell"))[
+            "rows"
+        ][0]["facts"]
+        self.assertEqual(facts["quota"]["state"], "unavailable")
+        self.assertEqual(facts["generation"]["state"], "unavailable")
+
     def test_catalog_credentials_quota_and_generation_are_independent(self):
         document = self.fresh(credential=False)
         facts = document["rows"][0]["facts"]

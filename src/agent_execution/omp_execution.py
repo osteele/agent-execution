@@ -1,4 +1,4 @@
-"""Pinned OMP SDK launch and native event evidence, shared by both OMP policies.
+"""Pinned OMP SDK launch and native event evidence for restricted OMP policies.
 
 The CLI's --tools flag is NOT a security allowlist in OMP 18.1.15. The shipped
 SDK helper uses restrictToolNames and only its own confined filesystem tools.
@@ -78,6 +78,7 @@ OMP_TOKEN_BILLING_KEYS = (
 )
 OMP_READ_TOOLS = ("execution_read", "execution_glob", "execution_grep")
 OMP_WRITE_TOOLS = (*OMP_READ_TOOLS, "execution_write", "execution_edit")
+OMP_SHELL_TOOLS = (*OMP_WRITE_TOOLS, "execution_shell")
 #: Confined tools that change bytes on success. The policy's write/edit tools
 #: refuse no-op writes, so a successful completion is proof of a source change
 #: even when identical arguments ran earlier after an intervening edit — and
@@ -94,6 +95,7 @@ MAX_CHANGED_PATHS = 8192
 _PACKET = "packet-only-no-tools"
 _GROUNDED = "read-only-no-shell"
 _WRITER = "workspace-write-no-shell"
+_SHELL_WRITER = "workspace-write-shell"
 #: Identities admitted to ``workspace-write-no-shell``. This is a curated
 #: allowlist, not a projection of the grounded registry: Kimi writes as ``k3``
 #: rather than its grounded ``kimi-k2.5``, so membership is stated per provider
@@ -345,7 +347,7 @@ def validate_omp_command(
     if "--cwd" not in values or (cwd / values["--cwd"]).resolve() != cwd.resolve():
         raise ValueError("OMP command cwd differs from execution snapshot")
     policy = values.get("--execution-tool-policy", "")
-    if policy not in {_PACKET, _GROUNDED, _WRITER}:
+    if policy not in {_PACKET, _GROUNDED, _WRITER, _SHELL_WRITER}:
         raise ValueError("OMP command lacks its enforced tool policy")
     selector = values.get("--model", "")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", selector):
@@ -354,14 +356,14 @@ def validate_omp_command(
     if policy == _GROUNDED and selector not in grounded_selectors:
         permitted = ", ".join(sorted(GROUNDED_OMP_SELECTORS))
         raise ValueError(f"grounded OMP selector must be registered: {permitted}")
-    if policy == _WRITER and selector not in OMP_WRITER_SELECTORS:
+    if policy in {_WRITER, _SHELL_WRITER} and selector not in OMP_WRITER_SELECTORS:
         permitted = ", ".join(sorted(OMP_WRITER_SELECTORS))
         raise ValueError(f"writer OMP selector must be registered: {permitted}")
     if policy == _PACKET and booleans != boolean_flags:
         raise ValueError(
             "packet OMP must disable tools, session, extensions, skills, rules and LSP"
         )
-    if policy in {_GROUNDED, _WRITER} and booleans:
+    if policy in {_GROUNDED, _WRITER, _SHELL_WRITER} and booleans:
         raise ValueError("tool-enabled OMP cannot masquerade as packet-only execution")
     return OmpInvocation(selector, policy, prompt, values.get("--system-prompt", ""))
 
@@ -394,15 +396,13 @@ def _count_changed_paths(details: object, changed_paths: set[str]) -> int:
 def _renewal_observer(budget: BudgetClock) -> Callable[[str], None]:
     """Build the stdout observer that records qualifying budget progress.
 
-    Only restricted tool lifecycle events qualify, correlated by
+    Only restricted read/write tool lifecycle events qualify, correlated by
     ``toolCallId`` between ``tool_execution_start`` — which alone carries
     ``args`` — and ``tool_execution_end``, which carries ``result`` and an
     explicit ``isError`` and no arguments. A successful write or edit is
     changed bytes by construction and always qualifies, counting the distinct
-    files it reports. Every other restricted tool qualifies only when its
-    exact input was never seen in this attempt, so an identical repeated read
-    renews once and then stops. Token text, heartbeats, failures, duplicate
-    completions, and untracked tools never renew.
+    files it reports. Reads qualify only once per exact input. Shell tools
+    never renew: their output is arbitrary and proves no workspace progress.
     """
     pending: dict[str, tuple[str, str | None]] = {}
     finished: set[str] = set()
@@ -480,16 +480,16 @@ def run_omp_command(
     With ``renewable_budget``, the native tool-event stream is observed and
     qualifying evidence renews the attempt through one ``BudgetClock`` that
     ``run_in_process_group`` owns; the raised ``BudgetTimeoutExpired`` (or the
-    completed result) carries the versioned budget telemetry. Renewable
-    budgets are refused for every other tool policy before launch, because
-    qualifying progress is not observable there.
+    completed result) carries versioned budget telemetry. Renewable budgets
+    require a writer policy before launch. Shell commands remain allowed under
+    the shell-writer policy, but their output never qualifies as progress.
     """
     from agent_execution.budget import BudgetClock
     from agent_execution.processes import run_in_process_group
 
     invocation = validate_omp_command(command, cwd)
-    if renewable_budget is not None and invocation.policy != _WRITER:
-        raise ValueError("renewable budgets require OMP workspace-write-no-shell")
+    if renewable_budget is not None and invocation.policy not in {_WRITER, _SHELL_WRITER}:
+        raise ValueError("renewable budgets require an OMP workspace-write policy")
     root, bun = require_omp_sdk()
     resolved_prompt = invocation.prompt if prompt is None else prompt
     if prompt is not None and invocation.prompt != "-":
@@ -528,6 +528,49 @@ def _object(value: object, label: str) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
+def _validate_shell_arguments(arguments: Mapping[str, object]) -> None:
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        raise ValueError("OMP shell command argument must be a string")
+    if set(arguments) - {"command", "timeout"}:
+        raise ValueError("OMP shell arguments contain unsupported fields")
+    timeout = arguments.get("timeout", 60)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 900:
+        raise ValueError("OMP shell timeout must be an integer from 1 through 900")
+
+
+def _validate_shell_evidence(
+    raw_arguments: object, details: Mapping[str, object], root: Path
+) -> None:
+    arguments = _object(raw_arguments, "shell arguments")
+    _validate_shell_arguments(arguments)
+    required = {
+        "paths",
+        "command",
+        "exit_code",
+        "timed_out",
+        "stdout",
+        "stderr",
+        "truncated",
+    }
+    if set(details) != required:
+        raise ValueError("OMP shell evidence fields are incomplete or unexpected")
+    # The root is canonical on the executor; requester-side symlinks are irrelevant.
+    if details.get("paths") != [str(root)]:
+        raise ValueError("OMP shell evidence must name exactly the snapshot root")
+    if details.get("command") != arguments["command"]:
+        raise ValueError("OMP shell command evidence disagrees with its arguments")
+    exit_code = details.get("exit_code")
+    if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+        raise ValueError("OMP shell exit_code must be an integer or null")
+    if not isinstance(details.get("timed_out"), bool):
+        raise ValueError("OMP shell timed_out evidence must be a boolean")
+    if not isinstance(details.get("stdout"), str) or not isinstance(details.get("stderr"), str):
+        raise ValueError("OMP shell output evidence must be strings")
+    if not isinstance(details.get("truncated"), bool):
+        raise ValueError("OMP shell truncated evidence must be a boolean")
+
+
 def omp_transcript(
     output: str,
     *,
@@ -562,17 +605,24 @@ def omp_transcript(
         r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", selected
     ):
         raise ValueError("OMP execution lacks exact selector")
-    if not isinstance(selected_policy, str) or selected_policy not in {_PACKET, _GROUNDED, _WRITER}:
+    if not isinstance(selected_policy, str) or selected_policy not in {
+        _PACKET,
+        _GROUNDED,
+        _WRITER,
+        _SHELL_WRITER,
+    }:
         raise ValueError("OMP execution has unknown policy")
     if selected_policy == _GROUNDED and selected not in GROUNDED_OMP_TRANSCRIPT_SELECTORS:
         raise ValueError("OMP grounded inference identity was never registered")
-    if selected_policy == _WRITER and selected not in OMP_WRITER_SELECTORS:
+    if selected_policy in {_WRITER, _SHELL_WRITER} and selected not in OMP_WRITER_SELECTORS:
         raise ValueError("OMP writer inference identity was never registered")
     expected_tools = (
         list(OMP_READ_TOOLS)
         if selected_policy == _GROUNDED
         else list(OMP_WRITE_TOOLS)
         if selected_policy == _WRITER
+        else list(OMP_SHELL_TOOLS)
+        if selected_policy == _SHELL_WRITER
         else []
     )
     if header.get("tools") != expected_tools:
@@ -691,6 +741,8 @@ def omp_transcript(
                     for path in paths
                 ):
                     raise ValueError("OMP tool evidence escapes snapshot")
+                if calls[call_id].get("toolName") == "execution_shell":
+                    _validate_shell_evidence(calls[call_id].get("args"), details, root)
             ended[call_id] = event
         elif kind == "agent_end":
             agent_end = True
@@ -789,7 +841,7 @@ def _exec_sdk() -> None:
     _, root, bun, selector, policy, system_prompt = sys.argv[1:]
     if policy == _GROUNDED and selector not in GROUNDED_OMP_SELECTORS:
         raise SystemExit("grounded OMP selector is not registered")
-    if policy == _WRITER and selector not in OMP_WRITER_SELECTORS:
+    if policy in {_WRITER, _SHELL_WRITER} and selector not in OMP_WRITER_SELECTORS:
         raise SystemExit("writer OMP selector is not registered")
     if policy == "--probe-writers":
         try:
@@ -832,6 +884,7 @@ def _exec_sdk() -> None:
             policy,
             system_prompt,
             snapshot_cwd,
+            sys.executable,
         ],
         environment,
     )

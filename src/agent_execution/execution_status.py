@@ -302,7 +302,7 @@ def _supported(subject: Json) -> bool:
     if surface == "offload-task":
         return (
             harness == "omp"
-            and policy == "workspace-write-no-shell"
+            and policy in {"workspace-write-no-shell", "workspace-write-shell"}
             and selector in OMP_WRITER_SELECTORS
         )
     if harness in {"claude", "claude-packet"}:

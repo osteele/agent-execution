@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +67,122 @@ class AntigravityTest(unittest.TestCase):
                 validate_omp_command(
                     omp_command(directory, selector="google-antigravity/gemini-unknown"), cwd
                 )
+
+    def test_shell_writer_command_and_native_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            command = omp_command(directory, shell_writer=True)
+            invocation = validate_omp_command(command, root)
+            self.assertEqual(invocation.policy, "workspace-write-shell")
+
+            raw = omp_output(
+                cwd=str(root),
+                policy="workspace-write-shell",
+                shell_command="pwd",
+            )
+            omp_transcript(raw, policy="workspace-write-shell", cwd=str(root))
+
+            with self.assertRaisesRegex(ValueError, "unauthorized"):
+                omp_transcript(omp_output(cwd=str(root), shell_command="pwd"))
+
+            events = [json.loads(line) for line in raw.splitlines()]
+            shell_start = next(
+                event for event in events if event.get("type") == "tool_execution_start"
+            )
+            shell_start["args"]["timeout"] = 0
+            with self.assertRaisesRegex(ValueError, "timeout"):
+                omp_transcript(chr(10).join(json.dumps(event) for event in events))
+
+            events = [json.loads(line) for line in raw.splitlines()]
+            shell_end = next(event for event in events if event.get("type") == "tool_execution_end")
+            shell_end["result"]["details"]["command"] = "different command"
+            with self.assertRaisesRegex(ValueError, "disagrees"):
+                omp_transcript(chr(10).join(json.dumps(event) for event in events))
+
+            for field in (
+                "paths",
+                "command",
+                "exit_code",
+                "timed_out",
+                "stdout",
+                "stderr",
+                "truncated",
+            ):
+                with self.subTest(field=field):
+                    events = [json.loads(line) for line in raw.splitlines()]
+                    shell_end = next(
+                        event for event in events if event.get("type") == "tool_execution_end"
+                    )
+                    del shell_end["result"]["details"][field]
+                    with self.assertRaises(ValueError):
+                        omp_transcript(chr(10).join(json.dumps(event) for event in events))
+
+            for field, value in (
+                ("exit_code", True),
+                ("timed_out", 1),
+                ("stdout", None),
+                ("stderr", 4),
+                ("truncated", 0),
+                ("paths", [directory, directory]),
+            ):
+                with self.subTest(malformed_field=field):
+                    events = [json.loads(line) for line in raw.splitlines()]
+                    shell_end = next(
+                        event for event in events if event.get("type") == "tool_execution_end"
+                    )
+                    shell_end["result"]["details"][field] = value
+                    with self.assertRaises(ValueError):
+                        omp_transcript(chr(10).join(json.dumps(event) for event in events))
+
+            for timeout in (True, 901):
+                with self.subTest(timeout=timeout):
+                    events = [json.loads(line) for line in raw.splitlines()]
+                    shell_start = next(
+                        event for event in events if event.get("type") == "tool_execution_start"
+                    )
+                    shell_start["args"]["timeout"] = timeout
+                    with self.assertRaisesRegex(ValueError, "timeout"):
+                        omp_transcript(chr(10).join(json.dumps(event) for event in events))
+
+    def test_remote_shell_evidence_does_not_follow_requester_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            remote_root = parent / "worker-snapshot"
+            raw = omp_output(
+                cwd=str(remote_root), policy="workspace-write-shell", shell_command="pwd"
+            )
+            before = omp_transcript(raw, policy="workspace-write-shell", cwd=str(remote_root))
+            requester_target = parent / "unrelated-requester-directory"
+            requester_target.mkdir()
+            remote_root.symlink_to(requester_target, target_is_directory=True)
+            after = omp_transcript(raw, policy="workspace-write-shell", cwd=str(remote_root))
+            self.assertEqual(after, before)
+
+    def test_shell_tool_refusal_can_be_followed_by_a_completed_response(self) -> None:
+        for arguments in ({"command": "pwd"}, {"command": "pwd", "timeout": 120000}):
+            with self.subTest(arguments=arguments):
+                events = [
+                    json.loads(line)
+                    for line in omp_output(
+                        cwd="/snapshot", policy="workspace-write-shell", shell_command="pwd"
+                    ).splitlines()
+                ]
+                content = [{"type": "text", "text": "Sandbox refused command setup"}]
+                for event in events:
+                    if event.get("type") == "tool_execution_start":
+                        event["args"] = arguments
+                    elif event.get("type") == "tool_execution_end":
+                        event["isError"] = True
+                        event["result"] = {"content": content}
+                    elif event.get("message", {}).get("role") == "toolResult":
+                        event["message"]["isError"] = True
+                        event["message"]["content"] = content
+                    elif event.get("message", {}).get("role") == "assistant":
+                        for block in event["message"]["content"]:
+                            if block["type"] == "toolCall":
+                                block["arguments"] = arguments
+                transcript = omp_transcript("\n".join(json.dumps(event) for event in events))
+                self.assertEqual(transcript["events"], events)
 
     def test_launch_never_forwards_google_keys(self) -> None:
         launch = omp_launch_environment(

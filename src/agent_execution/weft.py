@@ -1245,7 +1245,7 @@ class WeftCommandRunner:
                     else None,
                 )
                 allowed_policies = (
-                    {"read-only-no-shell", "workspace-write-no-shell"}
+                    {"read-only-no-shell", "workspace-write-no-shell", "workspace-write-shell"}
                     if self.agent == "omp"
                     else {"packet-only-no-tools"}
                 )
@@ -1526,7 +1526,10 @@ class WeftCommandRunner:
                 )
             if not protected:
                 detail = "legacy evidence path is not protected from writable tools"
-            elif execution.get("omp_policy") == "workspace-write-no-shell":
+            elif execution.get("omp_policy") in {
+                "workspace-write-no-shell",
+                "workspace-write-shell",
+            }:
                 detail = "legacy writer evidence cannot establish an untampered result"
         if detail:
             return WeftRetrievalOutcome("unknown", f"Weft job {job_id}: {detail}")

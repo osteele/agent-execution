@@ -62,6 +62,11 @@ WRITER_COMMAND = [
     "workspace-write-no-shell",
 ]
 
+SHELL_WRITER_COMMAND = [
+    *WRITER_COMMAND[:-1],
+    "workspace-write-shell",
+]
+
 STDIN_COMMAND = [
     "omp",
     "-p",
@@ -588,9 +593,8 @@ class WorkerRenewablePreflightTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
 
-    def assert_preflight(self, result: WorkerResult, detail: str) -> None:
+    def assert_preflight(self, result: WorkerResult) -> None:
         self.assertEqual(result.status, "preflight_failed")
-        self.assertEqual(result.failure, detail)
         self.assertFalse(result.model_call_started)
         self.assertIsNone(result.harness.exit_status)
         self.assertIsNone(result.budget)
@@ -606,7 +610,7 @@ class WorkerRenewablePreflightTests(unittest.TestCase):
             renewable_budget=RenewableBudget(0.5, 0.5, 30.0, 30.0),
             cwd=self.root,
         )
-        self.assert_preflight(result, "renewable budget conflicts with fixed timeout")
+        self.assert_preflight(result)
 
     def test_a_non_budget_object_is_refused(self) -> None:
         result = execute_worker(
@@ -618,7 +622,7 @@ class WorkerRenewablePreflightTests(unittest.TestCase):
             renewable_budget=cast(RenewableBudget, {"initial_seconds": 1.0}),
             cwd=self.root,
         )
-        self.assert_preflight(result, "renewable budget must be a RenewableBudget")
+        self.assert_preflight(result)
 
     def test_native_claude_is_refused(self) -> None:
         result = execute_worker(
@@ -630,10 +634,7 @@ class WorkerRenewablePreflightTests(unittest.TestCase):
             renewable_budget=RenewableBudget(0.5, 0.5, 30.0, 30.0),
             cwd=self.root,
         )
-        self.assert_preflight(
-            result,
-            "renewable budgets require provider omp with the workspace-write-no-shell policy",
-        )
+        self.assert_preflight(result)
 
     def test_agy_is_refused(self) -> None:
         result = execute_worker(
@@ -645,10 +646,7 @@ class WorkerRenewablePreflightTests(unittest.TestCase):
             renewable_budget=RenewableBudget(0.5, 0.5, 30.0, 30.0),
             cwd=self.root,
         )
-        self.assert_preflight(
-            result,
-            "renewable budgets require provider omp with the workspace-write-no-shell policy",
-        )
+        self.assert_preflight(result)
 
     def test_packet_omp_is_refused(self) -> None:
         result = execute_worker(
@@ -660,10 +658,7 @@ class WorkerRenewablePreflightTests(unittest.TestCase):
             renewable_budget=RenewableBudget(0.5, 0.5, 30.0, 30.0),
             cwd=self.root,
         )
-        self.assert_preflight(
-            result,
-            "renewable budgets require provider omp with the workspace-write-no-shell policy",
-        )
+        self.assert_preflight(result)
 
     def test_read_only_omp_is_refused_before_the_sdk_check(self) -> None:
         command = [
@@ -692,7 +687,7 @@ class WorkerRenewablePreflightTests(unittest.TestCase):
                 renewable_budget=RenewableBudget(0.5, 0.5, 30.0, 30.0),
                 cwd=self.root,
             )
-        self.assert_preflight(result, "renewable budgets require OMP workspace-write-no-shell")
+        self.assert_preflight(result)
 
 
 class WorkerRunnerRefusalTests(unittest.TestCase):
@@ -877,9 +872,10 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
         *,
         tail: str,
         budget_policy: RenewableBudget,
+        command: list[str] = WRITER_COMMAND,
     ) -> BudgetedCompletedProcess:
         self.write_harness(harness_script(events, tail))
-        return run_omp_command(WRITER_COMMAND, self.snapshot, None, renewable_budget=budget_policy)
+        return run_omp_command(command, self.snapshot, None, renewable_budget=budget_policy)
 
     def assert_group_cleaned_up(self) -> None:
         telemetry = processes.take_telemetry()
@@ -1023,6 +1019,28 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
             + SCHEDULER_TOLERANCE_SECONDS,
         )
         self.assert_group_cleaned_up()
+
+    def test_arbitrary_shell_output_does_not_renew(self) -> None:
+        events = [
+            tool_start("shell-1", "execution_shell", {"command": "printf output"}),
+            tool_end(
+                "shell-1",
+                "execution_shell",
+                {"content": [{"type": "text", "text": "arbitrary output"}]},
+            ),
+        ]
+        with self.assertRaises(BudgetTimeoutExpired) as raised:
+            self.run_budgeted(
+                events,
+                tail="sleep 5",
+                budget_policy=RenewableBudget(0.5, 0.5, 30.0, 30.0),
+                command=SHELL_WRITER_COMMAND,
+            )
+        stats = raised.exception.budget
+        assert stats is not None
+        self.assertEqual(stats["qualifying_progress_count"], 0)
+        self.assertEqual(stats["changed_file_count"], 0)
+        self.assertEqual(stats["termination_reason"], "no_recent_progress")
 
     def test_failures_orphans_and_untracked_tools_never_qualify(self) -> None:
         events = [

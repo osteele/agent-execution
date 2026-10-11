@@ -97,7 +97,7 @@ entity Dispatch {
     payload_name: String?
     payload_digest: String?
     payload_name_is_safe: Boolean
-    harness_policy: read_only_no_shell | packet_only_no_tools | workspace_write_no_shell
+    harness_policy: read_only_no_shell | packet_only_no_tools | workspace_write_no_shell | workspace_write_shell
     harness_selector: String
     harness_exit_status: Integer?
     harness_exceeded_deadline: Boolean
@@ -117,11 +117,17 @@ entity Dispatch {
     }
 
     invariant WorkspaceWriteIsConfined {
-        -- The additive writer policy exposes only owned SDK filesystem tools: read,
-        -- glob, grep, write, and edit. It refuses harness/VCS metadata writes,
-        -- preserves existing ordinary-file modes on replacement, and never enables
-        -- shell, extension discovery, skills, MCP, reviewed-tree configuration,
-        -- or unrestricted native CLI tools.
+        -- Both writer policies expose owned SDK filesystem tools: read,
+        -- glob, grep, write, and edit. They refuse harness/VCS metadata writes
+        -- and preserve ordinary-file modes on replacement. Extension discovery,
+        -- skills, MCP, reviewed-tree configuration, and unrestricted native
+        -- CLI tools stay disabled. workspace_write_shell additionally exposes
+        -- execution_shell under a macOS OS sandbox: snapshot/private scratch
+        -- writes, read-only installed runtimes, no network or host credentials.
+        -- Unsupported or unavailable sandbox enforcement refuses before generation.
+        -- Shell commands default to 60 seconds with a 900-second maximum,
+        -- within the enclosing deadline. Arguments, exit status, timeout state,
+        -- bounded stdout/stderr, and truncation are retained in native evidence.
         -- Reads may traverse existing relative symlinks while every resolution
         -- step stays inside the snapshot root; absolute targets, direct or
         -- intermediate escapes, cycles, dangling links, and links into
@@ -134,7 +140,7 @@ entity Dispatch {
         -- .agent-execution/results/<model-call-id>.json. Write/edit cannot modify
         -- this namespace (case-insensitive) or legacy worker-result filenames.
         -- New execution accepts no caller-selected evidence output location.
-        harness_policy = workspace_write_no_shell implies harness_selector in {
+        harness_policy in {workspace_write_no_shell, workspace_write_shell} implies harness_selector in {
             "anthropic/claude-opus-5-5",
             "google-antigravity/gemini-3.1-pro",
             "google-antigravity/claude-opus-4-6",
@@ -247,7 +253,7 @@ rule ProviderAdmitted {
     requires: d.provider in {omp, omp_packet, claude, claude_packet}
     requires: d.command_executable = executable_for(d.provider)
     requires:
-        (d.provider = omp and d.harness_policy in {read_only_no_shell, workspace_write_no_shell}) or
+        (d.provider = omp and d.harness_policy in {read_only_no_shell, workspace_write_no_shell, workspace_write_shell}) or
         (d.provider = omp_packet and d.harness_policy = packet_only_no_tools) or
         (d.provider = claude and d.harness_policy = read_only_no_shell) or
         (d.provider = claude_packet and d.harness_policy = packet_only_no_tools)
@@ -311,7 +317,7 @@ rule RenewableBudgetRequiresObservableProgress {
 
     ensures:
         d.provider = omp
-        d.harness_policy = workspace_write_no_shell
+        d.harness_policy in {workspace_write_no_shell, workspace_write_shell}
         d.deadline = null
 
     @guidance
@@ -333,9 +339,9 @@ rule RenewableBudgetExtensionAndCap {
     @guidance
         -- The deadline extends by extension_seconds only while qualifying
         -- evidence — a successful confined write or edit, or a novel
-        -- successful restricted tool completion — is younger than
+        -- successful confined read completion — is younger than
         -- progress_window_seconds, and one observation cannot renew twice.
-        -- Token text, heartbeats, repeated identical reads, repeated
+        -- Shell commands, token text, heartbeats, repeated identical reads,
         -- failures, and no-op writes never renew. Every deadline is bounded by
         -- the fixed monotonic start time plus max_seconds. At the first budget
         -- check observing that absolute deadline at or after expiry,

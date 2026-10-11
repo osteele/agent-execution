@@ -9,6 +9,7 @@ from agent_execution.omp_execution import (
     OMP_EXECUTION_SCHEMA,
     OMP_READ_TOOLS,
     OMP_SDK_VERSION,
+    OMP_SHELL_TOOLS,
     OMP_WRITE_TOOLS,
 )
 
@@ -21,6 +22,7 @@ def omp_events(
     prompt: str = "review",
     final: str = "final response",
     read_path: str | None = None,
+    shell_command: str | None = None,
 ) -> list[dict]:
     provider, model = selector.split("/", 1)
     events = [
@@ -31,7 +33,9 @@ def omp_events(
             "harness": "omp",
             "selector": selector,
             "tool_policy": policy,
-            "tools": list(OMP_WRITE_TOOLS)
+            "tools": list(OMP_SHELL_TOOLS)
+            if policy == "workspace-write-shell"
+            else list(OMP_WRITE_TOOLS)
             if policy == "workspace-write-no-shell"
             else list(OMP_READ_TOOLS)
             if policy == "read-only-no-shell"
@@ -91,6 +95,66 @@ def omp_events(
                 },
             ]
         )
+    if shell_command is not None:
+        args = {"command": shell_command}
+        content = [{"type": "text", "text": "command completed"}]
+        events.extend(
+            [
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "provider": provider,
+                        "model": model,
+                        "stopReason": "toolUse",
+                        "content": [
+                            {
+                                "type": "toolCall",
+                                "id": "shell-1",
+                                "name": "execution_shell",
+                                "arguments": args,
+                                "intent": "Run shell command",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "tool_execution_start",
+                    "toolCallId": "shell-1",
+                    "toolName": "execution_shell",
+                    "args": args,
+                    "intent": "Run shell command",
+                },
+                {
+                    "type": "tool_execution_end",
+                    "toolCallId": "shell-1",
+                    "toolName": "execution_shell",
+                    "result": {
+                        "content": content,
+                        "details": {
+                            "paths": [cwd],
+                            "command": shell_command,
+                            "exit_code": 0,
+                            "timed_out": False,
+                            "stdout": "output",
+                            "stderr": "",
+                            "truncated": False,
+                        },
+                    },
+                    "isError": False,
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "toolResult",
+                        "toolCallId": "shell-1",
+                        "toolName": "execution_shell",
+                        "content": content,
+                        "isError": False,
+                    },
+                },
+            ]
+        )
     events.extend(
         [
             {
@@ -118,6 +182,7 @@ def omp_output(
     prompt: str = "review",
     final: str = "final response",
     read_path: str | None = None,
+    shell_command: str | None = None,
 ) -> str:
     return "\n".join(
         json.dumps(event)
@@ -128,6 +193,7 @@ def omp_output(
             prompt=prompt,
             final=final,
             read_path=read_path,
+            shell_command=shell_command,
         )
     )
 
@@ -138,8 +204,12 @@ def omp_command(
     selector: str = "anthropic/claude-opus-5-5",
     packet: bool = False,
     writer: bool = False,
+    shell_writer: bool = False,
     prompt: str = "review",
 ) -> list[str]:
+    if writer and shell_writer:
+        raise ValueError("writer policies are mutually exclusive")
+
     command = [
         "omp",
         "-p",
@@ -151,6 +221,8 @@ def omp_command(
         "--execution-tool-policy",
         "packet-only-no-tools"
         if packet
+        else "workspace-write-shell"
+        if shell_writer
         else "workspace-write-no-shell"
         if writer
         else "read-only-no-shell",
@@ -158,7 +230,7 @@ def omp_command(
         selector,
     ]
     if packet:
-        if writer:
+        if writer or shell_writer:
             raise ValueError("packet and writer are mutually exclusive")
         command.extend(
             [

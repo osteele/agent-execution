@@ -247,7 +247,7 @@ def run_command_with_prompt(
     ignoring the policy.
     """
     if renewable_budget is not None and (not command or Path(command[0]).name != "omp"):
-        raise ValueError("renewable budgets are supported only for OMP workspace-write-no-shell")
+        raise ValueError("renewable budgets are supported only for OMP workspace-write policies")
     if command and Path(command[0]).name == "omp":
         completed = run_omp_command(
             command,
@@ -295,7 +295,7 @@ def run_worker_command(
     """
     name = Path(command[0]).name if command else ""
     if renewable_budget is not None and name != "omp":
-        raise ValueError("renewable budgets are supported only for OMP workspace-write-no-shell")
+        raise ValueError("renewable budgets are supported only for OMP workspace-write policies")
     if name == "omp":
         completed = run_omp_command(command, cwd, timeout, renewable_budget=renewable_budget)
         return CommandResult(
@@ -1028,7 +1028,7 @@ def execute_worker(
                 "preflight_failed",
                 failure=(
                     "renewable budgets require provider omp with the "
-                    "workspace-write-no-shell policy"
+                    "workspace-write-no-shell or workspace-write-shell policy"
                 ),
             )
         # Injected legacy runners have no progress-observer contract. Never
@@ -1069,14 +1069,17 @@ def execute_worker(
             logical_command = [*command, *(["--model", harness_model] if harness_model else [])]
             omp_invocation = validate_omp_command(logical_command, working_directory)
             expected_policies = (
-                {"read-only-no-shell", "workspace-write-no-shell"}
+                {"read-only-no-shell", "workspace-write-no-shell", "workspace-write-shell"}
                 if provider == "omp"
                 else {"packet-only-no-tools"}
             )
             if omp_invocation.policy not in expected_policies:
                 raise ValueError("OMP adapter identity disagrees with command tool policy")
-            if renewable_budget is not None and omp_invocation.policy != "workspace-write-no-shell":
-                raise ValueError("renewable budgets require OMP workspace-write-no-shell")
+            if renewable_budget is not None and omp_invocation.policy not in {
+                "workspace-write-no-shell",
+                "workspace-write-shell",
+            }:
+                raise ValueError("renewable budgets require an OMP workspace-write policy")
             require_omp_sdk()
         except ValueError as error:
             return finish("preflight_failed", failure=str(error))
@@ -1148,7 +1151,11 @@ def execute_worker(
         else:
             assert agy_invocation is not None
             selector = f"{AGY_ROUTE}/{agy_invocation.model}"
-        surface = "offload-task" if invocation.policy == "workspace-write-no-shell" else "worker"
+        surface = (
+            "offload-task"
+            if invocation.policy in {"workspace-write-no-shell", "workspace-write-shell"}
+            else "worker"
+        )
         try:
             status = execution_status.probe_status(
                 harness=provider,

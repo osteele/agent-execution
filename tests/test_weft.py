@@ -81,6 +81,7 @@ def worker_artifact(
     *,
     packet: bool = False,
     writer: bool = False,
+    shell_writer: bool = False,
     selector: str = "anthropic/claude-opus-5-5",
     protocol: int = WORKER_PROTOCOL_VERSION,
 ) -> str:
@@ -91,9 +92,12 @@ def worker_artifact(
         final="remote answer",
         policy="packet-only-no-tools"
         if packet
+        else "workspace-write-shell"
+        if shell_writer
         else "workspace-write-no-shell"
         if writer
         else "read-only-no-shell",
+        shell_command="pwd" if shell_writer else None,
     )
     return WorkerResult(
         model_call_id=KEY,
@@ -504,6 +508,55 @@ class AdmissionTests(unittest.TestCase):
                 self.assert_remote(result)
                 result.mark_consumed()
                 self.assertTrue(execution["processed"])
+
+    def test_shell_writer_policy_survives_dispatch_receipt_retrieval(self) -> None:
+        self.runner = WeftCommandRunner(
+            host="studio",
+            agent="omp",
+            model_call_id=KEY,
+            fallback=self.fallback,
+            invoke=self.invoke,
+            clock=lambda: self.now,
+            sleep=self.sleep,
+            expected_source_sha256=SOURCE,
+            worker_executable=source_worker_executable(SOURCE),
+        )
+        self.submissions = [CommandResult(0, receipt(), "")]
+        self.status = CommandResult(0, "", "")
+        self.artifact = CommandResult(
+            0,
+            worker_artifact(shell_writer=True, selector="openai-codex/gpt-6-astra"),
+            "",
+        )
+
+        def invoke(command: list[str], cwd: Path, timeout: float | None) -> CommandResult:
+            if command[1:3] == ["list", "jobs"]:
+                submitted = next(argv for argv, _, _ in self.calls if argv[1] == "run")
+                self.jobs = listing({"job_id": "wj42", "command": submitted[-1]})
+            return self.invoke(command, cwd, timeout)
+
+        self.runner.invoke = invoke
+        command = omp_command(
+            str(self.root), shell_writer=True, selector="openai-codex/gpt-6-astra"
+        )
+        self.assert_remote(self.runner(command, self.root, 30.0))
+        assert self.runner.last_execution is not None
+        execution = json.loads(json.dumps(self.runner.last_execution))
+        self.assertEqual(execution["omp_policy"], "workspace-write-shell")
+        consumer = WeftCommandRunner(
+            host="studio",
+            agent="omp",
+            model_call_id=KEY,
+            fallback=None,
+            invoke=self.invoke,
+            clock=lambda: self.now,
+            sleep=self.sleep,
+        )
+        result = consumer.retrieve(job_id="wj42", cwd=self.root, execution=execution)
+        assert isinstance(result, CommandResult)
+        self.assert_remote(result)
+        result.mark_consumed()
+        self.assertTrue(execution["processed"])
 
     def test_receipt_at_deadline_recovers_with_fresh_artifact_budget(self) -> None:
         self.submit_elapsed = 30.0

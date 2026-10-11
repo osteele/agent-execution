@@ -27,7 +27,7 @@ load:
 
 test: load
     uv run python -m unittest discover -s tests -v
-    bun test tests/omp_sdk.test.ts
+    bun test tests/omp_sdk.test.ts tests/omp_shell_sandbox.test.ts --timeout 20000
 
 # Provision the pinned optional OMP SDK; not required by `test`.
 omp-runtime:

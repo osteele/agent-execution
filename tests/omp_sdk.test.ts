@@ -23,6 +23,7 @@ import {
 	readTools,
 	requireAntigravityOAuth,
 	SDK_VERSION,
+	shellTool,
 	writerReadiness,
 	writeTools,
 } from "../src/agent_execution/omp_sdk";
@@ -791,4 +792,21 @@ test("implicit glob and search traversal completes without following directory l
 	]);
 	expect(searched.content[0].text).toContain("guide.txt:2: needle-doc");
 	expect(searched.content[0].text).toContain("source.txt:2: needle");
+});
+test.if(process.platform === "darwin")("shell tool rejects unbounded timeouts and returns command evidence", async () => {
+	const root = await snapshot();
+	const sdk = await sdkModule();
+	const shell = shellTool(sdk.z, root, "/usr/bin/python3");
+	expect(() => shell.parameters.parse({ command: "true", timeout: 0 })).toThrow();
+	expect(() => shell.parameters.parse({ command: "true", timeout: 901 })).toThrow();
+	const result = await shell.execute("shell", { command: "printf ok", timeout: 10 });
+	expect(result.details).toMatchObject({
+		paths: [await realpath(root)],
+		command: "printf ok",
+		exit_code: 0,
+		timed_out: false,
+		stdout: "ok",
+		stderr: "",
+		truncated: false,
+	});
 });

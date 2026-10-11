@@ -74,7 +74,8 @@ DEFAULT_EVENT_TTL_SECONDS = 10 * 60
 RETENTION_SECONDS = 30 * 24 * 60 * 60
 TRANSPORT_TIMEOUT_SECONDS = 20
 _PROJECTION_SCHEMA_VERSION = "provider-status-projection/v3"
-_EXECUTION_PROJECTION_SCHEMA = "provider-status-execution-projection/v1"
+# The cache format includes the admitted execution-policy vocabulary.
+_EXECUTION_PROJECTION_SCHEMA = "provider-status-execution-projection/v2"
 _REPLAY_ATTEMPTS = 3
 _CLOCK_FENCE_TIMEOUT_SECONDS = 0.05
 _LOCK_TIMEOUT_SECONDS = 5.0
@@ -107,6 +108,7 @@ EXECUTION_TOOL_POLICIES = (
     "packet-only-no-tools",
     "read-only-no-shell",
     "workspace-write-no-shell",
+    "workspace-write-shell",
 )
 EXECUTION_IDENTITY_FIELDS = (
     "harness",
