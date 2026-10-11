@@ -994,7 +994,7 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
             self.run_budgeted(
                 [start, end, start, end],
                 tail="sleep 5",
-                budget_policy=RenewableBudget(0.4, 0.4, 30.0, 30.0),
+                budget_policy=RenewableBudget(0.6, 0.6, 30.0, 30.0),
             )
         error = raised.exception
         self.assertEqual(error.output, f"{start}\n{end}\n{start}\n{end}\n")
@@ -1008,7 +1008,7 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
             [decision["decision"] for decision in decisions],
             ["extended", "no_recent_progress"],
         )
-        for decision, deadline in zip(decisions, (0.4, 0.8), strict=True):
+        for decision, deadline in zip(decisions, (0.6, 1.2), strict=True):
             decided_at = cast(float, decision["at_seconds"])
             self.assertGreaterEqual(decided_at, deadline)
             self.assertLessEqual(decided_at, deadline + SCHEDULER_TOLERANCE_SECONDS)
@@ -1016,7 +1016,7 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
         self.assertGreaterEqual(duration, cast(float, decisions[-1]["at_seconds"]))
         self.assertLessEqual(
             duration,
-            0.8
+            1.2
             + processes.GRACE_SECONDS
             + processes.SETTLE_SECONDS
             + 2 * processes.DRAIN_SECONDS

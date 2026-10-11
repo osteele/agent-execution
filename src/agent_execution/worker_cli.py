@@ -14,7 +14,7 @@ from pathlib import Path
 
 from agent_execution.agy_execution import AGY_MODELS
 from agent_execution.budget import RenewableBudget
-from agent_execution.credentials import observe_credential_basis
+from agent_execution.credentials import observe_agy_auth, observe_credential_basis
 from agent_execution.execution_status import add_status_parser, probe_status, run_status
 from agent_execution.identity import worker_evidence_path
 from agent_execution.omp_execution import require_omp_sdk
@@ -64,19 +64,17 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _probe_agy(harness_model: str | None) -> dict[str, object]:
-    """Report agy's presence and its unobservable credential basis; run nothing.
-
-    agy has no auth-status command, and an invented one could become a model
-    prompt. `agy models` does not generate, but it shows sign-in rather than
-    billing basis, and its output format is unverified, so it is not run here.
-    """
+def _probe_agy(harness_model: str | None, timeout: float = 60.0) -> dict[str, object]:
+    """Report agy's presence, authentication status, and its unobservable credential basis."""
     if harness_model is not None and harness_model not in AGY_MODELS:
         permitted = ", ".join(sorted(AGY_MODELS))
         raise ValueError(f"agy probe model must be admitted explicitly ({permitted})")
     executable = shutil.which("agy")
     credential = observe_credential_basis("agy", state_root=None, cwd=Path.cwd())
-    return {
+    auth_status = (
+        observe_agy_auth(timeout=timeout, native_executable=executable) if executable else None
+    )
+    result: dict[str, object] = {
         "schema_version": "agent-execution.worker-probe/v1",
         "worker_identity": installed_worker_identity().to_dict(),
         "provider": "agy",
@@ -87,6 +85,17 @@ def _probe_agy(harness_model: str | None) -> dict[str, object]:
         },
         "credential_basis": credential.to_dict(),
     }
+    if auth_status is not None:
+        result["authentication"] = auth_status.to_dict()
+    if harness_model is not None:
+        result["execution_status"] = probe_status(
+            harness="agy",
+            surface="worker",
+            selectors=[f"google-antigravity/{harness_model}"],
+            tool_policy="packet-only-no-tools",
+            timeout=timeout,
+        )
+    return result
 
 
 def probe_worker(
@@ -98,7 +107,7 @@ def probe_worker(
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("probe timeout must be finite and positive")
     if provider == "agy":
-        return _probe_agy(harness_model)
+        return _probe_agy(harness_model, timeout=timeout)
     if provider in {"claude", "claude-packet"}:
         if not harness_model:
             raise ValueError("Claude probe requires an exact native model ID")
