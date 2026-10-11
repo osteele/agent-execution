@@ -12,6 +12,7 @@ import getpass
 import hashlib
 import io
 import json
+import math
 import re
 import shlex
 import socket
@@ -21,7 +22,6 @@ import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast
 
@@ -183,9 +183,11 @@ class WeftWorkerStatus:
     carry. `destination` is the registered SSH address the envelope was
     actually observed through: the record is bound to its observation origin,
     and a record without that origin is unbound -- it never admits anything.
-    The placement filter re-runs Execution's own validation and re-checks
-    every identity at use, so a stale, foreign, or rewritten record
-    authorizes nothing.
+    The envelope's requester-local `received_monotonic` anchor ages its
+    already-computed facts while cached; executor wall time is not compared
+    with requester wall time. The placement filter re-runs Execution's own
+    validation and re-checks every identity at use, so a stale, foreign,
+    unanchored, or rewritten record authorizes nothing.
     """
 
     host: str
@@ -1062,10 +1064,15 @@ class WeftCommandRunner:
             or subject.get("requester_user") != getpass.getuser()
         ):
             return "worker status was requested by another requester identity"
-        generated = datetime.fromisoformat(
-            str(envelope["generated_at"]).replace("Z", "+00:00")
-        ).timestamp()
-        drift = max(0.0, time.time() - generated)
+        received = envelope.get("received_monotonic")
+        now = time.monotonic()
+        if (
+            isinstance(received, bool)
+            or not isinstance(received, (int, float))
+            or not -math.inf < received <= now
+        ):
+            return "worker status has no valid requester-local monotonic receipt"
+        drift = execution_status.TTL if received <= now - execution_status.TTL else now - received
         facts = rows[0]["facts"]
         for name in ("capability", "transport", "authentication"):
             fact = facts[name]

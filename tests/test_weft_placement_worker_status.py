@@ -11,10 +11,9 @@ refuse; only the selected exact worker's current facts -- for the exact
 subject that will run -- admit, and the authority is revalidated before every
 submission attempt, not once before the loop.
 
-The behavioral tests use a local frozen record with the attributes the
-production gate reads, so the unmodified baseline fails on the refusal itself
-rather than on a missing import; the typed record is proven equivalent in
-`test_typed_record_admits_the_same_way`.
+The status producer probes a fake native install; the Weft process boundary
+returns retained fixtures. Placement and dispatch use the real typed worker
+record and runner.
 """
 
 from __future__ import annotations
@@ -70,15 +69,16 @@ def _parse(value: object) -> float:
 
 
 def aged(envelope: dict, seconds: float) -> dict:
-    """Rewrite every timestamp backwards, consistently, past every expiry.
+    """Age the receipt and shift the executor's timestamps consistently.
 
-    The producer's own ``validate_status`` must still accept the envelope:
-    staleness is a fact about time, not a license to hand back a malformed
-    answer. Every observed fact and the credential basis move together.
+    The producer's own ``validate_status`` must still accept the envelope.
+    Cached freshness advances in the requester's monotonic clock, while
+    every observed fact and credential basis retain their relative ages.
     """
     result = copy.deepcopy(envelope)
     generated = _parse(result["generated_at"]) - seconds
     result["generated_at"] = _iso(generated)
+    result["received_monotonic"] -= seconds
     for row in result["rows"]:
         for fact in row["facts"].values():
             if fact["observed_at"] is None:
@@ -135,6 +135,7 @@ class WorkerStatusPlacementTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
         self.envelope = probe_worker_surface()
+        self.envelope["received_monotonic"] = time.monotonic()
         self.now = 0.0
         self.calls: list[list[str]] = []
         self.submissions: list[CommandResult] = []
@@ -398,6 +399,46 @@ class WorkerStatusPlacementTests(unittest.TestCase):
         self.assertFalse(any(command[1] == "run" for command in self.calls))
         self.assertIn("does not currently admit capability", str(runner.last_execution))
 
+    def test_cached_status_freshness_ignores_both_wall_clocks(self) -> None:
+        received = self.envelope["received_monotonic"]
+        for executor_shift in (-100_000.0, 100_000.0):
+            for requester_now in (1_000.0, 100_000_000_000.0):
+                with self.subTest(executor_shift=executor_shift, requester_now=requester_now):
+                    envelope = aged(self.envelope, executor_shift)
+                    envelope["received_monotonic"] = received
+                    runner = self.runner(record=self.record(envelope=envelope))
+                    with (
+                        mock.patch("agent_execution.weft.time.time", return_value=requester_now),
+                        mock.patch(
+                            "agent_execution.weft.time.monotonic", return_value=received + TTL - 1
+                        ),
+                    ):
+                        result = runner(packet_command(PROMPT), self.root, 120)
+                    self.assertEqual(result.exit_status, 0)
+
+    def test_cached_status_expires_at_monotonic_ttl(self) -> None:
+        received = self.envelope["received_monotonic"]
+        runner = self.runner(record=self.record())
+        with (
+            mock.patch("agent_execution.weft.time.monotonic", return_value=received + TTL),
+            self.assertRaises(WeftPlacementRefused),
+        ):
+            runner(packet_command(PROMPT), self.root, 120)
+        self.assertFalse(any(command[1] == "run" for command in self.calls))
+
+    def test_missing_or_foreign_monotonic_receipt_cannot_admit(self) -> None:
+        for receipt in (None, float("nan"), float("inf"), -float("inf"), True, "100", 10**12):
+            with self.subTest(receipt=receipt):
+                envelope = copy.deepcopy(self.envelope)
+                if receipt is None:
+                    envelope.pop("received_monotonic")
+                else:
+                    envelope["received_monotonic"] = receipt
+                runner = self.runner(record=self.record(envelope=envelope))
+                with self.assertRaises(WeftPlacementRefused):
+                    runner(packet_command(PROMPT), self.root, 120)
+        self.assertFalse(any(command[1] == "run" for command in self.calls))
+
     def test_workspace_write_dispatch_refuses_a_read_only_envelope(self) -> None:
         """A fresh read-only worker envelope cannot authorize a write dispatch.
 
@@ -427,18 +468,12 @@ class WorkerStatusPlacementTests(unittest.TestCase):
         )
 
     def test_offload_task_envelope_admits_the_matching_write_dispatch(self) -> None:
-        """A write dispatch is admitted by its own matching write subject.
-
-        The reviewed patch demanded the hardcoded `worker`/`read-only-no-shell`
-        subject here, so a genuine offload-task envelope -- the exact subject
-        the worker itself validates before writing -- never admitted anything.
-        """
+        """Only fresh status for the matching write subject admits a write dispatch."""
         selector = "anthropic/claude-opus-5-5"
         writer = admitted_status(
             harness="omp", surface="offload-task", selectors=[selector], transport="weft"
         )
-        self.assertEqual(writer["rows"][0]["subject"]["surface"], "offload-task")
-        self.assertEqual(writer["rows"][0]["subject"]["tool_policy"], "workspace-write-no-shell")
+        writer["received_monotonic"] = time.monotonic()
         runner = self.runner(record=self.record(envelope=writer), agent="omp")
         runner.status_selector = selector
         runner.omp_policy = "workspace-write-no-shell"
@@ -451,6 +486,7 @@ class WorkerStatusPlacementTests(unittest.TestCase):
         read_only = admitted_status(
             harness="omp", surface="worker", selectors=[selector], transport="weft"
         )
+        read_only["received_monotonic"] = time.monotonic()
         runner = self.runner(record=self.record(envelope=read_only), agent="omp")
         runner.status_selector = selector
         runner.omp_policy = "read-only-no-shell"
