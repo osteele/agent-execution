@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent_execution import credentials, execution_status, provider_status
+from agent_execution import claude_execution, credentials, execution_status, provider_status
 
 SELECTOR = "anthropic/claude-opus-5-5"
 
@@ -170,6 +170,30 @@ class ExecutionStatusTests(unittest.TestCase):
         self.assertEqual(facts["transport"]["state"], "available")
         self.assertEqual(facts["authentication"]["state"], "unknown")
         self.assertEqual(document["rows"][0]["credential_basis"]["basis"], "unobserved")
+
+    def test_native_worker_resolution_timeout_is_unknown_but_absence_is_unavailable(self):
+        failure = claude_execution.NativeClaudeResolutionError(
+            "native Claude executable resolution timed out after 0.05s; the launcher was not verified"
+        )
+        with mock.patch(
+            "agent_execution.claude_execution.native_claude_launch", side_effect=failure
+        ):
+            timed_out = execution_status.probe_status(
+                harness="claude", surface="worker", selectors=[SELECTOR], transport="weft"
+            )
+        capability = timed_out["rows"][0]["facts"]["capability"]
+        self.assertEqual(capability["state"], "unknown")
+        self.assertIn("timed out after 0.05s", capability["detail"])
+        self.assertIsNone(timed_out["rows"][0]["subject"]["effective_route"])
+
+        with mock.patch(
+            "agent_execution.claude_execution.native_claude_launch",
+            side_effect=FileNotFoundError("native Claude executable is unavailable on PATH"),
+        ):
+            absent = execution_status.probe_status(
+                harness="claude", surface="worker", selectors=[SELECTOR], transport="weft"
+            )
+        self.assertEqual(absent["rows"][0]["facts"]["capability"]["state"], "unavailable")
 
     def test_native_claude_worker_support_matrix_and_independent_observations(self):
         executable = self.root / "claude-native"

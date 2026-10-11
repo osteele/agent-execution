@@ -42,6 +42,10 @@ class ClaudeStatusError(ValueError):
     """Claude returned a native error/refusal rather than a usable result."""
 
 
+class NativeClaudeResolutionError(RuntimeError):
+    """The native executable could not be observed; absence is not established."""
+
+
 @dataclass(frozen=True)
 class ClaudeInvocation:
     command: list[str]
@@ -387,7 +391,13 @@ def native_claude_launch(
     command = _executable_file(command_path)
     if command is None:
         raise FileNotFoundError("Claude command did not resolve to an executable file")
-    if _is_native_binary(command):
+    try:
+        is_native = _is_native_binary(command)
+    except OSError as error:
+        raise NativeClaudeResolutionError(
+            f"native Claude executable could not be inspected: {error}; it was not verified"
+        ) from error
+    if is_native:
         return command, launch
     try:
         result = subprocess.run(
@@ -398,16 +408,38 @@ def native_claude_launch(
             check=False,
             env=launch,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        result = None
-    if result is not None and result.returncode == 0:
+    except subprocess.TimeoutExpired as error:
+        raise NativeClaudeResolutionError(
+            f"native Claude executable resolution timed out after {timeout:g}s; "
+            "the launcher was not verified"
+        ) from error
+    except OSError as error:
+        raise NativeClaudeResolutionError(
+            f"native Claude executable resolution failed: {error}; the launcher was not verified"
+        ) from error
+    if result.returncode == 0:
         lines = result.stdout.strip().splitlines()
         physical = _executable_file(lines[0].strip()) if len(lines) == 1 else None
-        if physical is None or not _is_native_binary(physical):
-            raise FileNotFoundError("Claude native-binary resolver returned an invalid executable")
+        if physical is None:
+            raise NativeClaudeResolutionError(
+                "Claude native-binary resolver returned no verified native executable"
+            )
+        try:
+            is_native = _is_native_binary(physical)
+        except OSError as error:
+            raise NativeClaudeResolutionError(
+                f"resolved native Claude executable could not be inspected: {error}"
+            ) from error
+        if not is_native:
+            raise NativeClaudeResolutionError(
+                "Claude native-binary resolver returned no verified native executable"
+            )
         return physical, launch
-    # Resolution failure must not execute a launcher whose route is unobserved.
-    raise FileNotFoundError("Claude wrapper did not resolve a verified native executable")
+    diagnostic = (result.stderr or result.stdout or "resolver exited unsuccessfully").strip()
+    diagnostic = " ".join(diagnostic.split())[:240]
+    raise NativeClaudeResolutionError(
+        f"Claude native-binary resolution failed: {diagnostic}; the launcher was not verified"
+    )
 
 
 def _native_command(executable: str, invocation: ClaudeInvocation) -> list[str]:

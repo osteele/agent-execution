@@ -76,7 +76,7 @@ class ClaudeExecutionTests(unittest.TestCase):
                     "run",
                     return_value=subprocess.CompletedProcess([], 1, "", "failed"),
                 ),
-                self.assertRaises(FileNotFoundError),
+                self.assertRaises(claude.NativeClaudeResolutionError),
             ):
                 claude.native_claude_launch(environment)
             with (
@@ -85,9 +85,34 @@ class ClaudeExecutionTests(unittest.TestCase):
                     "run",
                     return_value=subprocess.CompletedProcess([], 0, str(wrapper), ""),
                 ),
-                self.assertRaises(FileNotFoundError),
+                self.assertRaises(claude.NativeClaudeResolutionError),
             ):
                 claude.native_claude_launch(environment)
+
+    def test_timed_out_resolution_is_not_absence_and_never_launches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wrapper = root / "claude"
+            wrapper.write_text("#!/bin/sh\n")
+            wrapper.chmod(0o755)
+            with (
+                patch.object(
+                    claude.subprocess,
+                    "run",
+                    side_effect=subprocess.TimeoutExpired("claude wrapper native-binary", 0.05),
+                ),
+                self.assertRaises(claude.NativeClaudeResolutionError) as raised,
+            ):
+                claude.native_claude_launch({"PATH": str(root)}, timeout=0.05)
+            self.assertIn("timed out after 0.05s", str(raised.exception))
+            self.assertIn("not verified", str(raised.exception))
+            with (
+                patch.object(claude, "native_claude_launch", side_effect=raised.exception),
+                patch.object(claude, "run_in_process_group") as run,
+                self.assertRaises(claude.NativeClaudeResolutionError),
+            ):
+                claude.run_claude_command(command(), Path(temporary), 5)
+            run.assert_not_called()
 
     def test_explicit_profile_is_not_silently_bypassed(self) -> None:
         with self.assertRaises(ValueError):

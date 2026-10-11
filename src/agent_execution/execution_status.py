@@ -135,12 +135,15 @@ def _subject(
         raise ValueError("Claude workers require an exact selector")
     launch_harness = "claude" if harness == "claude-packet" else harness
     if worker_claude:
-        from agent_execution.claude_execution import native_claude_launch
+        from agent_execution.claude_execution import (
+            NativeClaudeResolutionError,
+            native_claude_launch,
+        )
 
         inherited = dict(os.environ if environment is None else environment)
         try:
             executable, launch = native_claude_launch(environment=inherited)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+        except (OSError, ValueError, subprocess.TimeoutExpired, NativeClaudeResolutionError):
             executable, launch = "", inherited
         if executable:
             path = launch.get("PATH", os.defpath)
@@ -330,12 +333,17 @@ def _probe_native_claude(
     environment: Mapping[str, str] | None, cwd: Path | None, timeout: float
 ) -> tuple[str, str, Json]:
     """Observe installed native worker flags without starting a model turn."""
-    from agent_execution.claude_execution import native_claude_launch
+    from agent_execution.claude_execution import (
+        NativeClaudeResolutionError,
+        native_claude_launch,
+    )
 
     try:
         executable, launch = native_claude_launch(environment=environment, timeout=timeout)
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return "unavailable", "Native Claude executable is unavailable", {}
+    except NativeClaudeResolutionError as error:
+        return "unknown", str(error), {}
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return "unavailable", f"Native Claude executable is unavailable: {error}", {}
     launch_path = launch.get("PATH", os.defpath)
     launch = {**launch, "PATH": f"{Path(executable).parent}{os.pathsep}{launch_path}"}
     # The physical file's invalidation identity is captured BEFORE the --help

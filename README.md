@@ -431,6 +431,11 @@ with `--safe-mode`, disabled slash commands, and an explicit empty strict MCP
 configuration. They bypass wrapper profiles and proxy routing; inherited
 Anthropic key, route, and model overrides are removed. A physical Mach-O or ELF
 executable is required, resolved directly or through `claude wrapper native-binary`.
+If that wrapper resolution times out or fails, capability is `unknown` (with a
+bounded diagnostic), not `unavailable`: the observation did not establish absence.
+A missing executable remains `unavailable`. Failed resolution never falls back to
+executing the unverified wrapper; workers require the executable pinned by a
+successful preflight.
 
 Worker preflight pins the physical executable and scrubbed environment used by
 its capability and authentication probes. The call consumes that binding once,
