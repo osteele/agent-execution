@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import getpass
 import json
 import os
+import socket
 import subprocess
 import tempfile
 import time
@@ -380,6 +382,68 @@ class ExecutionStatusTests(unittest.TestCase):
             execution_status.probe_remote_status(
                 host="studio", harness="omp", surface="offload-task", selectors=[SELECTOR]
             )
+
+    def remote_document(self, *, moment=10_000.0):
+        requester_host, requester_user = socket.gethostname(), getpass.getuser()
+        with (
+            mock.patch(
+                "agent_execution.execution_status.socket.gethostname", return_value="studio"
+            ),
+            mock.patch("agent_execution.execution_status.getpass.getuser", return_value="agent"),
+            mock.patch("agent_execution.execution_status.time.time", return_value=moment),
+        ):
+            return self.fresh(requester_host=requester_host, requester_user=requester_user)
+
+    def test_remote_freshness_is_independent_of_observer_wall_clock(self):
+        original = self.remote_document()
+        output = subprocess.CompletedProcess(["ssh"], 0, json.dumps(original), "")
+        for observer_time in (1_000.0, 100_000.0):
+            with (
+                self.subTest(observer_time=observer_time),
+                mock.patch("agent_execution.execution_status.subprocess.run", return_value=output),
+                mock.patch(
+                    "agent_execution.execution_status.time.time", return_value=observer_time
+                ),
+                mock.patch(
+                    "agent_execution.execution_status.time.monotonic", side_effect=(100.0, 105.0)
+                ),
+            ):
+                document = execution_status.probe_remote_status(
+                    host="studio", harness="omp", surface="offload-task", selectors=[SELECTOR]
+                )
+            row = document["rows"][0]
+            for name in ("capability", "authentication", "transport"):
+                self.assertEqual(row["facts"][name]["state"], "available")
+                self.assertEqual(row["facts"][name]["age_seconds"], 5.0)
+                self.assertFalse(row["facts"][name]["stale"])
+            self.assertEqual(row["credential_basis"]["age_seconds"], 5.0)
+            self.assertFalse(row["credential_basis"]["stale"])
+            self.assertEqual(row["facts"]["quota"]["state"], "unknown")
+            self.assertEqual(row["facts"]["generation"]["state"], "unknown")
+
+    def test_remote_round_trip_expires_facts_at_their_lifetime_boundary(self):
+        original = self.remote_document()
+        output = subprocess.CompletedProcess(["ssh"], 0, json.dumps(original), "")
+        for elapsed in (execution_status.TTL - 1, execution_status.TTL):
+            with (
+                self.subTest(elapsed=elapsed),
+                mock.patch("agent_execution.execution_status.subprocess.run", return_value=output),
+                mock.patch("agent_execution.execution_status.time.time", return_value=100_000.0),
+                mock.patch(
+                    "agent_execution.execution_status.time.monotonic",
+                    side_effect=(100.0, 100.0 + elapsed),
+                ),
+            ):
+                document = execution_status.probe_remote_status(
+                    host="studio", harness="omp", surface="offload-task", selectors=[SELECTOR]
+                )
+            expired = elapsed == execution_status.TTL
+            row = document["rows"][0]
+            for name in ("capability", "authentication", "transport"):
+                self.assertEqual(row["facts"][name]["age_seconds"], elapsed)
+                self.assertEqual(row["facts"][name]["stale"], expired)
+            self.assertEqual(row["credential_basis"]["age_seconds"], elapsed)
+            self.assertEqual(row["credential_basis"]["stale"], expired)
 
     def test_native_auth_uses_scrubbed_profile_environment_without_retaining_secrets(self):
         executable = self.root / "claude"

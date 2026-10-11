@@ -991,6 +991,7 @@ def probe_remote_status(
         'export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
         + shlex.join(command)
     )
+    started = time.monotonic()
     try:
         result = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, remote],
@@ -1038,10 +1039,11 @@ def probe_remote_status(
             expected["profile"] = profile
         if any(subject[key] != value for key, value in expected.items()):
             raise ValueError("execution status context differs from the request")
-    # Transport delay cannot extend the lifetime of the remote observations.
-    now = time.time()
-    if _timestamp(document["generated_at"]) > now + 1:
-        raise ValueError("executor clock is ahead of the observer")
+    # Age within the executor's clock domain by the full monotonic round trip.
+    # Transport cannot extend freshness, and host clock skew is not admission.
+    received = time.monotonic()
+    now = _timestamp(document["generated_at"]) + (received - started)
+    document["received_monotonic"] = received
     document["generated_at"] = _iso(now)
     for row in rows:
         for fact in row["facts"].values():

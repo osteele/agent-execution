@@ -385,6 +385,15 @@ Python consumers use `agent_execution.execution_status`:
   local preflight, packet-size, and evidence-validation failures are not failed
   generation observations.
 
+Remote freshness uses the executor's clock domain and the full monotonic SSH
+round-trip duration. `probe_remote_status` advances the snapshot evaluation
+time and each fact's age conservatively; it does not require synchronized host
+wall clocks. Observation and expiry timestamps remain in the executor's clock
+domain. The returned `received_monotonic` marks receipt on the requester.
+For live reuse on that requester, add monotonic time elapsed since receipt to
+the reported ages; do not compare `generated_at` with the requester's wall
+clock or reuse the receipt marker on another host or after a reboot.
+
 The local APIs accept `tool_policy`, `profile`, `environment`, `cwd`,
 `requester_host`, `requester_user`, `expected_execution_sha256`, and a positive
 finite `timeout`. Remote queries accept profile, tool policy, and working
