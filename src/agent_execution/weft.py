@@ -1384,6 +1384,17 @@ class WeftCommandRunner:
                 return diagnostics
         return diagnostics
 
+    @staticmethod
+    def _claude_expectation(execution: dict[str, object]) -> tuple[str, str] | None:
+        """Read exact native pins from the issued dispatch, never result claims."""
+        model = execution.get("claude_model")
+        session = execution.get("claude_session_id")
+        if not isinstance(model, str) or not model:
+            return None
+        if not isinstance(session, str) or not session:
+            return None
+        return model, session
+
     def _command_result_from_worker(
         self,
         *,
@@ -1537,10 +1548,10 @@ class WeftCommandRunner:
                 )
         if self.agent in {"claude", "claude-packet"} and worker.status == "completed":
             try:
-                model = execution.get("claude_model")
-                session = execution.get("claude_session_id")
-                if not isinstance(model, str) or not isinstance(session, str) or not session:
+                expectation = self._claude_expectation(execution)
+                if expectation is None:
                     raise ValueError("Claude dispatch receipt lacks its exact model/session")
+                model, session = expectation
                 claude_envelope(worker.harness.stdout, model=model, session_id=session)
             except ValueError as error:
                 self._refuse(
@@ -1794,6 +1805,12 @@ class WeftCommandRunner:
                 detail = "legacy evidence path is not protected from writable tools"
             elif execution.get("omp_policy") == "workspace-write-no-shell":
                 detail = "legacy writer evidence cannot establish an untampered result"
+        if (
+            not detail
+            and self.agent in {"claude", "claude-packet"}
+            and self._claude_expectation(execution) is None
+        ):
+            detail = "no exact dispatched Claude model/session expectation"
         if detail:
             return WeftRetrievalOutcome("unknown", f"Weft job {job_id}: {detail}")
         return None
@@ -1862,7 +1879,13 @@ class WeftCommandRunner:
             "expected_worker_protocol_version",
             "worker_result_path",
         )
-        if any(execution.get(key) in (None, "") for key in required):
+        missing_native = (
+            self.agent in {"claude", "claude-packet"}
+            and self._claude_expectation(execution) is None
+        )
+        # Recover absent expectations from the accepted command before inspecting
+        # the candidate result. A missing observation is not a bad response.
+        if any(execution.get(key) in (None, "") for key in required) or missing_native:
             record = self._inspect_job(job_id, cwd, self.clock() + timeout)
             if isinstance(record, WeftRetrievalOutcome):
                 return record

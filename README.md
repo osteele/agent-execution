@@ -460,6 +460,13 @@ for that session and working directory. Packet completion carries the native
 JSON output, with no persisted session or `ctx` evidence. Weft retrieval checks
 the original model/session expectations and rejects incomplete native evidence.
 
+If the retained execution projection lacks a native model or session expectation,
+retrieval first inspects the exact accepted job's retained issued command.
+Recovered expectations must agree with every existing pin; the result cannot
+supply its own expectations. Missing command evidence or conflicting retained
+pins remains `unknown`, without consumption. Offline artifact retrieval also
+remains `unknown` when dispatch expectations are incomplete.
+
 If the native envelope proves success but ctx observation fails, the retained
 worker result remains `evidence_failed` (unknown for evidence purposes). A
 consumer may call `agent_execution.native_evidence.recover_native_evidence`
