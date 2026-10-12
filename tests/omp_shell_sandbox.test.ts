@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { existsSync, watch } from "node:fs";
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertShellSandboxAvailable, executeShell } from "../src/agent_execution/omp_shell_sandbox";
 
@@ -78,6 +78,37 @@ test.if(process.platform === "darwin" && existsSync(join(brewPrefix, "etc")) && 
 		const result = await executeShell(root, `/bin/ls -A '${host}'`, "/usr/bin/python3", 10);
 		expect(result.exit_code).not.toBe(0);
 		expect(result.stdout).toBe("");
+	}
+});
+
+test.if(process.platform === "darwin")("macOS sandbox lets runtimes read but not write system parameters", async () => {
+	// Rust's std (uv, ruff) sizes its stack guard page and bun its allocator
+	// from sysctl; without sysctl-read both abort at startup (ax18).
+	const { root } = await makeSnapshot();
+	const read = await executeShell(root, "/usr/sbin/sysctl -n hw.pagesize", "/usr/bin/python3", 10);
+	expect(read.exit_code).toBe(0);
+	expect(Number(read.stdout.trim())).toBeGreaterThan(0);
+	const write = await executeShell(root, "/usr/sbin/sysctl -w kern.maxfiles=1", "/usr/bin/python3", 10);
+	expect(write.exit_code).not.toBe(0);
+});
+
+const uv = [join(homedir(), ".local", "bin", "uv"), "/opt/homebrew/bin/uv"].find((path) => existsSync(path));
+test.if(process.platform === "darwin" && uv !== undefined)("macOS sandbox runs a Rust toolchain binary", async () => {
+	const { root } = await makeSnapshot();
+	const result = await executeShell(root, "uv --version", "/usr/bin/python3", 10);
+	expect(result.exit_code).toBe(0);
+	expect(result.stdout).toStartWith("uv ");
+});
+
+test.if(process.platform === "darwin" && existsSync(join(brewPrefix, "etc", "openssl@3", "openssl.cnf")))("macOS sandbox reads Homebrew TLS configuration but not the rest of its etc", async () => {
+	const { root } = await makeSnapshot();
+	const tls = await executeShell(root, `/bin/cat '${join(brewPrefix, "etc", "openssl@3", "openssl.cnf")}' >/dev/null`, "/usr/bin/python3", 10);
+	expect(tls.exit_code).toBe(0);
+	const gitconfig = join(brewPrefix, "etc", "gitconfig");
+	if (existsSync(gitconfig)) {
+		const other = await executeShell(root, `/bin/cat '${gitconfig}'`, "/usr/bin/python3", 10);
+		expect(other.exit_code).not.toBe(0);
+		expect(other.stdout).toBe("");
 	}
 });
 
