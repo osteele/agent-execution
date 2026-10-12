@@ -11,8 +11,9 @@ patch application, and completion notifications.
 
 The optional OMP (Oh My Pi) coding-agent runtime exposes four tool policies:
 `packet-only-no-tools`, `read-only-no-shell`, `workspace-write-no-shell`, and
-`workspace-write-shell`. Both writer policies add confined `execution_write`
-and `execution_edit` tools. The shell policy also exposes `execution_shell`
+`workspace-write-shell`. Both writer policies add confined `execution_write`, `execution_edit`, and
+`execution_restore` tools. Existing-file writes require the SHA-256 returned by
+`execution_read`; use `execution_edit` for a targeted change. The shell policy also exposes `execution_shell`
 under an operating-system sandbox on macOS.
 
 Read confinement admits ordinary relative symlinks that already exist inside
@@ -238,7 +239,7 @@ native OMP stream, correlated by `toolCallId` between `tool_execution_start`
 (which carries `args`) and `tool_execution_end` (which carries `result` and an
 explicit `isError`, and no arguments):
 
-- A completed successful `execution_write` or `execution_edit` qualifies; the
+- A completed successful `execution_write`, `execution_edit`, or `execution_restore` qualifies; the
   confined tools refuse no-op writes, so success means changed bytes, and the
   distinct files it reports are counted once each per attempt.
 - Confined read tools qualify only when their exact arguments were never seen

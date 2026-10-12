@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	chmod,
 	lstat,
+	mkdtemp,
 	open,
 	readFile,
 	readlink,
@@ -11,7 +12,10 @@ import {
 	rename,
 	rm,
 	stat,
+	writeFile,
 } from "node:fs/promises";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type * as OmpSdk from "@oh-my-pi/pi-coding-agent";
@@ -140,7 +144,7 @@ export const READ_TOOLS = [
 	"execution_glob",
 	"execution_grep",
 ];
-export const WRITE_TOOLS = [...READ_TOOLS, "execution_write", "execution_edit"];
+export const WRITE_TOOLS = [...READ_TOOLS, "execution_write", "execution_edit", "execution_restore"];
 export const SHELL_WRITE_TOOLS = [...WRITE_TOOLS, "execution_shell"];
 
 export const TOOLS = READ_TOOLS;
@@ -377,14 +381,12 @@ async function assertSafeParent(root: string, path: string): Promise<void> {
 		throw new Error("Write parent escapes the execution snapshot");
 }
 
-async function atomicTextReplace(
+async function atomicByteReplace(
 	root: string,
 	path: string,
-	text: string,
+	bytes: Uint8Array,
 	mode: number = 0o600,
 ): Promise<void> {
-	const encoded = new TextEncoder().encode(text);
-	if (encoded.length > MAX_WRITE_BYTES) throw new Error("Write exceeds 2 MiB");
 	const permissions = mode & 0o777;
 	await assertSafeParent(root, path);
 	const temporary = join(
@@ -394,7 +396,7 @@ async function atomicTextReplace(
 	let handle;
 	try {
 		handle = await open(temporary, "wx", permissions);
-		await handle.writeFile(encoded);
+		await handle.writeFile(bytes);
 		await handle.close();
 		handle = undefined;
 		await chmod(temporary, permissions);
@@ -404,6 +406,17 @@ async function atomicTextReplace(
 		if (handle) await handle.close();
 		await rm(temporary, { force: true });
 	}
+}
+
+async function atomicTextReplace(
+	root: string,
+	path: string,
+	text: string,
+	mode: number = 0o600,
+): Promise<void> {
+	const encoded = new TextEncoder().encode(text);
+	if (encoded.length > MAX_WRITE_BYTES) throw new Error("Write exceeds 2 MiB");
+	await atomicByteReplace(root, path, encoded, mode);
 }
 
 /** Shell commands are OS-confined; cwd alone is not a security boundary. */
@@ -436,19 +449,48 @@ export function shellTool(z: typeof OmpSdk.z, root: string, pythonExecutable: st
 }
 
 
+type Baseline = { existed: boolean; backup?: string; mode: number };
+
 export function writeTools(z: typeof OmpSdk.z, root: string) {
+	const baselines = new Map<string, Baseline>();
+	let scratch: string | undefined;
+	async function remember(path: string): Promise<void> {
+		if (baselines.has(path)) return;
+		let bytes: Buffer | undefined;
+		let mode = 0o600;
+		try {
+			const info = await lstat(path);
+			if (info.isSymbolicLink() || !info.isFile())
+				throw new Error("Baseline target must be a plain file");
+				mode = info.mode;
+				bytes = await readFile(path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (!scratch) {
+			scratch = await mkdtemp(join(tmpdir(), "agent-execution-baseline-"));
+			process.once("exit", () => { if (scratch) rmSync(scratch, { recursive: true, force: true }); });
+		}
+		const baseline: Baseline = { existed: bytes !== undefined, mode };
+		if (bytes !== undefined) {
+			baseline.backup = join(scratch, createHash("sha256").update(path).digest("hex"));
+			await writeFile(baseline.backup, bytes, { mode: 0o600, flag: "wx" });
+		}
+		baselines.set(path, baseline);
+	}
 	return [
 		...readTools(z, root),
 		{
 			name: "execution_write" as const,
 			label: "Write snapshot",
 			description:
-				"Replace or create one UTF-8 file inside the execution snapshot. Relative paths only; every symlink including an in-root alias, traversal, URLs and VCS metadata are refused.",
+				"Replace or create one UTF-8 file inside the execution snapshot. Overwriting an existing file requires expected_sha256 matching its current bytes; get it from execution_read first, or use execution_edit. Creating a new file needs no digest. Relative paths only; symlinks, traversal, URLs and VCS metadata are refused.",
 			parameters: z.object({
 				path: z.string(),
 				content: z.string(),
+				expected_sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 			}),
-			async execute(_id: string, args: { path: string; content: string }) {
+			async execute(_id: string, args: { path: string; content: string; expected_sha256?: string }) {
 				const path = await safeSnapshotPath(root, args.path, {
 					mode: "write",
 					mustExist: false,
@@ -456,17 +498,24 @@ export function writeTools(z: typeof OmpSdk.z, root: string) {
 				});
 				let before = "";
 				let mode = 0o600;
+				let exists = false;
 				try {
 					const info = await lstat(path);
 					if (info.isSymbolicLink() || !info.isFile())
 						throw new Error("Write target must be a plain file");
 					mode = info.mode;
-					before = await readFile(path, "utf8");
+					exists = true;
+					const bytes = await readFile(path);
+					const digest = createHash("sha256").update(bytes).digest("hex");
+					if (args.expected_sha256 !== digest)
+						throw new Error("Existing file not overwritten: read the file first for its SHA-256, or use execution_edit");
+					before = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 				}
-				if (before === args.content)
+				if (before === args.content && exists)
 					throw new Error("Write would not change file bytes");
+				await remember(path);
 				await atomicTextReplace(root, path, args.content, mode);
 				return response(`wrote ${path}`, [path]);
 			},
@@ -504,8 +553,40 @@ export function writeTools(z: typeof OmpSdk.z, root: string) {
 					before.slice(first + args.old_text.length);
 				if (after === before)
 					throw new Error("Edit would not change file bytes");
+				await remember(path);
 				await atomicTextReplace(root, path, after, info.mode);
 				return response(`edited ${path}`, [path]);
+			},
+		},
+		{
+			name: "execution_restore" as const,
+			label: "Restore snapshot file",
+			description: "Restore one file to the bytes captured immediately before its first successful execution_write or execution_edit in this execution. If the file did not exist then, remove the newly created file. Shell changes are not tracked; restore does not undo them. Only paths modified by execution_write or execution_edit can be restored; relative paths only, with symlinks, traversal and metadata refused.",
+			parameters: z.object({ path: z.string() }),
+			async execute(_id: string, args: { path: string }) {
+				const path = await safeSnapshotPath(root, args.path, {
+					mode: "write", mustExist: false, forbidMetadata: true,
+				});
+				const baseline = baselines.get(path);
+				if (!baseline) throw new Error("No execution baseline is recorded for this path");
+				await assertSafeParent(root, path);
+				let current: Buffer | undefined;
+				try {
+					const info = await lstat(path);
+					if (info.isSymbolicLink() || !info.isFile()) throw new Error("Restore target must be a plain file");
+					current = await readFile(path);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				}
+				if (baseline.existed) {
+					const bytes = await readFile(baseline.backup!);
+					if (current?.equals(bytes)) throw new Error("Restore would not change file bytes");
+					await atomicByteReplace(root, path, bytes, baseline.mode);
+				} else {
+					if (current === undefined) throw new Error("Restore would not change file bytes");
+					await rm(path);
+				}
+				return response(`restored ${path}`, [path]);
 			},
 		},
 	];
@@ -522,7 +603,7 @@ export function readTools(z: typeof OmpSdk.z, root: string) {
 			name: "execution_read" as const,
 			label: "Read snapshot",
 			description:
-				"Read a UTF-8 file of at most 4 MiB inside the execution snapshot. Results are limited to 512 KiB. Existing relative in-root symlinks are followed read-only to their canonical target; absolute, escaping, cyclic, dangling and metadata links are refused. No URLs, internal devices, shell, or document converters. Line offsets start at 1.",
+				"Read a UTF-8 file of at most 4 MiB inside the execution snapshot; the result includes its SHA-256 for safe overwrite confirmation. Results are limited to 512 KiB. Existing relative in-root symlinks are followed read-only to their canonical target; absolute, escaping, cyclic, dangling and metadata links are refused. No URLs, internal devices, shell, or document converters. Line offsets start at 1.",
 			parameters: z.object({
 				path: z.string(),
 				offset: z.number().int().min(1).optional(),
@@ -540,7 +621,7 @@ export function readTools(z: typeof OmpSdk.z, root: string) {
 					offset - 1 + (args.limit ?? 300),
 				);
 				return response(
-					`${file.path}\n${selected.map((line, i) => `${offset + i}: ${line}`).join("\n")}\n[${lines.length} total lines]`,
+					`${file.path}\nsha256: ${createHash("sha256").update(await readFile(file.path)).digest("hex")}\n${selected.map((line, i) => `${offset + i}: ${line}`).join("\n")}\n[${lines.length} total lines]`,
 					[file.path],
 				);
 			},
