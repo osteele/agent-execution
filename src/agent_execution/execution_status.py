@@ -923,13 +923,20 @@ def record_generation(
     Native callers pass the subject returned by probe_status. Local admission,
     spawn and evidence-validation failures must not call this producer.
     """
-    provider_status.validate_execution_identity(_scope(subject))
+    if type(succeeded) is not bool or condition not in {None, *provider_status.REFUSAL_CONDITIONS}:
+        raise ValueError("invalid provider generation outcome")
     if subject["selector"] is None:
         raise ValueError("generation observation requires an exact selector")
     if subject["harness"] == "claude" and subject["effective_route"] is None:
-        raise ValueError("native generation observation requires a verified launch route")
-    if type(succeeded) is not bool or condition not in {None, *provider_status.REFUSAL_CONDITIONS}:
-        raise ValueError("invalid provider generation outcome")
+        # A successful native local launch is itself evidence for this exact
+        # route-unobserved subject. Refusals still require a verified route.
+        if not (
+            subject["transport"] == "local"
+            and subject["surface"] == "native"
+            and succeeded
+            and condition is None
+        ):
+            raise ValueError("native generation observation requires a verified launch route")
     if (
         subject["host"] != socket.gethostname()
         or subject["os_user"] != getpass.getuser()
