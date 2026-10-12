@@ -622,8 +622,41 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(len(self.payloads), 1)
         self.assertEqual(self.local_calls, [])
 
+    def test_lookup_miss_retries_same_model_call_key_until_admitted(self) -> None:
+        self.submissions = [
+            subprocess.TimeoutExpired(["weft", "run"], 30),
+            CommandResult(0, receipt("deduplicated"), ""),
+        ]
+        self.jobs = listing()
+
+        result = self.run_dispatch()
+
+        self.assert_remote(result)
+        run_commands = [command for command, _, _ in self.calls if command[1] == "run"]
+        self.assertEqual(len(run_commands), 2)
+        self.assertEqual(
+            [command[command.index("--idempotency-key") + 1] for command in run_commands],
+            [KEY, KEY],
+        )
+        self.assertEqual(len(self.payloads), 2)
+
+    def test_ambiguous_admission_resubmission_is_bounded_and_keeps_custody(self) -> None:
+        self.submissions = [subprocess.TimeoutExpired(["weft", "run"], 30)] * 3
+        self.jobs = listing()
+
+        with self.assertRaises(WeftExecutionAmbiguous):
+            self.run_dispatch()
+
+        run_commands = [command for command, _, _ in self.calls if command[1] == "run"]
+        self.assertEqual(len(run_commands), 3)
+        self.assertEqual(
+            {command[command.index("--idempotency-key") + 1] for command in run_commands},
+            {KEY},
+        )
+        self.assertEqual(self.local_calls, [])
+
     def test_description_mention_cannot_establish_dispatch_ownership(self) -> None:
-        self.submissions = [CommandResult(1, "not json", "")]
+        self.submissions = [CommandResult(1, "not json", "")] * 3
         self.jobs = listing(
             {
                 "job_id": "wj-other",
@@ -653,8 +686,14 @@ class AdmissionTests(unittest.TestCase):
                 self.submissions = [CommandResult(1, raw, "unmodified refusal evidence")] * 3
                 with self.assertRaises(WeftExecutionAmbiguous):
                     self.run_dispatch()
-                self.assertEqual(len(self.payloads), 1)
+                self.assertEqual(len(self.payloads), 3)
                 self.assertEqual(self.local_calls, [])
+                run_commands = [command for command, _, _ in self.calls if command[1] == "run"]
+                self.assertEqual(len(run_commands), 3)
+                self.assertEqual(
+                    {command[command.index("--idempotency-key") + 1] for command in run_commands},
+                    {KEY},
+                )
                 assert self.runner.last_execution is not None
                 diagnostics = self.runner.last_execution["diagnostics"]
                 assert isinstance(diagnostics, dict)
@@ -731,8 +770,8 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(len(self.local_calls), 1)
 
     def test_admission_sequences_obey_no_double_execution(self) -> None:
-        # Exhaust the bounded event model. R retries; A owns remotely; U is unknown.
-        # The oracle is the first non-rejection, independently of production state.
+        # R is proven not_accepted, A owns remotely, U is ambiguous and retries
+        # under the same key. The oracle is independent of producer state.
         counts = {"local": 0, "remote": 0, "unknown": 0}
         for events in itertools.product("RAU", repeat=3):
             with self.subTest(events=events):
@@ -752,9 +791,13 @@ class AdmissionTests(unittest.TestCase):
                     )
                     for event in events
                 ]
-                first = next((i for i, event in enumerate(events) if event != "R"), 3)
+                accepted_at = next((i for i, event in enumerate(events) if event == "A"), None)
                 expected = (
-                    "local" if first == 3 else "remote" if events[first] == "A" else "unknown"
+                    "remote"
+                    if accepted_at is not None
+                    else "local"
+                    if events[-1] == "R"
+                    else "unknown"
                 )
                 counts[expected] += 1
                 if expected == "unknown":
@@ -767,14 +810,15 @@ class AdmissionTests(unittest.TestCase):
                     else:
                         self.assertEqual(result.stdout, "local answer")
                 self.assertEqual(len(self.local_calls), int(expected == "local"))
-                self.assertEqual(len(self.payloads), min(first + 1, 3))
+                attempts_used = accepted_at + 1 if accepted_at is not None else 3
+                self.assertEqual(len(self.payloads), attempts_used)
                 keys = {
                     command[command.index("--idempotency-key") + 1]
                     for command, _, _ in self.calls
                     if command[1] == "run"
                 }
                 self.assertEqual(keys, {KEY})
-        self.assertEqual(counts, {"local": 1, "remote": 13, "unknown": 13})
+        self.assertEqual(counts, {"local": 4, "remote": 19, "unknown": 4})
 
     def test_deduplication_and_unbounded_harness_keep_remote_ownership(self) -> None:
         self.submissions = [CommandResult(0, receipt("deduplicated"), "")]
@@ -1058,19 +1102,17 @@ class JobAttributionTests(unittest.TestCase):
 
 
 class UnreadableReceiptProbeTests(AdmissionTests):
-    """An unreadable receipt whose probe found nothing records that it found nothing.
+    """An unreadable receipt with no attributable job retries the exact key.
 
-    Consumers must not retry an unobserved outcome — re-dispatching one risks
-    running a review that already ran. But this path probes Weft for a job
-    attributable to the call and only raises when the probe comes back empty,
-    which is a proven absence rather than an unknown. Leaving that out of the
-    record made the two indistinguishable, and agent-review then held a
-    request `running` for four hours over a cycle that had completed
-    (cycle ff82c4337350).
+    Consumers must not retry an unobserved outcome using a new key, but
+    resubmitting this same model-call ID is protected by Weft's idempotency
+    contract. When the bounded attempts remain inconclusive, custody stays
+    ambiguous and the evidence records that the probes found no attributable
+    job.
     """
 
     def test_a_probed_absence_is_recorded_as_such(self) -> None:
-        self.submissions = [CommandResult(0, "not json", "")]
+        self.submissions = [CommandResult(0, "not json", "")] * 3
 
         with self.assertRaises(WeftExecutionAmbiguous):
             self.run_dispatch()

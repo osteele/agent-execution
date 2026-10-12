@@ -2403,6 +2403,11 @@ class WeftCommandRunner:
         receipt: WeftRunReceipt | None = None
         submission: CommandResult | None = None
         for attempt in range(1, len(ADMISSION_RETRY_DELAYS) + 2):
+            attempt_deadline = (
+                deadline
+                if attempt == 1
+                else max(deadline, self.clock() + LOST_OBSERVATION_PROBE_SECONDS)
+            )
             self._progress("submitting", transport="weft", host=self.host, attempt=attempt)
             # The worker-status authority is revalidated immediately before
             # EVERY actual `weft run` attempt, against the same exact host and
@@ -2414,7 +2419,7 @@ class WeftCommandRunner:
             # kept whenever the fresh exact status does not pass.
             authorized = False
             if self.worker_status is not None and self.host != WEFT_AUTO_HOST:
-                fresh = self._placement_check(cwd, deadline)
+                fresh = self._placement_check(cwd, attempt_deadline)
                 if fresh["state"] == "refused":
                     detail = str(fresh["detail"])
                     self._progress(
@@ -2434,7 +2439,7 @@ class WeftCommandRunner:
                     command,
                     cwd,
                     timeout,
-                    deadline,
+                    attempt_deadline,
                     worker_status_authorized=authorized,
                 )
             except WeftExecutionAmbiguous as error:
@@ -2474,6 +2479,27 @@ class WeftCommandRunner:
                         host=self.host,
                         model_call_id=self.model_call_id,
                     )
+                    # A lookup miss is not proof of rejection, but Weft's
+                    # idempotency key makes another admission of this same
+                    # model call safe: it either accepts it or rejoins the
+                    # already-created job. Never create a replacement call.
+                    if attempt <= len(ADMISSION_RETRY_DELAYS):
+                        delay = ADMISSION_RETRY_DELAYS[attempt - 1]
+                        self._progress(
+                            "admission_retry",
+                            transport="weft",
+                            host=self.host,
+                            attempt=attempt,
+                            next_attempt=attempt + 1,
+                            backoff_seconds=delay,
+                            ambiguous=True,
+                        )
+                        if self.admission_wait(delay):
+                            raise WeftAdmissionCancelled(
+                                f"Weft admission for {self.model_call_id} was cancelled "
+                                "during ambiguous admission retry"
+                            )
+                        continue
                     raise
                 execution = self._probed_submission_execution(
                     job_id=accepted,
@@ -2497,7 +2523,7 @@ class WeftCommandRunner:
                 # assignment terminally without looking is the defect decision 0050
                 # names: an observation failure is not a verdict on the thing observed.
                 # Five completed reviews were discarded this way before anyone looked.
-                accepted = self._probe_submitted_job(cwd, deadline)
+                accepted = self._probe_submitted_job(cwd, attempt_deadline)
                 if accepted is not None:
                     execution = self._probed_submission_execution(
                         job_id=accepted,
@@ -2546,6 +2572,23 @@ class WeftCommandRunner:
                         ),
                     },
                 }
+                if attempt <= len(ADMISSION_RETRY_DELAYS):
+                    delay = ADMISSION_RETRY_DELAYS[attempt - 1]
+                    self._progress(
+                        "admission_retry",
+                        transport="weft",
+                        host=self.host,
+                        attempt=attempt,
+                        next_attempt=attempt + 1,
+                        backoff_seconds=delay,
+                        ambiguous=True,
+                    )
+                    if self.admission_wait(delay):
+                        raise WeftAdmissionCancelled(
+                            f"Weft admission for {self.model_call_id} was cancelled "
+                            "during ambiguous admission retry"
+                        )
+                    continue
                 raise WeftExecutionAmbiguous(str(error)) from error
             attempts.append(
                 {
