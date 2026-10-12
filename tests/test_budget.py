@@ -218,18 +218,23 @@ def harness_script(events: list[str], tail: str) -> str:
     return "\n".join([*printed, tail, ""])
 
 
+# The initial deadline starts before the launcher spawns, so it must cover
+# interpreter and stub-shell startup before the first event; a loaded test host
+# stretches that to seconds.
+STARTUP_ALLOWANCE_SECONDS = 5.0
+
 # Real subprocess decisions allow scheduling jitter, not process teardown time.
-SCHEDULER_TOLERANCE_SECONDS = 0.5
+SCHEDULER_TOLERANCE_SECONDS = 2.0
 
 IDLE_SCRIPT = """\
 printf '%s\\n' 'warming up'
 sleep 30 &
-sleep 6
+sleep 30
 """
 
 CONTINUOUS_PROGRESS_SCRIPT = """\
 i=0
-while [ "$i" -lt 40 ]; do
+while [ "$i" -lt 120 ]; do
   printf '{"type":"tool_execution_start","toolCallId":"w%s","toolName":"execution_edit","args":{"path":"/w/f%s.txt","oldText":"a%s","newText":"b%s"}}\\n' "$i" "$i" "$i" "$i"
   printf '{"type":"tool_execution_end","toolCallId":"w%s","toolName":"execution_edit","isError":false,"result":{"content":[{"type":"text","text":"edited"}],"details":{"paths":["/w/f%s.txt"]}}}\\n' "$i" "$i"
   i=$((i+1))
@@ -893,8 +898,8 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
         with self.assertRaises(BudgetTimeoutExpired) as raised:
             self.run_budgeted(
                 events,
-                tail="sleep 6",
-                budget_policy=RenewableBudget(0.5, 0.6, 30.0, 30.0),
+                tail="sleep 30",
+                budget_policy=RenewableBudget(STARTUP_ALLOWANCE_SECONDS, 1.0, 30.0, 30.0),
             )
         error = raised.exception
         self.assertIsInstance(error, subprocess.TimeoutExpired)
@@ -917,14 +922,55 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
             ],
         )
         duration = cast(float, stats["duration_seconds"])
-        self.assertGreaterEqual(duration, 0.9)
-        self.assertLessEqual(duration, 4.0)
+        deadline = STARTUP_ALLOWANCE_SECONDS + 1.0
+        self.assertGreaterEqual(duration, deadline)
+        self.assertLessEqual(
+            duration,
+            deadline
+            + processes.GRACE_SECONDS
+            + processes.SETTLE_SECONDS
+            + 2 * processes.DRAIN_SECONDS
+            + SCHEDULER_TOLERANCE_SECONDS,
+        )
+        self.assert_group_cleaned_up()
+
+    def test_a_slow_starting_child_still_qualifies_before_the_initial_deadline(self) -> None:
+        events = [
+            tool_start("w1", "execution_write", {"path": "/w/slow.txt", "content": "body"}),
+            tool_end("w1", "execution_write", write_result("/w/slow.txt")),
+        ]
+        self.write_harness("sleep 1.5\n" + harness_script(events, "sleep 30"))
+        with self.assertRaises(BudgetTimeoutExpired) as raised:
+            run_omp_command(
+                WRITER_COMMAND,
+                self.snapshot,
+                None,
+                renewable_budget=RenewableBudget(STARTUP_ALLOWANCE_SECONDS, 1.0, 30.0, 30.0),
+            )
+        error = raised.exception
+        self.assertIn("tool_execution_start", error.output or "")
+        stats = error.budget
+        assert stats is not None
+        self.assertEqual(stats["qualifying_progress_count"], 1)
+        self.assertEqual(stats["changed_file_count"], 1)
+        self.assertEqual(stats["termination_reason"], "no_recent_progress")
+        decisions = cast(list[dict[str, object]], stats["decisions"])
+        self.assertEqual(
+            [decision["decision"] for decision in decisions],
+            ["extended", "no_recent_progress"],
+        )
+        self.assertGreaterEqual(cast(float, decisions[0]["at_seconds"]), STARTUP_ALLOWANCE_SECONDS)
         self.assert_group_cleaned_up()
 
     def test_an_idle_attempt_stops_at_the_initial_deadline(self) -> None:
         self.write_harness(IDLE_SCRIPT)
         with self.assertRaises(BudgetTimeoutExpired) as raised:
-            run_omp_command(WRITER_COMMAND, self.snapshot, None, renewable_budget=budget())
+            run_omp_command(
+                WRITER_COMMAND,
+                self.snapshot,
+                None,
+                renewable_budget=RenewableBudget(STARTUP_ALLOWANCE_SECONDS, 1.0, 30.0, 30.0),
+            )
         error = raised.exception
         self.assertIn("warming up", error.output or "")
         stats = error.budget
@@ -944,13 +990,13 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
         )
         decisions = cast(list[dict[str, object]], stats["decisions"])
         decided_at = cast(float, decisions[0]["at_seconds"])
-        self.assertGreaterEqual(decided_at, 1.0)
-        self.assertLessEqual(decided_at, 1.0 + SCHEDULER_TOLERANCE_SECONDS)
+        self.assertGreaterEqual(decided_at, STARTUP_ALLOWANCE_SECONDS)
+        self.assertLessEqual(decided_at, STARTUP_ALLOWANCE_SECONDS + SCHEDULER_TOLERANCE_SECONDS)
         duration = cast(float, stats["duration_seconds"])
         self.assertGreaterEqual(duration, decided_at)
         self.assertLessEqual(
             duration,
-            1.0
+            STARTUP_ALLOWANCE_SECONDS
             + processes.GRACE_SECONDS
             + processes.SETTLE_SECONDS
             + 2 * processes.DRAIN_SECONDS
@@ -965,7 +1011,12 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
                 WRITER_COMMAND,
                 self.snapshot,
                 None,
-                renewable_budget=RenewableBudget(0.4, 0.4, 1.1, 1.2),
+                renewable_budget=RenewableBudget(
+                    STARTUP_ALLOWANCE_SECONDS,
+                    1.0,
+                    STARTUP_ALLOWANCE_SECONDS,
+                    STARTUP_ALLOWANCE_SECONDS + 2.0,
+                ),
             )
         stats = raised.exception.budget
         assert stats is not None
@@ -979,8 +1030,16 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
         self.assertGreaterEqual(cast(int, stats["qualifying_progress_count"]), 1)
         self.assertGreaterEqual(cast(int, stats["changed_file_count"]), 1)
         duration = cast(float, stats["duration_seconds"])
-        self.assertGreaterEqual(duration, 1.1)
-        self.assertLessEqual(duration, 5.0)
+        deadline = STARTUP_ALLOWANCE_SECONDS + 2.0
+        self.assertGreaterEqual(duration, deadline)
+        self.assertLessEqual(
+            duration,
+            deadline
+            + processes.GRACE_SECONDS
+            + processes.SETTLE_SECONDS
+            + 2 * processes.DRAIN_SECONDS
+            + SCHEDULER_TOLERANCE_SECONDS,
+        )
         self.assert_group_cleaned_up()
 
     def test_duplicate_completions_cannot_renew_twice(self) -> None:
@@ -989,8 +1048,8 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
         with self.assertRaises(BudgetTimeoutExpired) as raised:
             self.run_budgeted(
                 [start, end, start, end],
-                tail="sleep 5",
-                budget_policy=RenewableBudget(0.6, 0.6, 30.0, 30.0),
+                tail="sleep 30",
+                budget_policy=RenewableBudget(STARTUP_ALLOWANCE_SECONDS, 1.0, 30.0, 30.0),
             )
         error = raised.exception
         self.assertEqual(error.output, f"{start}\n{end}\n{start}\n{end}\n")
@@ -1004,7 +1063,9 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
             [decision["decision"] for decision in decisions],
             ["extended", "no_recent_progress"],
         )
-        for decision, deadline in zip(decisions, (0.6, 1.2), strict=True):
+        initial = STARTUP_ALLOWANCE_SECONDS
+        extension = 1.0
+        for decision, deadline in zip(decisions, (initial, initial + extension), strict=True):
             decided_at = cast(float, decision["at_seconds"])
             self.assertGreaterEqual(decided_at, deadline)
             self.assertLessEqual(decided_at, deadline + SCHEDULER_TOLERANCE_SECONDS)
@@ -1012,7 +1073,8 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
         self.assertGreaterEqual(duration, cast(float, decisions[-1]["at_seconds"]))
         self.assertLessEqual(
             duration,
-            1.2
+            initial
+            + extension
             + processes.GRACE_SECONDS
             + processes.SETTLE_SECONDS
             + 2 * processes.DRAIN_SECONDS
@@ -1032,11 +1094,13 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
         with self.assertRaises(BudgetTimeoutExpired) as raised:
             self.run_budgeted(
                 events,
-                tail="sleep 5",
-                budget_policy=RenewableBudget(0.5, 0.5, 30.0, 30.0),
+                tail="sleep 30",
+                budget_policy=RenewableBudget(STARTUP_ALLOWANCE_SECONDS, 1.0, 30.0, 30.0),
                 command=SHELL_WRITER_COMMAND,
             )
-        stats = raised.exception.budget
+        error = raised.exception
+        self.assertIn("arbitrary output", error.output or "")
+        stats = error.budget
         assert stats is not None
         self.assertEqual(stats["qualifying_progress_count"], 0)
         self.assertEqual(stats["changed_file_count"], 0)
@@ -1065,7 +1129,11 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
             tool_end("missing-result", "execution_write", {}),
         ]
         with self.assertRaises(BudgetTimeoutExpired) as raised:
-            self.run_budgeted(events, tail="sleep 5", budget_policy=budget())
+            self.run_budgeted(
+                events,
+                tail="sleep 30",
+                budget_policy=RenewableBudget(STARTUP_ALLOWANCE_SECONDS, 1.0, 30.0, 30.0),
+            )
         error = raised.exception
         self.assertIn("I will now attempt the edit", error.output or "")
         stats = error.budget
@@ -1094,8 +1162,8 @@ class OmpRenewableSubprocessTests(unittest.TestCase):
         with self.assertRaises(BudgetTimeoutExpired) as raised:
             self.run_budgeted(
                 events,
-                tail="sleep 5",
-                budget_policy=RenewableBudget(0.4, 0.5, 30.0, 30.0),
+                tail="sleep 30",
+                budget_policy=RenewableBudget(STARTUP_ALLOWANCE_SECONDS, 1.0, 30.0, 30.0),
             )
         stats = raised.exception.budget
         assert stats is not None
