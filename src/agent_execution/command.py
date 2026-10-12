@@ -28,6 +28,14 @@ class CommandResult:
     #: Versioned renewable-budget telemetry from the process owner, present
     #: only when the call ran under an ``agent_execution.budget.RenewableBudget``.
     budget: dict[str, object] | None = None
+    #: Which environment the command ran under where the runner defines one:
+    #: ``"inherited"`` for the caller's whole environment or ``"scrubbed"``
+    #: for the allow-listed check environment (issue ax17). ``None`` where the
+    #: runner has no policy of its own to record — transport helpers, and
+    #: harness launches whose credential environment ``credentials.py``
+    #: defines. This fact travels with the in-memory result only; it is not
+    #: part of any versioned wire schema.
+    environment_policy: str | None = None
 
     def mark_consumed(self) -> None:
         """Acknowledge only after the consumer validates and durably records output."""

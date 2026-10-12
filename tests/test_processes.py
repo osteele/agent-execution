@@ -373,3 +373,39 @@ print(child.pid, flush=True)
         assert telemetry is not None
         self.assertEqual(telemetry.kill_kind, "group-kill")
         self.assert_no_group(telemetry.pgid or -1)
+
+
+class CheckEnvironmentTests(unittest.TestCase):
+    """The allow-listed validation-check environment (issue ax17)."""
+
+    def test_scrubbed_environment_keeps_tools_and_locale_only(self) -> None:
+        source = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/check",
+            "TMPDIR": "/tmp/check",
+            "LANG": "en_US.UTF-8",
+            "LC_ALL": "en_US.UTF-8",
+            "XDG_CACHE_HOME": "/home/check/.cache",
+            "UV_CACHE_DIR": "/home/check/.cache/uv",
+            "CODEX_THREAD_ID": "thread-ax17",
+            "OMP_SESSION_ID": "omp-ax17",
+            "ANTHROPIC_API_KEY": "secret",
+            "WEFT_PAYLOAD_DIR": "/payload",
+        }
+        scrubbed = processes.scrubbed_check_environment(source)
+        self.assertEqual(
+            set(scrubbed),
+            {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "XDG_CACHE_HOME", "UV_CACHE_DIR"},
+        )
+
+    def test_every_named_identity_variable_is_excluded(self) -> None:
+        source = {name: "ax17" for name in processes.HARNESS_SESSION_IDENTITY_VARIABLES}
+        source["PATH"] = "/usr/bin:/bin"
+        scrubbed = processes.scrubbed_check_environment(source)
+        self.assertEqual(set(scrubbed), {"PATH"})
+
+    def test_allowlist_never_names_an_identity_variable(self) -> None:
+        self.assertFalse(
+            set(processes.CHECK_ENVIRONMENT_ALLOWLIST)
+            & processes.HARNESS_SESSION_IDENTITY_VARIABLES
+        )

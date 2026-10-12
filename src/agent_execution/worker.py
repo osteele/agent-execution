@@ -54,6 +54,7 @@ from agent_execution.processes import (
     BudgetedCompletedProcess,
     BudgetTimeoutExpired,
     run_in_process_group,
+    scrubbed_check_environment,
 )
 from agent_execution.worker_transcript import validate_ctx_transcript
 
@@ -283,6 +284,7 @@ def run_worker_command(
     timeout: float | None,
     *,
     renewable_budget: RenewableBudget | None = None,
+    scrub_environment: bool = False,
 ) -> CommandResult:
     """Run a worker helper with the same process-group cleanup as the harness.
 
@@ -292,10 +294,27 @@ def run_worker_command(
 
     A renewable budget is refused here for every non-OMP helper, before any
     process starts.
+
+    ``scrub_environment=True`` runs a non-harness command — a caller's
+    validation check — under the defined allow-listed environment from
+    ``agent_execution.processes.scrubbed_check_environment`` instead of
+    inheriting this process's whole environment, so harness and session
+    identity variables from an enclosing harness session cannot leak into the
+    check and bind its results to that session (issue ax17). Harness helpers
+    (``omp``, ``agy``, ``claude``) refuse the flag rather than silently
+    ignoring it: their launches keep the credential environments
+    ``credentials.py`` defines.
+
+    The result records the environment policy the command ran under.
     """
     name = Path(command[0]).name if command else ""
     if renewable_budget is not None and name != "omp":
         raise ValueError("renewable budgets are supported only for OMP workspace-write policies")
+    if scrub_environment and name in ("omp", "agy", "claude"):
+        raise ValueError(
+            "a scrubbed environment applies only to non-harness commands; "
+            "harness launches keep their credential environment"
+        )
     if name == "omp":
         completed = run_omp_command(command, cwd, timeout, renewable_budget=renewable_budget)
         return CommandResult(
@@ -310,12 +329,19 @@ def run_worker_command(
     if name == "claude":
         completed = run_claude_command(command, cwd, timeout)
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
-    completed = run_in_process_group(command, cwd, "", timeout)
+    completed = run_in_process_group(
+        command,
+        cwd,
+        "",
+        timeout,
+        environment=scrubbed_check_environment() if scrub_environment else None,
+    )
     return CommandResult(
         completed.returncode,
         completed.stdout,
         completed.stderr,
         budget=_budget_telemetry(completed),
+        environment_policy="scrubbed" if scrub_environment else "inherited",
     )
 
 

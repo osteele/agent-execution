@@ -144,6 +144,30 @@ test.if(process.platform === "darwin")("macOS sandbox denies network access", as
 	}
 });
 
+test.if(process.platform === "darwin")("macOS sandbox command environment excludes harness session identity variables", async () => {
+	// Issue ax17: a check inheriting the writer session's identity variables
+	// binds its effects to that session and fails tests that pass in a clean
+	// shell. The confined writer shell passes an allow-listed environment, so
+	// these names must never reach the command even when the parent exports them.
+	const { root } = await makeSnapshot();
+	const names = ["CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "OMP_SESSION_ID"];
+	const prior = names.map((name) => process.env[name]);
+	names.forEach((name, index) => {
+		process.env[name] = `ax17-${index}`;
+	});
+	try {
+		const result = await executeShell(root, "env | sort", "/usr/bin/python3", 10);
+		expect(result.exit_code).toBe(0);
+		for (const name of names) expect(result.stdout).not.toContain(name);
+		expect(result.stdout).toContain("PATH=");
+	} finally {
+		names.forEach((name, index) => {
+			if (prior[index] === undefined) delete process.env[name];
+			else process.env[name] = prior[index];
+		});
+	}
+});
+
 test.if(process.platform === "darwin")("timeout kills the complete command process group", async () => {
 	const { root } = await makeSnapshot();
 	const marker = join(root, "child.pid");

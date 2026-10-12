@@ -80,6 +80,66 @@ HARNESS_PROGRAMS = frozenset(
     }
 )
 
+#: Harness and session identity variables a caller-run validation check must
+#: never see.
+#:
+#: A harness exports these so commands it runs can attribute their work to the
+#: enclosing session: Codex exports ``CODEX_THREAD_ID``, and Claude Code and
+#: OMP export their session ids likewise. A check that inherits one binds its
+#: effects to the writer's session — agent-review's state then sees the
+#: check's notification recipient conflict with the captured originator and
+#: fails tests that pass in any clean shell (issue ax17, observed 2026-10-11).
+#: The scrubbed check environment below is allow-listed, so these names are
+#: excluded by construction; naming them pins the regression they caused and
+#: stands guard over any future allow-list addition.
+HARNESS_SESSION_IDENTITY_VARIABLES = frozenset(
+    {
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+        "OMP_SESSION_ID",
+    }
+)
+
+#: What a validation check keeps: tool resolution, cache locations, and
+#: locale — the same shape the confined writer shell passes, so a check a
+#: writer ran and a check the caller ran observe the same environment policy.
+CHECK_ENVIRONMENT_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "XDG_CACHE_HOME",
+    "UV_CACHE_DIR",
+)
+
+#: Locale categories beyond LANG.
+CHECK_ENVIRONMENT_ALLOWLIST_PREFIXES = ("LC_",)
+
+
+def scrubbed_check_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The defined environment for a caller-initiated validation check.
+
+    An allow-listed copy of ``source`` (the process environment when omitted):
+    tool-resolution, cache, and locale variables, and nothing else. Harness
+    and session identity variables are excluded by construction — their
+    inheritance made writer-run checks fail against state bound to the
+    writer's session — and stay excluded even if a future allow-list entry
+    names one.
+    """
+    inherited = os.environ if source is None else source
+    return {name: value for name, value in inherited.items() if _check_variable_allowed(name)}
+
+
+def _check_variable_allowed(name: str) -> bool:
+    """One name's admission to the check environment: allow-listed, never an identity."""
+    if name in HARNESS_SESSION_IDENTITY_VARIABLES:
+        return False
+    if name in CHECK_ENVIRONMENT_ALLOWLIST:
+        return True
+    return name.startswith(CHECK_ENVIRONMENT_ALLOWLIST_PREFIXES)
+
 
 @dataclass(frozen=True)
 class Survivor:

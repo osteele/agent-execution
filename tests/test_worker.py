@@ -21,6 +21,7 @@ from agent_execution.worker import (
     WorkerResult,
     codex_session_id,
     execute_worker,
+    run_worker_command,
 )
 from agent_execution.worker_cli import main
 from tests.execution_status_fixtures import admitted_status
@@ -883,6 +884,52 @@ class WorkerResultTests(unittest.TestCase):
     def test_worker_result_refuses_an_unknown_schema(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported worker result schema"):
             WorkerResult.parse('{"schema_version":"agent-execution.worker-result/v9"}')
+
+
+class WorkerCheckEnvironmentTests(unittest.TestCase):
+    """The environment a caller-initiated validation check runs under (issue ax17)."""
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        environment = mock.patch.dict(
+            os.environ,
+            {"CODEX_THREAD_ID": "thread-ax17", "OMP_SESSION_ID": "omp-ax17"},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def probe(self, scrub_environment: bool = False) -> CommandResult:
+        code = (
+            "import os, shutil; "
+            "print('thread=%s' % os.environ.get('CODEX_THREAD_ID')); "
+            "print('omp=%s' % os.environ.get('OMP_SESSION_ID')); "
+            "print('python3=%s' % shutil.which('python3'))"
+        )
+        return run_worker_command(
+            ["python3", "-c", code], self.root, 30.0, scrub_environment=scrub_environment
+        )
+
+    def test_scrubbed_check_excludes_harness_session_identity(self) -> None:
+        result = self.probe(scrub_environment=True)
+        self.assertEqual(result.exit_status, 0, result.stderr)
+        self.assertIn("thread=None", result.stdout)
+        self.assertIn("omp=None", result.stdout)
+        self.assertRegex(result.stdout, r"python3=/")
+        self.assertEqual(result.environment_policy, "scrubbed")
+
+    def test_inherited_check_keeps_the_parent_environment(self) -> None:
+        result = self.probe()
+        self.assertEqual(result.exit_status, 0, result.stderr)
+        self.assertIn("thread=thread-ax17", result.stdout)
+        self.assertIn("omp=omp-ax17", result.stdout)
+        self.assertEqual(result.environment_policy, "inherited")
+
+    def test_harness_helpers_refuse_the_scrubbed_environment(self) -> None:
+        for harness in ("omp", "agy", "claude"):
+            with self.subTest(harness=harness), self.assertRaises(ValueError):
+                run_worker_command([harness], self.root, 1.0, scrub_environment=True)
 
 
 if __name__ == "__main__":
