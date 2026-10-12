@@ -828,6 +828,7 @@ def _publish_provider_status(result: WorkerResult, subject: dict | None) -> None
             subject,
             succeeded=succeeded,
             condition=provider_status.classify(refusal)[0] if refusal is not None else None,
+            signature=refusal,
         )
     except OSError as error:
         print(f"agent-execution: could not record provider observation: {error}", file=sys.stderr)

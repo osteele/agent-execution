@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	chmod,
 	link,
@@ -162,6 +163,10 @@ afterEach(async () => {
 		temporary.splice(0).map((path) => rm(path, { recursive: true })),
 	);
 });
+function sha256(bytes: string | Buffer): string {
+	return createHash("sha256").update(bytes).digest("hex");
+}
+
 async function snapshot() {
 	const parent = await realpath(await mkdtemp(join(tmpdir(), "omp-policy-")));
 	temporary.push(parent);
@@ -229,6 +234,7 @@ test("read, glob and literal search expose served paths but neither execute nor 
 		offset: 2,
 		limit: 1,
 	});
+	expect(result.content[0].text).toContain(`sha256: ${sha256("first\nneedle\nlast\n")}`);
 	expect(result.content[0].text).toContain("2: needle");
 	expect(result.content[0].text).not.toContain("1: first");
 	expect(result.details.paths).toEqual([join(root, "source.txt")]);
@@ -334,6 +340,7 @@ test("workspace-write tools change snapshot bytes and refuse ambiguous edits", a
 	await write.execute("write-2", {
 		path: "source.txt",
 		content: "same\nsame\n",
+		expected_sha256: sha256("first\nneedle\nlast\n"),
 	});
 	await expect(
 		edit.execute("ambiguous", {
@@ -342,6 +349,31 @@ test("workspace-write tools change snapshot bytes and refuse ambiguous edits", a
 			new_text: "changed",
 		}),
 	).rejects.toThrow("ambiguous");
+});
+
+test("overwrites require the current digest and restore returns execution-start bytes", async () => {
+	const root = await snapshot();
+	const sdk = await sdkModule();
+	const tools = writeTools(sdk.z, root);
+	const write = tools.find((tool) => tool.name === "execution_write")!;
+	const edit = tools.find((tool) => tool.name === "execution_edit")!;
+	const restore = tools.find((tool) => tool.name === "execution_restore")!;
+	const original = "first\nneedle\nlast\n";
+	await expect(write.execute("no-digest", { path: "source.txt", content: "lost" })).rejects.toThrow("read the file first");
+	expect(await readFile(join(root, "source.txt"), "utf8")).toBe(original);
+	await expect(write.execute("wrong-digest", { path: "source.txt", content: "lost", expected_sha256: "0".repeat(64) })).rejects.toThrow();
+	expect(await readFile(join(root, "source.txt"), "utf8")).toBe(original);
+	await edit.execute("edit-before-restore", { path: "source.txt", old_text: "needle", new_text: "edited" });
+	await restore.execute("restore-edit", { path: "source.txt" });
+	expect(await readFile(join(root, "source.txt"), "utf8")).toBe(original);
+	await write.execute("right-digest", { path: "source.txt", content: "overwritten", expected_sha256: sha256(original) });
+	expect(await readFile(join(root, "source.txt"), "utf8")).toBe("overwritten");
+	await restore.execute("restore-write", { path: "source.txt" });
+	expect(await readFile(join(root, "source.txt"), "utf8")).toBe(original);
+	await write.execute("create-for-restore", { path: "new.txt", content: "new file" });
+	expect(await readFile(join(root, "new.txt"), "utf8")).toBe("new file");
+	await restore.execute("remove-created", { path: "new.txt" });
+	await expect(readFile(join(root, "new.txt"))).rejects.toThrow();
 });
 
 test("workspace-write tools refuse escapes symlinks and metadata", async () => {
@@ -473,6 +505,7 @@ test("workspace-write replacement does not mutate outside hardlink targets", asy
 	await write.execute("replace-hardlink", {
 		path: "linked.txt",
 		content: "inside\n",
+		expected_sha256: sha256("outside\n"),
 	});
 	expect(await readFile(join(root, "linked.txt"), "utf8")).toBe("inside\n");
 	expect(await readFile(join(parent, "shared.txt"), "utf8")).toBe("outside\n");
@@ -499,6 +532,7 @@ test("workspace-write replacement preserves existing executable mode", async () 
 	await write.execute("replace-executable", {
 		path: "run.sh",
 		content: "#!/bin/sh\necho new\n",
+		expected_sha256: sha256("#!/bin/sh\necho old\n"),
 	});
 	expect((await stat(script)).mode & 0o777).toBe(beforeMode);
 	await edit.execute("edit-executable", {
@@ -547,9 +581,60 @@ test("workspace-write edits and writes UTF-8 files through the 2 MiB byte limit"
 		write.execute("write-over-limit", {
 			path: "boundary.txt",
 			content: oversized,
+			expected_sha256: sha256(exactLimit),
 		}),
 	).rejects.toThrow();
 	expect(await readFile(join(root, "boundary.txt"))).toEqual(Buffer.from(exactLimit));
+});
+
+test("shell-writer restore documents that shell changes are outside its baseline", async () => {
+	const root = await snapshot();
+	const sdk = await sdkModule();
+	const tools = writeTools(sdk.z, root);
+	const write = tools.find((tool) => tool.name === "execution_write")!;
+	const restore = tools.find((tool) => tool.name === "execution_restore")!;
+	const description = tools.find((tool) => tool.name === "execution_restore")!.description;
+	expect(description).toContain("Shell changes are not tracked");
+	expect(description).toContain("immediately before its first successful");
+
+	// Simulate a shell write before the confined writer first records its baseline.
+	await writeFile(join(root, "source.txt"), "shell-modified\\n");
+	await write.execute("write-after-shell", {
+		path: "source.txt",
+		content: "confined-write\\n",
+		expected_sha256: sha256("shell-modified\\n"),
+	});
+	await restore.execute("restore-after-shell", { path: "source.txt" });
+	expect(await readFile(join(root, "source.txt"), "utf8")).toBe("shell-modified\\n");
+});
+
+test("restore recovers originals larger than the write limit and invalid UTF-8 bytes", async () => {
+	const root = await snapshot();
+	const sdk = await sdkModule();
+	const tools = writeTools(sdk.z, root);
+	const write = tools.find((tool) => tool.name === "execution_write")!;
+	const edit = tools.find((tool) => tool.name === "execution_edit")!;
+	const restore = tools.find((tool) => tool.name === "execution_restore")!;
+
+	const largeOriginal = Buffer.alloc(3 * 1024 * 1024, 0x61);
+	await writeFile(join(root, "large-original.txt"), largeOriginal);
+	await write.execute("overwrite-large", {
+		path: "large-original.txt",
+		content: "replacement",
+		expected_sha256: sha256(largeOriginal),
+	});
+	await restore.execute("restore-large", { path: "large-original.txt" });
+	expect(await readFile(join(root, "large-original.txt"))).toEqual(largeOriginal);
+
+	const invalidOriginal = Buffer.from([0xff, ...Buffer.from("needle\n"), 0xfe]);
+	await writeFile(join(root, "invalid-utf8.txt"), invalidOriginal);
+	await edit.execute("edit-invalid-utf8", {
+		path: "invalid-utf8.txt",
+		old_text: "needle",
+		new_text: "changed",
+	});
+	await restore.execute("restore-invalid-utf8", { path: "invalid-utf8.txt" });
+	expect(await readFile(join(root, "invalid-utf8.txt"))).toEqual(invalidOriginal);
 });
 
 /** The pinned deployed SDK module that supplies zod for the tool schemas. */

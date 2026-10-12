@@ -244,6 +244,8 @@ def _record(
     method: str,
     condition: str | None = None,
     basis: Json | None = None,
+    ttl_seconds: int = TTL,
+    now: float | None = None,
 ) -> Json:
     extra: Json = {"detail": detail}
     if condition is not None:
@@ -260,8 +262,9 @@ def _record(
         os_user=subject["os_user"],
         billing_pool=subject["billing_pool"],
         execution_identity=_scope(subject),
-        ttl_seconds=TTL,
+        ttl_seconds=ttl_seconds,
         detail=extra,
+        now=now,
     )
 
 
@@ -907,7 +910,14 @@ def validate_status(value: object, *, expected_execution_sha256: str | None = No
     return document
 
 
-def record_generation(subject: Json, *, succeeded: bool, condition: str | None = None) -> None:
+def record_generation(
+    subject: Json,
+    *,
+    succeeded: bool,
+    condition: str | None = None,
+    signature: str | None = None,
+    now: float | None = None,
+) -> None:
     """Publish an actual provider outcome for the subject observed before launch.
 
     Native callers pass the subject returned by probe_status. Local admission,
@@ -926,6 +936,11 @@ def record_generation(subject: Json, *, succeeded: bool, condition: str | None =
         or subject["execution_sha256"] != _identity(None)["source_sha256"]
     ):
         raise ValueError("generation producer does not match execution subject")
+    quota_ttl = TTL
+    if not succeeded and condition == "quota" and signature is not None:
+        classified_condition, _, classified_ttl, _ = provider_status.classify(signature, now=now)
+        if classified_condition == "quota":
+            quota_ttl = classified_ttl
     _record(
         subject,
         "generation",
@@ -935,6 +950,7 @@ def record_generation(subject: Json, *, succeeded: bool, condition: str | None =
         else f"Provider reported {condition or 'unknown'} refusal",
         method="provider-generation",
         condition=None if succeeded else condition or "unknown",
+        now=now,
     )
     if succeeded:
         _record(
@@ -943,6 +959,7 @@ def record_generation(subject: Json, *, succeeded: bool, condition: str | None =
             "unknown",
             "Generation succeeded; remaining quota was not measured",
             method="provider-generation",
+            now=now,
         )
     elif condition in {"quota", "auth", "network"}:
         name = {"quota": "quota", "auth": "authentication", "network": "transport"}[condition]
@@ -953,6 +970,8 @@ def record_generation(subject: Json, *, succeeded: bool, condition: str | None =
             f"Provider reported {condition} refusal",
             method="provider-refusal",
             condition=condition,
+            ttl_seconds=quota_ttl if name == "quota" else TTL,
+            now=now,
         )
 
 

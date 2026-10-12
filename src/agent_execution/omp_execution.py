@@ -77,13 +77,15 @@ OMP_TOKEN_BILLING_KEYS = (
     "OPENAI_API_KEY",
 )
 OMP_READ_TOOLS = ("execution_read", "execution_glob", "execution_grep")
-OMP_WRITE_TOOLS = (*OMP_READ_TOOLS, "execution_write", "execution_edit")
+OMP_LEGACY_WRITE_TOOLS = (*OMP_READ_TOOLS, "execution_write", "execution_edit")
+OMP_WRITE_TOOLS = (*OMP_READ_TOOLS, "execution_write", "execution_edit", "execution_restore")
 OMP_SHELL_TOOLS = (*OMP_WRITE_TOOLS, "execution_shell")
+OMP_LEGACY_SHELL_TOOLS = (*OMP_LEGACY_WRITE_TOOLS, "execution_shell")
 #: Confined tools that change bytes on success. The policy's write/edit tools
 #: refuse no-op writes, so a successful completion is proof of a source change
 #: even when identical arguments ran earlier after an intervening edit — and
 #: never needs an input-novelty check.
-OMP_CHANGE_TOOLS = frozenset({"execution_write", "execution_edit"})
+OMP_CHANGE_TOOLS = frozenset({"execution_write", "execution_edit", "execution_restore"})
 #: Renewable-budget observation bounds. A hostile or looping event stream
 #: cannot grow observer memory past these. Reaching a bound is conservative —
 #: further events stop renewing — and never drops event bytes, which stay in
@@ -616,17 +618,27 @@ def omp_transcript(
         raise ValueError("OMP grounded inference identity was never registered")
     if selected_policy in {_WRITER, _SHELL_WRITER} and selected not in OMP_WRITER_SELECTORS:
         raise ValueError("OMP writer inference identity was never registered")
-    expected_tools = (
-        list(OMP_READ_TOOLS)
-        if selected_policy == _GROUNDED
-        else list(OMP_WRITE_TOOLS)
-        if selected_policy == _WRITER
-        else list(OMP_SHELL_TOOLS)
-        if selected_policy == _SHELL_WRITER
-        else []
-    )
-    if header.get("tools") != expected_tools:
+    sdk_version = header["sdk_version"]
+    if selected_policy == _GROUNDED:
+        allowed_tool_lists = (list(OMP_READ_TOOLS),)
+    elif selected_policy == _WRITER:
+        allowed_tool_lists = (
+            (list(OMP_WRITE_TOOLS), list(OMP_LEGACY_WRITE_TOOLS))
+            if sdk_version == OMP_SDK_VERSION
+            else (list(OMP_LEGACY_WRITE_TOOLS),)
+        )
+    elif selected_policy == _SHELL_WRITER:
+        allowed_tool_lists = (
+            (list(OMP_SHELL_TOOLS), list(OMP_LEGACY_SHELL_TOOLS))
+            if sdk_version == OMP_SDK_VERSION
+            else (list(OMP_LEGACY_SHELL_TOOLS),)
+        )
+    else:
+        allowed_tool_lists = ([],)
+    if header.get("tools") not in allowed_tool_lists:
         raise ValueError("OMP tool allowlist attestation mismatch")
+    # Each call is checked against the list this execution attested.
+    expected_tools = next(tools for tools in allowed_tool_lists if tools == header.get("tools"))
     for key, expected in (
         ("selector", selector),
         ("tool_policy", policy),

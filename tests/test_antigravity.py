@@ -68,6 +68,42 @@ class AntigravityTest(unittest.TestCase):
                     omp_command(directory, selector="google-antigravity/gemini-unknown"), cwd
                 )
 
+    def test_writer_transcripts_accept_only_the_allowlist_for_their_sdk_era(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for policy, old_tools in (
+                (
+                    "workspace-write-no-shell",
+                    [
+                        "execution_read",
+                        "execution_glob",
+                        "execution_grep",
+                        "execution_write",
+                        "execution_edit",
+                    ],
+                ),
+                (
+                    "workspace-write-shell",
+                    [
+                        "execution_read",
+                        "execution_glob",
+                        "execution_grep",
+                        "execution_write",
+                        "execution_edit",
+                        "execution_shell",
+                    ],
+                ),
+            ):
+                with self.subTest(policy=policy):
+                    events = [
+                        json.loads(line)
+                        for line in omp_output(cwd=directory, policy=policy).splitlines()
+                    ]
+                    events[0]["tools"] = old_tools
+                    omp_transcript("\n".join(json.dumps(event) for event in events))
+                    events[0]["tools"] = old_tools[:-1] + ["unapproved"]
+                    with self.assertRaisesRegex(ValueError, "allowlist"):
+                        omp_transcript("\n".join(json.dumps(event) for event in events))
+
     def test_shell_writer_command_and_native_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
