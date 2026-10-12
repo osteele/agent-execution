@@ -204,9 +204,19 @@ def sandbox_profile(
         for prefix in ("/opt/homebrew", "/usr/local")
         for directory in ("bin", "sbin", "Cellar", "opt", "lib", "share", "Frameworks")
     }
+    # OpenSSL reads its configuration and CA bundle from Homebrew's etc, which is
+    # otherwise refused: it also holds gitconfig, gnupg and service settings.
+    tls_config_roots = {
+        path
+        for prefix in ("/opt/homebrew", "/usr/local")
+        for pattern in ("etc/openssl@*", "etc/ca-certificates")
+        for path in Path(prefix).glob(pattern)
+        if path.is_dir()
+    }
     read_roots = (
         roots
         | brew_roots
+        | tls_config_roots
         | {
             Path(path)
             for path in (
@@ -250,6 +260,9 @@ def sandbox_profile(
 (deny default)
 (allow process-fork)
 (allow signal (target same-sandbox))
+; Runtimes read system parameters at startup: Rust's std sizes its stack guard
+; page and bun its allocator from sysctl. Writes stay denied.
+(allow sysctl-read)
 (allow process-exec (subpath "/bin") (subpath "/usr/bin") (subpath "/usr/sbin") (subpath "/sbin") (subpath {root_path}) (subpath {scratch_path}) {exec_roots} {exec_rules})
 ; Root-directory access permits process startup without exposing descendants.
 (allow file-read* (literal "/"))
