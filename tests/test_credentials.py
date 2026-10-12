@@ -26,9 +26,7 @@ class OmpCredentialBasisTests(unittest.TestCase):
             mock.patch(
                 "agent_execution.credentials._resolved_status_executable", return_value="bun"
             ),
-            mock.patch(
-                "agent_execution.credentials._omp_cache_profile", return_value="test-sdk"
-            ),
+            mock.patch("agent_execution.credentials._omp_cache_profile", return_value="test-sdk"),
             mock.patch(
                 "agent_execution.credentials._cache_fingerprint", return_value="test-fingerprint"
             ),
@@ -57,9 +55,7 @@ class OmpCredentialBasisTests(unittest.TestCase):
             mock.patch(
                 "agent_execution.credentials._resolved_status_executable", return_value="bun"
             ),
-            mock.patch(
-                "agent_execution.credentials._omp_cache_profile", return_value="test-sdk"
-            ),
+            mock.patch("agent_execution.credentials._omp_cache_profile", return_value="test-sdk"),
             mock.patch(
                 "agent_execution.credentials._cache_fingerprint", return_value="test-fingerprint"
             ),

@@ -489,7 +489,6 @@ def _omp_basis_for_source(reported: str | None, profile: str | None) -> str:
     return BASIS_UNOBSERVED
 
 
-
 #: The status commands this module knows. Anything else is never probed: an
 #: invented auth-status subcommand on another CLI can become a model prompt,
 #: which bills. `agy` is deliberately absent: it has no auth-status command,
@@ -500,11 +499,6 @@ _AUTH_STATUS_PROBES = {
     "omp": _probe_omp_auth_status,
 }
 
-#: Per-harness source-to-basis mappings, paired with the probes above.
-_SOURCE_BASIS_FOR_HARNESS = {
-    "claude": basis_for_source,
-    "omp": _omp_basis_for_source,
-}
 
 #: Per-harness environment selections for the cache fingerprint.
 _CACHE_ENV_KEYS = {
@@ -705,11 +699,10 @@ def observe_credential_basis(
     )
     if reported is None and previous is not None and previous.reported_source is not None:
         return previous
-    basis = (
-        _omp_basis_for_source(reported, profile)
-        if name == "omp"
-        else _SOURCE_BASIS_FOR_HARNESS[name](reported)
-    )
+    if name == "omp":
+        basis = _omp_basis_for_source(reported, profile)
+    else:
+        basis = basis_for_source(reported)
     observation = CredentialBasis(
         harness=executable,
         basis=basis,
