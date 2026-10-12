@@ -298,7 +298,10 @@ def _safe_component(value: str) -> str:
     return cleaned[:100] or "unknown"
 
 
-def classify(signature: str) -> tuple[str, str | None, int, str | None]:
+def classify(
+    signature: str, *, now: float | None = None
+) -> tuple[str, str | None, int, str | None]:
+    moment = time.time() if now is None else now
     for pattern, condition, window, cooldown in _SIGNATURES:
         match = re.search(pattern, signature or "", re.IGNORECASE)
         if not match:
@@ -309,7 +312,7 @@ def classify(signature: str) -> tuple[str, str | None, int, str | None]:
                 reset = datetime.strptime(
                     reset_at.replace("T", " "), "%Y-%m-%d %H:%M:%S"
                 ).astimezone()
-                seconds = max(3600, int(reset.timestamp() - time.time()))
+                seconds = max(3600, int(reset.timestamp() - moment))
             except (ValueError, OverflowError, OSError):
                 seconds = 24 * 3600
             return condition, window, seconds, reset_at
@@ -317,7 +320,7 @@ def classify(signature: str) -> tuple[str, str | None, int, str | None]:
             try:
                 seconds = int(match.group(1)) * 3600
                 # Refusal expiration must remain representable by the event format.
-                datetime.fromtimestamp(time.time() + seconds, timezone.utc)
+                datetime.fromtimestamp(moment + seconds, timezone.utc)
             except (ValueError, OverflowError, OSError):
                 seconds = DEFAULT_EVENT_TTL_SECONDS
             if seconds <= 0:
@@ -338,7 +341,8 @@ def validate_execution_identity(value: object) -> dict[str, object]:
         ("tool_policy", EXECUTION_TOOL_POLICIES),
     ):
         if not isinstance(value[field], str) or value[field] not in choices:
-            raise ValueError(f"invalid execution identity {field}")
+            rejected = repr(value[field])[:128]
+            raise ValueError(f"invalid execution identity {field}: rejected value {rejected}")
     for field in ("requester_host", "requester_user", "environment_fingerprint"):
         if not isinstance(value[field], str) or not value[field] or len(value[field]) > 512:
             raise ValueError(f"invalid execution identity {field}")
@@ -1486,15 +1490,34 @@ def _execution_projection(cache: list[str], *, locked: bool) -> _Projection:
             return projection
     projection = _Projection(generations)
     for entry in _event_entries(directory):
+        raw: object = None
         try:
-            event = validate_event(json.loads(Path(entry.path).read_text()))
+            raw = json.loads(Path(entry.path).read_text())
+            event = validate_event(raw)
             if entry.name != f"{event['event_id']}.json" or "execution" not in cast(
                 dict, event["subject"]
             ):
                 raise ValueError("invalid exact event identity")
             projection.admit(event)
         except (OSError, ValueError) as error:
-            _note(projection.diagnostics, f"execution event {entry.name}: {_describe(error)}")
+            message = _describe(error)
+            if (
+                isinstance(raw, dict)
+                and isinstance(raw.get("subject"), dict)
+                and isinstance(raw["subject"].get("execution"), dict)
+                and isinstance(error, ValueError)
+                and str(error).startswith("invalid execution identity ")
+                and ": rejected value " in str(error)
+            ):
+                execution = raw["subject"]["execution"]
+                field = str(error).removeprefix("invalid execution identity ").partition(":")[0]
+                selector = execution.get("selector")
+                rejected = execution.get(field)
+                message = (
+                    f"unknown vocabulary value (written by a newer build?): "
+                    f"event {entry.name}, selector {selector!r}, {field}={repr(rejected)[:128]}"
+                )
+            _note(projection.diagnostics, f"execution event {entry.name}: {message}")
     if locked and _generation(directory) == generations["execution"]:
         _publish_execution_projection(projection)
     return projection

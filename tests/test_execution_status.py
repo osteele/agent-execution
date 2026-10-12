@@ -32,11 +32,11 @@ class ExecutionStatusTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def query(self, **overrides):
+    def query(self, *, selectors: list[str] | None = None, **overrides):
         return dict(
             harness="omp",
             surface="offload-task",
-            selectors=[SELECTOR],
+            selectors=selectors or [SELECTOR],
             transport="weft",
             **overrides,
         )
@@ -135,6 +135,61 @@ class ExecutionStatusTests(unittest.TestCase):
         facts = execution_status.cached_status(**self.query())["rows"][0]["facts"]
         self.assertEqual(facts["generation"]["state"], "available")
         self.assertEqual(facts["quota"]["state"], "unknown")
+
+    def test_newer_policy_event_diagnostic_names_event_value_and_selector(self):
+        subject = self.fresh()["rows"][0]["subject"]
+        execution_status.record_generation(subject, succeeded=False, condition="quota")
+        event_path = next((self.root / "observations" / "events" / "execution").glob("*.json"))
+        event = json.loads(event_path.read_text())
+        event["subject"]["execution"]["tool_policy"] = "workspace-write-future"
+        event_path.write_text(json.dumps(event))
+        (self.root / "observations" / "execution-projection.json").unlink(missing_ok=True)
+
+        other = execution_status.cached_status(
+            **self.query(selectors=["anthropic/claude-sonnet-4-5"])
+        )
+        diagnostic = " ".join(other["diagnostics"])
+        self.assertIn(event["event_id"], diagnostic)
+        self.assertIn("workspace-write-future", diagnostic)
+        self.assertIn(SELECTOR, diagnostic)
+        self.assertIn("written by a newer build?", diagnostic)
+        self.assertEqual(other["rows"][0]["facts"]["quota"]["state"], "unknown")
+
+    def test_success_at_later_explicit_time_clears_quota_refusal(self):
+        subject = self.fresh()["rows"][0]["subject"]
+        observed = time.time() + 3600
+        execution_status.record_generation(
+            subject, succeeded=False, condition="quota", now=observed
+        )
+        execution_status.record_generation(subject, succeeded=True, now=observed + 1)
+
+        with mock.patch("agent_execution.execution_status.time.time", return_value=observed + 2):
+            facts = execution_status.cached_status(**self.query())["rows"][0]["facts"]
+        self.assertEqual(facts["generation"]["state"], "available")
+        self.assertEqual(facts["quota"]["state"], "unknown")
+
+    def test_classified_quota_refusal_remains_current_for_provider_window(self):
+        subject = self.fresh()["rows"][0]["subject"]
+        observed = 1_800_000_000.0
+        execution_status.record_generation(
+            subject,
+            succeeded=False,
+            condition="quota",
+            signature="provider.auth_error: 403",
+            now=observed,
+        )
+        with mock.patch(
+            "agent_execution.execution_status.time.time", return_value=observed + 11 * 60
+        ):
+            current = execution_status.cached_status(**self.query())["rows"][0]["facts"]["quota"]
+        self.assertEqual(current["state"], "unavailable")
+        self.assertFalse(current["stale"])
+        with mock.patch(
+            "agent_execution.execution_status.time.time", return_value=observed + 5 * 3600 + 1
+        ):
+            expired = execution_status.cached_status(**self.query())["rows"][0]["facts"]["quota"]
+        self.assertEqual(expired["state"], "unavailable")
+        self.assertTrue(expired["stale"])
 
     def test_expired_failure_is_retained_with_age_not_reclassified_as_success(self):
         subject = self.fresh()["rows"][0]["subject"]
