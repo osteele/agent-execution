@@ -390,10 +390,8 @@ from absent quota measurements.
 
 OMP capability uses the active pinned SDK's exact model registry; authentication
 uses credentials eligible for its restricted launch. Anthropic and Antigravity
-use OAuth-only credentials. The Zhipu coding-plan selector accepts `ZAI_API_KEY`
-as its plan credential, so its observed `api_key` source is classified as a
-subscription billing basis; a key on the metered `zai` route remains an API-key
-basis. Read-only Review selectors are checked independently of the writer roster.
+use OAuth-only credentials. The Zhipu coding-plan route can use `ZAI_API_KEY`.
+Read-only Review selectors are checked independently of the writer roster.
 The `native` Claude surface observes the configured wrapper, profile, and
 working directory. Its sign-in probe cannot establish wrapper generation routing
 or billing. Those facts remain unobserved and do not affect OMP observations.

@@ -43,7 +43,7 @@ CREDENTIAL_BASIS_SCHEMA = "harness-credential-basis/v1"
 
 #: Bumped when cached rows stop meaning what they said. A row without this
 #: version was written under retired cache semantics and is re-probed.
-CREDENTIAL_CACHE_VERSION = "credential-basis-cache/v4"
+CREDENTIAL_CACHE_VERSION = "credential-basis-cache/v3"
 
 #: Recorded bases. `unobserved` is not a synonym for `subscription`: it means the
 #: harness did not answer, and a reader must not price it as free.
@@ -477,16 +477,10 @@ def _probe_omp_auth_status(
     )
 
 
-def _omp_basis_for_source(reported: str | None, profile: str | None) -> str:
+def _omp_basis_for_source(reported: str | None) -> str:
     if reported == "oauth":
         return BASIS_SUBSCRIPTION
-    if reported == "api_key":
-        # The exact coding-plan route accepts ZAI_API_KEY as its plan credential;
-        # the same source on a metered `zai` route remains billed per token.
-        if profile is not None and profile.split("/", 1)[0] == "zhipu-coding-plan":
-            return BASIS_SUBSCRIPTION
-        return BASIS_API_KEY
-    return BASIS_UNOBSERVED
+    return BASIS_API_KEY if reported == "api_key" else BASIS_UNOBSERVED
 
 
 #: The status commands this module knows. Anything else is never probed: an
@@ -499,6 +493,11 @@ _AUTH_STATUS_PROBES = {
     "omp": _probe_omp_auth_status,
 }
 
+#: Per-harness source-to-basis mappings, paired with the probes above.
+_SOURCE_BASIS_FOR_HARNESS = {
+    "claude": basis_for_source,
+    "omp": _omp_basis_for_source,
+}
 
 #: Per-harness environment selections for the cache fingerprint.
 _CACHE_ENV_KEYS = {
@@ -699,13 +698,9 @@ def observe_credential_basis(
     )
     if reported is None and previous is not None and previous.reported_source is not None:
         return previous
-    if name == "omp":
-        basis = _omp_basis_for_source(reported, profile)
-    else:
-        basis = basis_for_source(reported)
     observation = CredentialBasis(
         harness=executable,
-        basis=basis,
+        basis=_SOURCE_BASIS_FOR_HARNESS[name](reported),
         reported_source=reported,
         observed_at=now,
         fingerprint=fingerprint,
