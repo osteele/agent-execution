@@ -44,7 +44,7 @@ def transcript(session_id: str = "thread-42", *, cwd: str = "/remote/project") -
                 "event_type": "tool_call",
                 "occurred_at": "1970-01-01T00:00:10.500Z",
                 "content": {"complete": True},
-                "activity": {"facts": [{"kind": "session_cwd", "value": cwd}]},
+                # Activity-absent: legacy provider text remains the source.
                 "text": json.dumps(
                     {
                         "type": "custom_tool_call",
@@ -52,7 +52,15 @@ def transcript(session_id: str = "thread-42", *, cwd: str = "/remote/project") -
                         "arguments": {"path": "/remote/project/figure.png"},
                     }
                 ),
-            }
+            },
+            {
+                "provider": "codex",
+                "provider_session_id": session_id,
+                "ctx_event_id": "session-1",
+                "event_type": "message",
+                "occurred_at": "1970-01-01T00:00:10.000Z",
+                "activity": {"facts": [{"kind": "session_cwd", "value": cwd}]},
+            },
         ],
     }
 

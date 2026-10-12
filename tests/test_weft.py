@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import itertools
 import json
@@ -336,6 +337,33 @@ class AdmissionTests(unittest.TestCase):
         summary = result.execution["worker_result"]
         assert isinstance(summary, dict)
         self.assertEqual(summary["artifact_path"], artifact[-1])
+
+    def test_input_values_with_commas_and_quotes_remain_single_references(self) -> None:
+        references = ("/workspace/notes, draft.md", '/workspace/said "hello".md')
+        self.runner = WeftCommandRunner(
+            host="studio",
+            agent="omp",
+            model_call_id=KEY,
+            fallback=self.fallback,
+            invoke=self.invoke,
+            clock=lambda: self.now,
+            sleep=self.sleep,
+            admission_wait=self.wait,
+            expected_source_sha256=SOURCE,
+            inputs=references,
+        )
+        self.submissions = [CommandResult(0, receipt(), "")]
+
+        self.run_dispatch()
+
+        submitted = next(argv for argv, _, _ in self.calls if argv[1] == "run")
+        encoded_inputs = [
+            submitted[index + 1]
+            for index, argument in enumerate(submitted[:-1])
+            if argument == "--input"
+        ]
+        decoded_inputs = [next(csv.reader([value]))[0] for value in encoded_inputs]
+        self.assertEqual(decoded_inputs, list(references))
 
     def test_the_job_is_filed_under_the_consumers_project(self) -> None:
         self.submissions = [CommandResult(0, receipt(), "")]

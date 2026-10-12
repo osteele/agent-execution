@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import getpass
 import json
 import os
+import socket
 import subprocess
 import tempfile
 import time
@@ -12,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent_execution import credentials, execution_status, provider_status
+from agent_execution import claude_execution, credentials, execution_status, provider_status
 
 SELECTOR = "anthropic/claude-opus-5-5"
 
@@ -200,6 +202,30 @@ class ExecutionStatusTests(unittest.TestCase):
         self.assertEqual(facts["transport"]["state"], "available")
         self.assertEqual(facts["authentication"]["state"], "unknown")
         self.assertEqual(document["rows"][0]["credential_basis"]["basis"], "unobserved")
+
+    def test_native_worker_resolution_timeout_is_unknown_but_absence_is_unavailable(self):
+        failure = claude_execution.NativeClaudeResolutionError(
+            "native Claude executable resolution timed out after 0.05s; the launcher was not verified"
+        )
+        with mock.patch(
+            "agent_execution.claude_execution.native_claude_launch", side_effect=failure
+        ):
+            timed_out = execution_status.probe_status(
+                harness="claude", surface="worker", selectors=[SELECTOR], transport="weft"
+            )
+        capability = timed_out["rows"][0]["facts"]["capability"]
+        self.assertEqual(capability["state"], "unknown")
+        self.assertIn("timed out after 0.05s", capability["detail"])
+        self.assertIsNone(timed_out["rows"][0]["subject"]["effective_route"])
+
+        with mock.patch(
+            "agent_execution.claude_execution.native_claude_launch",
+            side_effect=FileNotFoundError("native Claude executable is unavailable on PATH"),
+        ):
+            absent = execution_status.probe_status(
+                harness="claude", surface="worker", selectors=[SELECTOR], transport="weft"
+            )
+        self.assertEqual(absent["rows"][0]["facts"]["capability"]["state"], "unavailable")
 
     def test_native_claude_worker_support_matrix_and_independent_observations(self):
         executable = self.root / "claude-native"
@@ -413,6 +439,68 @@ class ExecutionStatusTests(unittest.TestCase):
                 host="studio", harness="omp", surface="offload-task", selectors=[SELECTOR]
             )
 
+    def remote_document(self, *, moment=10_000.0):
+        requester_host, requester_user = socket.gethostname(), getpass.getuser()
+        with (
+            mock.patch(
+                "agent_execution.execution_status.socket.gethostname", return_value="studio"
+            ),
+            mock.patch("agent_execution.execution_status.getpass.getuser", return_value="agent"),
+            mock.patch("agent_execution.execution_status.time.time", return_value=moment),
+        ):
+            return self.fresh(requester_host=requester_host, requester_user=requester_user)
+
+    def test_remote_freshness_is_independent_of_observer_wall_clock(self):
+        original = self.remote_document()
+        output = subprocess.CompletedProcess(["ssh"], 0, json.dumps(original), "")
+        for observer_time in (1_000.0, 100_000.0):
+            with (
+                self.subTest(observer_time=observer_time),
+                mock.patch("agent_execution.execution_status.subprocess.run", return_value=output),
+                mock.patch(
+                    "agent_execution.execution_status.time.time", return_value=observer_time
+                ),
+                mock.patch(
+                    "agent_execution.execution_status.time.monotonic", side_effect=(100.0, 105.0)
+                ),
+            ):
+                document = execution_status.probe_remote_status(
+                    host="studio", harness="omp", surface="offload-task", selectors=[SELECTOR]
+                )
+            row = document["rows"][0]
+            for name in ("capability", "authentication", "transport"):
+                self.assertEqual(row["facts"][name]["state"], "available")
+                self.assertEqual(row["facts"][name]["age_seconds"], 5.0)
+                self.assertFalse(row["facts"][name]["stale"])
+            self.assertEqual(row["credential_basis"]["age_seconds"], 5.0)
+            self.assertFalse(row["credential_basis"]["stale"])
+            self.assertEqual(row["facts"]["quota"]["state"], "unknown")
+            self.assertEqual(row["facts"]["generation"]["state"], "unknown")
+
+    def test_remote_round_trip_expires_facts_at_their_lifetime_boundary(self):
+        original = self.remote_document()
+        output = subprocess.CompletedProcess(["ssh"], 0, json.dumps(original), "")
+        for elapsed in (execution_status.TTL - 1, execution_status.TTL):
+            with (
+                self.subTest(elapsed=elapsed),
+                mock.patch("agent_execution.execution_status.subprocess.run", return_value=output),
+                mock.patch("agent_execution.execution_status.time.time", return_value=100_000.0),
+                mock.patch(
+                    "agent_execution.execution_status.time.monotonic",
+                    side_effect=(100.0, 100.0 + elapsed),
+                ),
+            ):
+                document = execution_status.probe_remote_status(
+                    host="studio", harness="omp", surface="offload-task", selectors=[SELECTOR]
+                )
+            expired = elapsed == execution_status.TTL
+            row = document["rows"][0]
+            for name in ("capability", "authentication", "transport"):
+                self.assertEqual(row["facts"][name]["age_seconds"], elapsed)
+                self.assertEqual(row["facts"][name]["stale"], expired)
+            self.assertEqual(row["credential_basis"]["age_seconds"], elapsed)
+            self.assertEqual(row["credential_basis"]["stale"], expired)
+
     def test_native_auth_uses_scrubbed_profile_environment_without_retaining_secrets(self):
         executable = self.root / "claude"
         capture = self.root / "launch"
@@ -528,6 +616,136 @@ class ExecutionStatusTests(unittest.TestCase):
         self.assertEqual(row["facts"]["capability"]["state"], "unavailable")
         self.assertEqual(row["facts"]["authentication"]["state"], "unavailable")
         self.assertEqual(row["credential_basis"]["basis"], "not_observable")
+
+
+class WorkerCliExecutionStatusTests(unittest.TestCase):
+    """The ``execution-status`` CLI surface, against a fake native install.
+
+    This is the versioned, non-generating operation a registered remote status
+    probe invokes on a worker. These cases were previously only printable
+    lines in a local fake-install smoke script; they are real unit tests here,
+    and nothing about them is deployment evidence: no remote probe was run.
+    """
+
+    def setUp(self) -> None:
+        import getpass
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        wrapper = bin_dir / "claude"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "wrapper" ] && [ "$2" = "native-binary" ]; then\n'
+            '    IFS= read -r physical < "$FAKE_NATIVE_POINTER" || exit 70\n'
+            '    echo "$physical"\n'
+            "    exit 0\n"
+            "fi\n"
+            'echo "unsupported wrapper invocation" >&2\n'
+            "exit 64\n"
+        )
+        wrapper.chmod(0o755)
+        pointer = self.root / "pointer.txt"
+        native = self.root / "native-executable"
+        native.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 60)
+        native.chmod(0o755)
+        pointer.write_text(f"{native}\n")
+        environment = mock.patch.dict(
+            os.environ,
+            {
+                "PATH": str(bin_dir),
+                "FAKE_NATIVE_POINTER": str(pointer),
+                "AGENT_PROVIDER_STATUS_DIR": str(self.root / "observations"),
+                "AGENT_PROVIDER_STATUS_TRANSPORT": "none",
+                "ANTHROPIC_API_KEY": "sk-test-cli-secret",
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.account = getpass.getuser()
+
+    def test_cli_exposes_the_validated_no_generation_envelope(self) -> None:
+        import io
+        import socket
+
+        from agent_execution.execution_status import SCHEMA
+        from agent_execution.identity import source_sha256
+        from agent_execution.worker_cli import main
+
+        basis = credentials.CredentialBasis(
+            "claude", credentials.BASIS_SUBSCRIPTION, "none", time.time(), "fixture-fingerprint"
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch(
+                "agent_execution.execution_status.run_in_process_group",
+                return_value=subprocess.CompletedProcess(
+                    ["claude", "--help"], 0, "--safe-mode --tools --restricted", ""
+                ),
+            ),
+            mock.patch(
+                "agent_execution.credentials.observe_claude_auth",
+                return_value=mock.Mock(state="available", answered=True, basis=basis),
+            ),
+            mock.patch("sys.stdout", new=stdout),
+        ):
+            status = main(
+                [
+                    "execution-status",
+                    "--harness",
+                    "claude-packet",
+                    "--surface",
+                    "worker",
+                    "--selector",
+                    SELECTOR,
+                    "--transport",
+                    "weft",
+                    "--tool-policy",
+                    "packet-only-no-tools",
+                    "--json",
+                ]
+            )
+        self.assertEqual(status, 0)
+        text = stdout.getvalue()
+        self.assertNotIn("sk-test-cli-secret", text)
+        envelope = json.loads(text)
+        self.assertEqual(envelope["schema_version"], SCHEMA)
+        # Execution's own validator accepts the exposed answer.
+        execution_status.validate_status(envelope)
+        self.assertEqual(envelope["worker_identity"]["source_sha256"], source_sha256())
+        observer = envelope["observer"]
+        self.assertEqual(observer["host"], socket.gethostname())
+        self.assertEqual(observer["os_user"], self.account)
+        rows = envelope["rows"]
+        self.assertEqual(len(rows), 1)
+        subject = rows[0]["subject"]
+        expected = {
+            "harness": "claude-packet",
+            "surface": "worker",
+            "selector": SELECTOR,
+            "tool_policy": "packet-only-no-tools",
+            "transport": "weft",
+            "requester_host": socket.gethostname(),
+            "requester_user": self.account,
+            "host": socket.gethostname(),
+            "os_user": self.account,
+        }
+        for name, value in expected.items():
+            self.assertEqual(subject.get(name), value, name)
+        facts = rows[0]["facts"]
+        self.assertEqual(
+            set(facts),
+            {"capability", "authentication", "quota", "generation", "transport"},
+        )
+        for name in ("capability", "authentication", "transport"):
+            fact = facts[name]
+            self.assertEqual(fact["state"], "available", name)
+            self.assertFalse(fact["stale"], name)
+        # The operation provably generated nothing.
+        self.assertIsNone(facts["generation"]["observed_at"])
+        self.assertEqual(facts["generation"]["state"], "unknown")
 
 
 if __name__ == "__main__":

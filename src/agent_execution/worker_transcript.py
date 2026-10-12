@@ -37,7 +37,12 @@ _DETAIL_KEYS = (
 
 @dataclass(frozen=True)
 class TranscriptCall:
-    """One validated tool-call event from ctx's public transcript schema."""
+    """One validated tool-call event from ctx's public transcript schema.
+
+    ``fidelity`` is ``full`` only when the event content is complete and the
+    call rests on ctx's explicit capture or facts; anything ctx leaves
+    uncertain degrades the call to ``partial``.
+    """
 
     tool: str | None
     detail: str
@@ -47,7 +52,11 @@ class TranscriptCall:
 
 @dataclass(frozen=True)
 class ValidatedTranscript:
-    """The database-neutral facts needed to construct a context manifest."""
+    """The database-neutral facts needed to construct a context manifest.
+
+    ``fidelity`` is ``full`` only when every call is; one uncertain call
+    makes the whole transcript ``partial``.
+    """
 
     calls: tuple[TranscriptCall, ...]
     fidelity: str
@@ -61,7 +70,121 @@ def _detail(payload: dict[str, object]) -> str:
     return ""
 
 
-def _tool_call(event: dict[str, object]) -> tuple[str, str] | None:
+# ctx's public normalized capture states for `invocation.arguments`. Only
+# `present` vouches for its accompanying `value`; the others say the value was
+# not captured, and any bytes beside them are not transcript evidence.
+_CAPTURE_PRESENT = "present"
+CAPTURE_STATUSES = frozenset({"present", "absent", "unavailable", "omitted"})
+
+
+def _has_normalized_activity(event: dict[str, object]) -> bool:
+    """Whether the event carries ctx's normalized activity at all.
+
+    An event with activity is interpreted only through it, however uncertain
+    its fields. Legacy provider-text parsing is reserved for events that carry
+    no activity field.
+    """
+    return "activity" in event
+
+
+def _captured_argument_detail(arguments: object) -> str:
+    """Read a detail from normalized arguments only when capture is `present`."""
+    if not isinstance(arguments, dict):
+        return ""
+    captured = cast(dict[str, object], arguments)
+    if captured.get("capture_status") != _CAPTURE_PRESENT:
+        # Explicitly absent, unavailable, omitted, unrecognized, or missing
+        # status: the accompanying value is never promoted.
+        return ""
+    value = captured.get("value")
+    if isinstance(value, dict):
+        return _detail(cast(dict[str, object], value))
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _readable_file_facts(facts: object) -> tuple[list[str], bool]:
+    """The detail strings ctx's readable ``file`` facts name, in order.
+
+    The flag reports whether the facts also carry a recognized ``file`` fact
+    whose value ctx left missing or unreadable.  Such a fact is an explicit
+    uncertainty about the file identity, never a record to skip silently, so it
+    can ground only partial fidelity.
+    """
+    if not isinstance(facts, list):
+        return [], False
+    details: list[str] = []
+    unreadable = False
+    for fact in cast(list[object], facts):
+        if not isinstance(fact, dict) or fact.get("kind") != "file":
+            continue
+        file_value = fact.get("value")
+        detail = ""
+        if isinstance(file_value, str):
+            detail = file_value
+        elif isinstance(file_value, dict):
+            detail = _detail(cast(dict[str, object], file_value))
+        if detail:
+            details.append(detail)
+        else:
+            unreadable = True
+    return details, unreadable
+
+
+def _normalized_tool_call(event: dict[str, object]) -> tuple[str, str, bool] | None:
+    """Read ctx's public normalized activity; never consult provider text.
+
+    Returns None when the activity names no usable tool, in which case the
+    caller records an unattributed call at partial fidelity rather than
+    falling back to legacy ``event.text`` parsing.  Otherwise it returns
+    ``(tool, detail, grounded)``.  ``grounded`` is true only when ctx
+    explicitly captured the arguments (``capture_status: present`` with a
+    readable value) and every readable ``file`` fact agrees with the captured
+    detail; an unsupported shape, an unknown or non-present capture state,
+    conflicting evidence, or a recognized ``file`` fact ctx cannot read stays
+    usable through its ctx-supplied detail but is never full-fidelity grounding.
+    """
+    activity = event.get("activity")
+    if not isinstance(activity, dict) or not _is_schema_version_1(activity.get("revision")):
+        return None
+    invocation = activity.get("invocation")
+    if not isinstance(invocation, dict):
+        return None
+    tool = invocation.get("tool")
+    if not isinstance(tool, str) or not tool:
+        return None
+    # `value` carries the public normalized argument object, and only under
+    # `capture_status: present`; `file` facts provide the canonical file
+    # identity when provider arguments are opaque or uncaptured.
+    fact_details, unreadable_file_fact = _readable_file_facts(activity.get("facts"))
+    captured = _captured_argument_detail(invocation.get("arguments"))
+    if captured:
+        # The captured value is the only detail ctx vouches for.  A readable
+        # `file` fact that names something else is a conflict, and a recognized
+        # `file` fact ctx left missing or unreadable is an explicit uncertainty:
+        # neither is evidence to prefer nor to drop, so keep the captured detail
+        # and let fidelity record that the file evidence is unresolved.
+        return (
+            tool,
+            captured,
+            not unreadable_file_fact and all(detail == captured for detail in fact_details),
+        )
+    if fact_details and all(detail == fact_details[0] for detail in fact_details):
+        # Uncaptured arguments still have ctx's own file identity, but without
+        # a `present` capture it is corroboration, not full-fidelity grounding.
+        return tool, fact_details[0], False
+    # An unknown, missing, or non-present capture state, or facts that
+    # contradict each other or that ctx cannot read, name no single detail this
+    # SDK may claim.
+    return tool, "", False
+
+
+def _tool_call(event: dict[str, object]) -> tuple[str | None, str, bool] | None:
+    if _has_normalized_activity(event):
+        # Normalized activity is authoritative even when its fields are
+        # uncertain; provider text must not fill in what it declined to vouch for.
+        return _normalized_tool_call(event)
     text = event.get("text")
     if not isinstance(text, str):
         return None
@@ -82,7 +205,9 @@ def _tool_call(event: dict[str, object]) -> tuple[str, str] | None:
         detail = inputs
     else:
         detail = ""
-    return tool, detail
+    # Legacy events carry no ctx activity, so their fidelity is the event
+    # content's alone; parsing changed nothing about how much ctx vouches.
+    return tool, detail, True
 
 
 def _spell_out_utc_designator(value: str) -> str:
@@ -159,15 +284,22 @@ def validate_ctx_transcript(
             continue
         occurred_at = _timestamp(event.get("occurred_at"))
         content = event.get("content")
+        parsed = _tool_call(event)
+        # Full fidelity requires complete content AND, for an event carrying
+        # ctx activity, an activity this SDK can vouch for: an unsupported
+        # revision or invocation, an unknown capture state, or conflicting
+        # evidence leaves the call partial.  Legacy events without activity
+        # keep their content-only fidelity.
+        grounded = parsed[2] if parsed is not None else not _has_normalized_activity(event)
         event_fidelity = (
             "full"
-            if isinstance(content, dict)
+            if grounded
+            and isinstance(content, dict)
             and cast(dict[str, object], content).get("complete") is True
             else "partial"
         )
         if event_fidelity != "full":
             fidelity = "partial"
-        parsed = _tool_call(event)
         calls.append(
             TranscriptCall(
                 tool=parsed[0] if parsed is not None else None,
@@ -176,6 +308,6 @@ def validate_ctx_transcript(
                 fidelity=event_fidelity,
             )
         )
-    if remote_cwd is not None and remote_cwd not in observed_cwds:
+    if remote_cwd is not None and observed_cwds != {remote_cwd}:
         raise ValueError("ctx session export does not corroborate the worker working directory")
     return ValidatedTranscript(calls=tuple(calls), fidelity=fidelity)
