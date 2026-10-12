@@ -157,7 +157,11 @@ class WeftAttributeDispatchTests(unittest.TestCase):
         self.harness = Harness()
         self.addCleanup(self.harness.close)
 
-    def runner(self, attributes: Mapping[str, str] | None = None) -> WeftCommandRunner:
+    def runner(
+        self,
+        attributes: Mapping[str, str] | None = None,
+        inputs: list[str] | None = None,
+    ) -> WeftCommandRunner:
         return WeftCommandRunner(
             host="studio",
             agent="omp",
@@ -169,6 +173,7 @@ class WeftAttributeDispatchTests(unittest.TestCase):
             admission_wait=self.harness.wait,
             expected_source_sha256=SOURCE,
             attributes=attributes,
+            inputs=inputs or (),
         )
 
     def dispatch(self, runner: WeftCommandRunner) -> CommandResult:
@@ -180,6 +185,18 @@ class WeftAttributeDispatchTests(unittest.TestCase):
         self.assertEqual(self.harness.local_calls, [])
         self.assertIsNotNone(result.execution)
 
+    def test_a_bare_input_string_is_refused_before_invocation(self) -> None:
+        with self.assertRaises(ValueError):
+            WeftCommandRunner(
+                host="studio",
+                agent="omp",
+                model_call_id=KEY,
+                fallback=None,
+                invoke=self.harness.invoke,
+                inputs="local:lab-notebook/guide.md",
+            )
+        self.assertEqual(self.harness.calls, [])
+
     def test_no_attributes_leaves_submission_identical_to_the_baseline(self) -> None:
         baselines: list[list[str]] = []
         for attributes in (None, {}):
@@ -190,6 +207,47 @@ class WeftAttributeDispatchTests(unittest.TestCase):
             baselines.append(without_payload_path(submitted))
             self.harness.calls.clear()
         self.assertEqual(baselines[0], baselines[1])
+
+    def test_inputs_are_frozen_across_construction_and_admission_resend(self) -> None:
+        values = ["first input", "second=*"]
+
+        def mutate_during_backoff(seconds: float) -> bool:
+            self.harness.now += seconds
+            values[:] = ["mutated"]
+            return False
+
+        runner = WeftCommandRunner(
+            host="studio",
+            agent="omp",
+            model_call_id=KEY,
+            fallback=self.harness.fallback,
+            invoke=self.harness.invoke,
+            clock=lambda: self.harness.now,
+            sleep=self.harness.sleep,
+            admission_wait=mutate_during_backoff,
+            expected_source_sha256=SOURCE,
+            inputs=values,
+        )
+        values[:] = ["mutated before dispatch"]
+        self.harness.submissions = [
+            CommandResult(
+                1,
+                receipt("not_accepted", rejection={"code": "drained", "detail": "retry later"}),
+                "",
+            ),
+            CommandResult(0, receipt("deduplicated"), ""),
+        ]
+        self.assert_remote(self.dispatch(runner))
+        submissions = self.harness.submissions_sent()
+        self.assertEqual(len(submissions), 2)
+        for submitted in submissions:
+            values_sent = [
+                submitted[index + 1]
+                for index, word in enumerate(submitted[:-1])
+                if word == "--input"
+            ]
+            self.assertEqual(values_sent, ["first input", "second=*"])
+        self.assertEqual(without_payload_path(submissions[0]), without_payload_path(submissions[1]))
 
     def test_attributes_are_emitted_as_attr_pairs_in_ascending_key_order(self) -> None:
         self.harness.submissions = [CommandResult(0, receipt(), "")]

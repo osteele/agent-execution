@@ -15,6 +15,9 @@ class WeftCapabilities:
     host: str
     state: DeclarationState
     values: tuple[str, ...] | None
+    ssh_target: str | None = None
+    ssh_identity_file: str | None = None
+    endpoint_valid: bool = True
     command: tuple[str, ...] = WEFT_HOST_LIST_COMMAND
 
     def to_dict(self) -> dict[str, object]:
@@ -22,6 +25,8 @@ class WeftCapabilities:
             "host": self.host,
             "state": self.state,
             "capabilities": None if self.values is None else list(self.values),
+            "ssh_target": self.ssh_target,
+            "ssh_identity_file": self.ssh_identity_file,
             "command": list(self.command),
         }
 
@@ -61,8 +66,21 @@ def parse_weft_host_capabilities(
         name = entry.get("name")
         if not isinstance(name, str):
             raise ValueError(f"weft host list entry {index} must contain a string name")
+        target = entry.get("ssh_target")
+        identity_file = entry.get("ssh_identity_file")
+        endpoint_valid = (target is None or isinstance(target, str)) and (
+            identity_file is None or isinstance(identity_file, str)
+        )
+        if not isinstance(target, str):
+            target = None
+        if not isinstance(identity_file, str):
+            identity_file = None
         if "capabilities" not in entry:
-            declarations.append(WeftCapabilities(name, "absent", None, command))
+            declarations.append(
+                WeftCapabilities(
+                    name, "absent", None, target, identity_file, endpoint_valid, command
+                )
+            )
             continue
         capabilities = entry["capabilities"]
         if not isinstance(capabilities, list) or not all(
@@ -71,6 +89,14 @@ def parse_weft_host_capabilities(
             raise ValueError(f"weft host {name!r} capabilities must be an array of strings")
         values = tuple(cast(list[str], capabilities))
         declarations.append(
-            WeftCapabilities(name, "empty" if not values else "populated", values, command)
+            WeftCapabilities(
+                name,
+                "empty" if not values else "populated",
+                values,
+                target,
+                identity_file,
+                endpoint_valid,
+                command,
+            )
         )
     return tuple(declarations)

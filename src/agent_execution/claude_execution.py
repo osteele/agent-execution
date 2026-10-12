@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -39,6 +40,10 @@ def is_exact_claude_model(model: str) -> bool:
 
 class ClaudeStatusError(ValueError):
     """Claude returned a native error/refusal rather than a usable result."""
+
+
+class NativeClaudeResolutionError(RuntimeError):
+    """The native executable could not be observed; absence is not established."""
 
 
 @dataclass(frozen=True)
@@ -259,6 +264,118 @@ def _is_native_binary(path: str) -> bool:
     }
 
 
+#: How long a recorded launch binding stays consumable. The worker consumes it
+#: immediately after the preflight that recorded it; the binding exists to keep
+#: one launch on one observation, not to cache a resolution.
+_LAUNCH_BINDING_MAX_AGE_SECONDS = 120.0
+
+
+@dataclass(frozen=True)
+class NativeClaudeLaunchBinding:
+    """The exact launch one validated native observation stands behind.
+
+    `native_claude_launch` resolves PATH, so observing once and launching once
+    can select two different binaries: the fresh facts the worker admitted
+    would then describe an executable it never runs. The worker's preflight
+    therefore records the physical executable and the scrubbed launch
+    environment its status probe validated, and its single launch consumes the
+    record instead of resolving again. `identity` pins the observed file
+    (path, inode, size, mtime), so a binary replaced between observation and
+    launch is refused rather than silently swapped in. `environment` is the
+    scrubbed environment with the executable's directory leading `PATH` -- the
+    exact environment the probe's own harness observation ran under.
+    """
+
+    executable: str
+    environment: dict[str, str]
+    identity: str
+    observed_at: float
+
+
+_LAUNCH_BINDING: NativeClaudeLaunchBinding | None = None
+
+
+def _observed_identity(executable: str) -> str:
+    """The observed file's invalidation identity, shared with the credential store."""
+    from agent_execution.credentials import _executable_identity
+
+    return _executable_identity(executable)
+
+
+def record_native_launch_binding(
+    executable: str,
+    environment: Mapping[str, str],
+    *,
+    identity: str | None = None,
+) -> NativeClaudeLaunchBinding:
+    """Record the launch a fresh validated observation stands behind.
+
+    Called by Execution's own status probe for the native worker surface it
+    probes immediately before one dispatch. Recording replaces any earlier
+    binding: only the freshest observation may authorize a launch.
+
+    ``identity`` is the physical executable's invalidation identity as it was
+    captured before the probe's ``--help`` observation ran. The probe verifies
+    the file never changed across help and authentication, so the identity it
+    observed first is the one the launch must be held to; recomputing it here
+    could instead bless a post-race replacement as the preflight identity.
+    """
+    global _LAUNCH_BINDING
+    _LAUNCH_BINDING = NativeClaudeLaunchBinding(
+        executable=executable,
+        environment=dict(environment),
+        identity=identity if identity is not None else _observed_identity(executable),
+        observed_at=time.time(),
+    )
+    return _LAUNCH_BINDING
+
+
+def take_native_launch_binding() -> NativeClaudeLaunchBinding | None:
+    """Consume the recorded binding, if one is still fresh.
+
+    One call answers for one launch. A binding older than
+    `_LAUNCH_BINDING_MAX_AGE_SECONDS` is discarded, not honored: the
+    observation it stands behind is no longer fresh enough to launch on.
+    """
+    global _LAUNCH_BINDING
+    binding = _LAUNCH_BINDING
+    _LAUNCH_BINDING = None
+    if binding is None or time.time() - binding.observed_at > _LAUNCH_BINDING_MAX_AGE_SECONDS:
+        return None
+    return binding
+
+
+def discard_native_launch_binding() -> None:
+    """Drop any recorded binding without consuming it.
+
+    A worker run calls this before its own preflight probe: a binding left by
+    an earlier probe in this process is not this attempt's observation, and
+    only the probe of this exact attempt may bind its launch.
+    """
+    global _LAUNCH_BINDING
+    _LAUNCH_BINDING = None
+
+
+def _validated_launch(launch: NativeClaudeLaunchBinding | None) -> tuple[str, dict[str, str]]:
+    """The launch to run: the observed binding when given, else a fresh resolution.
+
+    A binding is proof, not a hint: the executable must still be the exact
+    file that was observed. Anything else is a refusal -- falling back to a
+    second PATH resolution would launch a binary no observation ever admitted.
+    """
+    if launch is None:
+        return native_claude_launch()
+    if not os.path.isfile(launch.executable) or not os.access(launch.executable, os.X_OK):
+        raise FileNotFoundError(
+            f"the observed native Claude executable is no longer installed: {launch.executable}"
+        )
+    if _observed_identity(launch.executable) != launch.identity:
+        raise FileNotFoundError(
+            "the native Claude executable changed after its validated preflight observation"
+        )
+    return launch.executable, dict(launch.environment)
+
+
 def native_claude_launch(
     environment: Mapping[str, str] | None = None, *, timeout: float = _NATIVE_RESOLVER_TIMEOUT
 ) -> tuple[str, dict[str, str]]:
@@ -274,7 +391,13 @@ def native_claude_launch(
     command = _executable_file(command_path)
     if command is None:
         raise FileNotFoundError("Claude command did not resolve to an executable file")
-    if _is_native_binary(command):
+    try:
+        is_native = _is_native_binary(command)
+    except OSError as error:
+        raise NativeClaudeResolutionError(
+            f"native Claude executable could not be inspected: {error}; it was not verified"
+        ) from error
+    if is_native:
         return command, launch
     try:
         result = subprocess.run(
@@ -285,16 +408,38 @@ def native_claude_launch(
             check=False,
             env=launch,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        result = None
-    if result is not None and result.returncode == 0:
+    except subprocess.TimeoutExpired as error:
+        raise NativeClaudeResolutionError(
+            f"native Claude executable resolution timed out after {timeout:g}s; "
+            "the launcher was not verified"
+        ) from error
+    except OSError as error:
+        raise NativeClaudeResolutionError(
+            f"native Claude executable resolution failed: {error}; the launcher was not verified"
+        ) from error
+    if result.returncode == 0:
         lines = result.stdout.strip().splitlines()
         physical = _executable_file(lines[0].strip()) if len(lines) == 1 else None
-        if physical is None or not _is_native_binary(physical):
-            raise FileNotFoundError("Claude native-binary resolver returned an invalid executable")
+        if physical is None:
+            raise NativeClaudeResolutionError(
+                "Claude native-binary resolver returned no verified native executable"
+            )
+        try:
+            is_native = _is_native_binary(physical)
+        except OSError as error:
+            raise NativeClaudeResolutionError(
+                f"resolved native Claude executable could not be inspected: {error}"
+            ) from error
+        if not is_native:
+            raise NativeClaudeResolutionError(
+                "Claude native-binary resolver returned no verified native executable"
+            )
         return physical, launch
-    # Resolution failure must not execute a launcher whose route is unobserved.
-    raise FileNotFoundError("Claude wrapper did not resolve a verified native executable")
+    diagnostic = (result.stderr or result.stdout or "resolver exited unsuccessfully").strip()
+    diagnostic = " ".join(diagnostic.split())[:240]
+    raise NativeClaudeResolutionError(
+        f"Claude native-binary resolution failed: {diagnostic}; the launcher was not verified"
+    )
 
 
 def _native_command(executable: str, invocation: ClaudeInvocation) -> list[str]:
@@ -343,15 +488,26 @@ def _native_command(executable: str, invocation: ClaudeInvocation) -> list[str]:
 
 
 def run_claude_command(
-    command: list[str], cwd: Path, timeout: float | None, *, prompt: str | None = None
+    command: list[str],
+    cwd: Path,
+    timeout: float | None,
+    *,
+    prompt: str | None = None,
+    launch: NativeClaudeLaunchBinding | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the validated native command in a process group with prompt on stdin."""
+    """Run the validated native command in a process group with prompt on stdin.
+
+    `launch` is the worker preflight's own validated observation. When given,
+    this one launch runs that exact executable and scrubbed environment --
+    never a second PATH resolution that could select a binary the admitted
+    facts do not describe -- and refuses if the observed file changed.
+    """
     invocation = validate_claude_command(command)
     if prompt is None and invocation.prompt == CLAUDE_STDIN_PROMPT_MARKER:
         raise ValueError(
             "Claude '-' prompt marker requires its payload through the prompt argument"
         )
-    executable, environment = native_claude_launch()
+    executable, environment = _validated_launch(launch)
     payload = invocation.prompt if prompt is None else prompt
     if not payload.strip() or "\x00" in payload:
         raise ValueError("Claude prompt payload must be nonempty and contain no NUL")
