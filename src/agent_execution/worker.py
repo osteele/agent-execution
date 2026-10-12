@@ -50,6 +50,7 @@ from agent_execution.omp_execution import (
     validate_omp_command,
     validate_omp_transcript,
 )
+from agent_execution.omp_shell_supervisor import resolve_runtime_tools
 from agent_execution.processes import (
     BudgetedCompletedProcess,
     BudgetTimeoutExpired,
@@ -285,6 +286,7 @@ def run_worker_command(
     *,
     renewable_budget: RenewableBudget | None = None,
     scrub_environment: bool = False,
+    mise_runtime_path: bool = False,
 ) -> CommandResult:
     """Run a worker helper with the same process-group cleanup as the harness.
 
@@ -329,13 +331,28 @@ def run_worker_command(
     if name == "claude":
         completed = run_claude_command(command, cwd, timeout)
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
-    completed = run_in_process_group(
-        command,
-        cwd,
-        "",
-        timeout,
-        environment=scrubbed_check_environment() if scrub_environment else None,
-    )
+    environment = scrubbed_check_environment() if scrub_environment else None
+    if mise_runtime_path:
+        with tempfile.TemporaryDirectory(prefix="agent-check-tools-") as directory:
+            tool_bin = Path(directory)
+            home = Path((environment or os.environ).get("HOME", str(Path.home())))
+            search_path = (environment or os.environ).get("PATH", os.defpath)
+            tools, _sources = resolve_runtime_tools(
+                cwd, home, Path(sys.executable), search_path=search_path
+            )
+            for tool, target in tools.items():
+                (tool_bin / tool).symlink_to(target)
+            environment = dict(environment or os.environ)
+            environment["PATH"] = f"{tool_bin}:{environment.get('PATH', os.defpath)}"
+            completed = run_in_process_group(command, cwd, "", timeout, environment=environment)
+    else:
+        completed = run_in_process_group(
+            command,
+            cwd,
+            "",
+            timeout,
+            environment=environment,
+        )
     return CommandResult(
         completed.returncode,
         completed.stdout,

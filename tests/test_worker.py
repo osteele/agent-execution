@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -930,6 +931,101 @@ class WorkerCheckEnvironmentTests(unittest.TestCase):
         for harness in ("omp", "agy", "claude"):
             with self.subTest(harness=harness), self.assertRaises(ValueError):
                 run_worker_command([harness], self.root, 1.0, scrub_environment=True)
+
+
+class MiseRuntimeResolutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        # HOME is self.root, so mise's install tree is self.root/.local/share/mise.
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("MISE_DATA_DIR", None)
+        install = self.root / ".local/share/mise/installs/node/24.0.0/bin"
+        install.mkdir(parents=True)
+        self.node = install / "node"
+        self.node.write_text("#!/bin/sh\necho mise-node\n")
+        self.node.chmod(0o755)
+        self.outside = self.root / "host-node"
+        self.outside.write_text("#!/bin/sh\necho host-node\n")
+        self.outside.chmod(0o755)
+        self.mise_answers(node=self.node)
+
+    def mise_answers(self, **paths: Path) -> None:
+        cases = "".join(
+            f"if [ \"$2\" = {name} ]; then echo '{path}'; exit 0; fi\n"
+            for name, path in paths.items()
+        )
+        mise = self.bin / "mise"
+        mise.write_text(f"#!/bin/sh\n{cases}exit 1\n")
+        mise.chmod(0o755)
+
+    def test_custom_mise_data_dir_locates_installs_and_reaches_mise(self) -> None:
+        from agent_execution.omp_shell_supervisor import resolve_runtime_tools
+
+        data = self.root / "custom-mise"
+        install = data / "installs/node/25.0.0/bin"
+        install.mkdir(parents=True)
+        node = install / "node"
+        node.write_text("#!/bin/sh\necho custom-node\n")
+        node.chmod(0o755)
+        # The fake mise answers only when it sees the custom data directory.
+        mise = self.bin / "mise"
+        mise.write_text(
+            f'#!/bin/sh\n[ "$MISE_DATA_DIR" = \'{data}\' ] && [ "$2" = node ] '
+            f"&& {{ echo '{node}'; exit 0; }}\nexit 1\n"
+        )
+        mise.chmod(0o755)
+        os.environ["MISE_DATA_DIR"] = str(data)
+        tools, sources = resolve_runtime_tools(
+            self.root, self.root, Path(sys.executable), search_path=str(self.bin)
+        )
+        self.assertEqual(sources["node"], "mise")
+        self.assertEqual(tools["node"], node.resolve())
+
+    def test_mise_result_outside_its_install_tree_is_refused(self) -> None:
+        from agent_execution.omp_shell_supervisor import resolve_runtime_tools
+
+        self.mise_answers(node=self.outside)
+        tools, sources = resolve_runtime_tools(
+            self.root, self.root, Path(sys.executable), search_path=str(self.bin)
+        )
+        self.assertNotEqual(sources["node"], "mise")
+        self.assertNotEqual(tools.get("node"), self.outside.resolve())
+
+    def test_mise_resolution_and_fallback_when_tool_is_missing(self) -> None:
+        from agent_execution.omp_shell_supervisor import resolve_runtime_tools
+
+        tools, sources = resolve_runtime_tools(
+            self.root, self.root, Path(sys.executable), search_path=str(self.bin)
+        )
+        self.assertEqual(tools["node"], self.node.resolve())
+        self.assertEqual(sources["node"], "mise")
+        self.assertEqual(sources["deno"], "missing")
+
+    def test_mise_absent_preserves_fallback_behavior(self) -> None:
+        from agent_execution.omp_shell_supervisor import resolve_runtime_tools
+
+        tools, sources = resolve_runtime_tools(
+            self.root, self.root, Path(sys.executable), search_path="/nonexistent"
+        )
+        self.assertNotIn("node", tools)
+        self.assertEqual(sources["node"], "missing")
+        self.assertEqual(sources["python3"], "system")
+
+    def test_check_opt_in_prepends_same_resolved_tool_directory(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"PATH": f"{self.bin}:/usr/bin:/bin", "HOME": str(self.root)}
+        ):
+            result = run_worker_command(
+                ["/bin/sh", "-c", "command -v node"], self.root, 10.0, mise_runtime_path=True
+            )
+        self.assertEqual(result.exit_status, 0, result.stderr)
+        self.assertIn("agent-check-tools-", result.stdout)
 
 
 if __name__ == "__main__":
