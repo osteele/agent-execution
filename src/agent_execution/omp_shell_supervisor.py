@@ -131,8 +131,8 @@ class ProcessMarkers:
             time.sleep(0.01)
 
 
-def metadata_pattern() -> str:
-    names = (
+def metadata_names() -> tuple[str, ...]:
+    return (
         ".git",
         ".jj",
         ".hg",
@@ -146,15 +146,17 @@ def metadata_pattern() -> str:
         ".gemini",
     )
 
-    def literal(name: str) -> str:
-        return "".join(
-            f"[{char.lower()}{char.upper()}]" if char.isalpha() else "[.]" if char == "." else char
-            for char in name
-        )
 
-    pattern = "|".join(literal(name) for name in names)
-    legacy = literal("agent-execution-worker-result") + "(-[^/]*)?" + literal(".json")
-    return f"/({pattern}|{legacy})(/|$)"
+def metadata_regex_component(name: str) -> str:
+    return "".join(
+        f"[{char.lower()}{char.upper()}]" if char.isalpha() else "[.]" if char == "." else char
+        for char in name
+    )
+
+
+def result_evidence_pattern() -> str:
+    stem = metadata_regex_component("agent-execution-worker-result")
+    return "/" + stem + "(-[^/]*)?" + metadata_regex_component(".json") + "(/|$)"
 
 
 def runtime_paths(python_executable: Path, home: Path) -> tuple[set[Path], set[Path]]:
@@ -222,6 +224,10 @@ def sandbox_profile(
         }
     )
     exec_rules = " ".join(f"(literal {sbpl_string(str(path))})" for path in sorted(executables))
+    openssl_rules = " ".join(
+        f"(literal {sbpl_string(str(prefix / 'etc' / 'openssl@3' / 'openssl.cnf'))})"
+        for prefix in (Path("/opt/homebrew"), Path("/usr/local"))
+    )
     read_rules = " ".join(f"(subpath {sbpl_string(str(path))})" for path in sorted(read_roots))
     exec_roots = " ".join(
         f"(subpath {sbpl_string(str(path))})" for path in sorted(roots | brew_roots)
@@ -238,11 +244,19 @@ def sandbox_profile(
     developer_rules = " ".join(
         f"(literal {sbpl_string(str(path))})" for path in sorted(developer_links)
     )
-    metadata = metadata_pattern()
+    metadata = (
+        "/(" + "|".join(metadata_regex_component(name) for name in metadata_names()) + ")(/|$)"
+    )
+    # Tool caches in private scratch use names such as .git; snapshot and
+    # installed-runtime metadata remains protected at every directory depth.
+    metadata_denies = (
+        f"(require-all (regex #{sbpl_string(metadata)}) (require-not (subpath {scratch_path})))"
+    )
+    evidence = result_evidence_pattern()
     protected = "\n".join(
         (
-            f"(deny file-read* (regex #{sbpl_string(metadata)}))",
-            f"(deny file-write* (regex #{sbpl_string(metadata)}))",
+            f"(deny file-read* {metadata_denies} (regex #{sbpl_string(evidence)}))",
+            f"(deny file-write* {metadata_denies} (regex #{sbpl_string(evidence)}))",
         )
     )
     return f"""
@@ -257,6 +271,13 @@ def sandbox_profile(
 (allow file-read* {developer_rules})
 (allow file-read-metadata {metadata_rules})
 (allow file-read* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom") {read_rules} (subpath {root_path}) (subpath {scratch_path}))
+; Homebrew-linked Node loads this OpenSSL configuration at startup.
+(allow file-read* {openssl_rules})
+; Runtimes read CPU/memory topology and OS version; named host identifiers
+; and everything outside these names (process census, kern.proc.*) stay denied.
+(allow sysctl-read (sysctl-name-prefix "hw.") (sysctl-name-prefix "kern.os")
+    (sysctl-name "kern.version") (sysctl-name "kern.hostname"))
+(deny sysctl-read (sysctl-name "hw.uuid") (sysctl-name "hw.serial"))
 (allow file-write* (subpath {root_path}) (subpath {scratch_path}) (literal "/dev/null"))
 (deny network*)
 {markers.rules()}
@@ -328,7 +349,7 @@ def supervise(
             ["/usr/bin/sandbox-exec", "-p", profile, "/bin/sh", "-c", command],
             cwd=root,
             env={
-                "PATH": f"{tool_bin}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "PATH": f"{tool_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
                 "HOME": str(scratch),
                 "TMPDIR": str(scratch),
                 "XDG_CACHE_HOME": str(scratch / "cache"),

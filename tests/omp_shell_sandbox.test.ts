@@ -2,9 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, watch } from "node:fs";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertShellSandboxAvailable, executeShell } from "../src/agent_execution/omp_shell_sandbox";
 
@@ -70,6 +70,14 @@ test.if(process.platform === "darwin" && existsSync("/System/Volumes/Data"))("ma
 });
 
 const brewPrefix = process.arch === "arm64" ? "/opt/homebrew" : "/usr/local";
+const homeDirectory = homedir();
+
+const ruffPath = Bun.which("ruff");
+const nodePath = join(brewPrefix, "bin/node");
+const bunPath = join(homeDirectory, ".bun/bin/bun");
+const uvPath = join(homeDirectory, ".local/bin/uv");
+const denoPath = join(brewPrefix, "bin/deno");
+
 test.if(process.platform === "darwin" && existsSync(join(brewPrefix, "etc")) && existsSync(join(brewPrefix, "var")))("macOS sandbox refuses Homebrew configuration and service directories", async () => {
 	const { root } = await makeSnapshot();
 	for (const directory of ["etc", "var"]) {
@@ -95,6 +103,65 @@ test.if(process.platform === "darwin")("macOS sandbox cannot expose host files t
 });
 
 
+test.if(process.platform === "darwin")("macOS sandbox reads system identity through uname", async () => {
+	const { root } = await makeSnapshot();
+	const expected = spawnSync("/usr/bin/uname", ["-a"]).stdout.toString().trim();
+	const result = await executeShell(root, "uname -a", "/usr/bin/python3", 30);
+	expect(result.exit_code).toBe(0);
+	expect(result.stdout.trim()).toBe(expected);
+});
+
+test.if(process.platform === "darwin" && existsSync(uvPath))("macOS sandbox runs uv to build a venv offline", async () => {
+	const { root } = await makeSnapshot();
+	const result = await executeShell(
+		root,
+		'uv venv --python python3 "$TMPDIR/venv" >/dev/null && cat "$TMPDIR/venv/pyvenv.cfg"',
+		"/usr/bin/python3",
+		60,
+	);
+	expect(result.exit_code).toBe(0);
+	expect(result.stdout).toContain("home = ");
+});
+
+test.if(process.platform === "darwin" && ruffPath !== null)("macOS sandbox runs ruff formatting", async () => {
+	const { root } = await makeSnapshot();
+	// Supply the installed standalone binary as an ordinary snapshot tool.
+	await copyFile(await realpath(ruffPath!), join(root, "ruff"));
+	await writeFile(join(root, "format-input.py"), "value=1\n");
+	const result = await executeShell(root, "./ruff format format-input.py", "/usr/bin/python3", 60);
+	expect(result.exit_code).toBe(0);
+	expect(await readFile(join(root, "format-input.py"), "utf8")).toBe("value = 1\n");
+});
+
+test.if(process.platform === "darwin" && existsSync(bunPath))("macOS sandbox runs bun TypeScript", async () => {
+	const { root } = await makeSnapshot();
+	await writeFile(join(root, "sum.ts"), "const total: number = 6 * 7;\nconsole.log(total);\n");
+	const result = await executeShell(root, "bun run sum.ts", "/usr/bin/python3", 60);
+	expect(result.exit_code).toBe(0);
+	expect(result.stdout.trim()).toBe("42");
+});
+
+test.if(process.platform === "darwin" && existsSync(nodePath))("macOS sandbox runs node with working OpenSSL hashing", async () => {
+	const { root } = await makeSnapshot();
+	const result = await executeShell(
+		root,
+		`node -e 'console.log(process.version);console.log(require("node:crypto").createHash("sha256").update("abc").digest("hex"))'`,
+		"/usr/bin/python3",
+		60,
+	);
+	expect(result.exit_code).toBe(0);
+	const [version, digest] = result.stdout.trim().split("\n");
+	expect(version).toBe(spawnSync(nodePath, ["--version"]).stdout.toString().trim());
+	expect(digest).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+});
+
+test.if(process.platform === "darwin" && existsSync(denoPath))("macOS sandbox runs deno evaluation", async () => {
+	const { root } = await makeSnapshot();
+	const result = await executeShell(root, 'deno eval "console.log(6 * 7)"', "/usr/bin/python3", 90);
+	expect(result.exit_code).toBe(0);
+	expect(result.stdout.trim()).toBe("42");
+});
+
 test.if(process.platform === "darwin")("macOS sandbox refuses reads, writes and renames of protected metadata", async () => {
 	const { root } = await makeSnapshot();
 	const git = join(root, ".git");
@@ -109,6 +176,21 @@ test.if(process.platform === "darwin")("macOS sandbox refuses reads, writes and 
 	const forged = await executeShell(root, "printf forged > agent-execution-worker-result-copy.json", "/usr/bin/python3", 10);
 	expect(forged.exit_code).not.toBe(0);
 	expect(await readFile(evidence, "utf8")).toBe("retained evidence");
+});
+
+test.if(process.platform === "darwin")("metadata protection covers nested and mixed-case paths while scratch caches remain writable", async () => {
+	const { root } = await makeSnapshot();
+	for (const name of ["nested/.GiT", "nested/.agent-execution"]) {
+		await mkdir(join(root, name), { recursive: true });
+		await writeFile(join(root, name, "secret"), "protected bytes");
+		const result = await executeShell(root, `cat '${name}/secret'; printf forged > '${name}/secret'`, "/usr/bin/python3", 10);
+		expect(result.exit_code).not.toBe(0);
+		expect(result.stdout).not.toContain("protected bytes");
+		expect(await readFile(join(root, name, "secret"), "utf8")).toBe("protected bytes");
+	}
+	const cache = await executeShell(root, 'mkdir -p "$TMPDIR/cache/.git" && printf cache > "$TMPDIR/cache/.git/marker" && cat "$TMPDIR/cache/.git/marker"', "/usr/bin/python3", 10);
+	expect(cache.exit_code).toBe(0);
+	expect(cache.stdout).toBe("cache");
 });
 
 test.if(process.platform === "darwin")("macOS sandbox denies network access", async () => {

@@ -297,9 +297,16 @@ The shell tool accepts `{command, timeout?}` and starts `/bin/sh` in the
 canonical snapshot root. Its timeout defaults to 60 seconds and must be an
 integer from 1 through 900; the enclosing worker deadline also applies.
 Commands run without network access or inherited credentials. Only the snapshot
-and private scratch are writable; protected VCS/harness metadata stays denied.
-Installed runtime subtrees are readable; Homebrew configuration (`etc`) and
-service data (`var`) are not. Host dependency caches are not supplied.
+and private scratch are writable. VCS/harness metadata is protected at every
+snapshot directory depth; private scratch permits cache markers such as `.git`.
+Installed runtime subtrees are readable. The supplied `PATH` includes Homebrew
+tools and provisions `python3`, `uv`, and `bun`. Homebrew configuration (`etc`)
+and service data (`var`) are not readable, except
+`etc/openssl@3/openssl.cnf`, which Homebrew-linked Node loads at startup.
+System introspection is read-only: hardware, CPU-capability, OS-version, and
+hostname facts are readable, while platform UUID and serial sysctls, host
+process enumeration (so `ps` cannot census processes), and nested
+`sandbox-exec` stay denied. Host dependency caches are not supplied.
 Projects requiring unavailable dependencies need an offline preparation step.
 Use `python3` from the supplied `PATH` for the provisioned interpreter; absolute
 OS launcher shims can require host preferences that the sandbox denies.
