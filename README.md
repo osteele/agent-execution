@@ -378,8 +378,10 @@ Each row contains:
   `age_seconds`, `stale`, `source` (`tool`, `method`), `detail`, and an optional
   typed refusal `condition` (`quota`, `auth`, `network`, `unknown`).
 - `credential_basis`: an independent `harness-credential-basis/v1` observation
-  with expiry, age, and staleness, or null when absent. Authentication presence
-  does not establish subscription billing.
+  with expiry, age, and staleness, or null when absent. It is not a provider
+  billing-model decision. Consumers must keep the observed credential
+  information distinct from modeled provider billing and operator-declared
+  credential-plan facts; none substitutes for another.
 
 States are `available`, `unavailable`, or `unknown`. Absent facts have null
 timestamps/age and `stale: true`. Expired facts retain their observed state and

@@ -622,6 +622,72 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(len(self.payloads), 1)
         self.assertEqual(self.local_calls, [])
 
+    def test_lookup_miss_retries_same_model_call_key_until_admitted(self) -> None:
+        self.submissions = [
+            subprocess.TimeoutExpired(["weft", "run"], 30),
+            CommandResult(0, receipt("deduplicated"), ""),
+        ]
+        self.jobs = listing()
+        self.runner.retry_ambiguous_admission = True
+
+        result = self.run_dispatch()
+
+        self.assert_remote(result)
+        run_commands = [command for command, _, _ in self.calls if command[1] == "run"]
+        self.assertEqual(len(run_commands), 2)
+        self.assertEqual(
+            [command[command.index("--idempotency-key") + 1] for command in run_commands],
+            [KEY, KEY],
+        )
+        self.assertEqual(len(self.payloads), 2)
+
+    def test_ambiguous_admission_resubmission_is_bounded_and_keeps_custody(self) -> None:
+        self.submissions = [subprocess.TimeoutExpired(["weft", "run"], 30)] * 3
+        self.jobs = listing()
+        self.runner.retry_ambiguous_admission = True
+
+        with self.assertRaises(WeftExecutionAmbiguous):
+            self.run_dispatch()
+
+        run_commands = [command for command, _, _ in self.calls if command[1] == "run"]
+        self.assertEqual(len(run_commands), 3)
+        self.assertEqual(
+            {command[command.index("--idempotency-key") + 1] for command in run_commands},
+            {KEY},
+        )
+        self.assertEqual(self.local_calls, [])
+
+    def test_not_accepted_after_ambiguous_admission_never_falls_back_locally(self) -> None:
+        self.submissions = [
+            subprocess.TimeoutExpired(["weft", "run"], 30),
+            CommandResult(0, receipt("not_accepted"), ""),
+            CommandResult(0, receipt("not_accepted"), ""),
+        ]
+        self.jobs = listing()
+        self.runner.retry_ambiguous_admission = True
+
+        with self.assertRaises(WeftExecutionAmbiguous):
+            self.run_dispatch()
+
+        run_commands = [command for command, _, _ in self.calls if command[1] == "run"]
+        self.assertEqual(len(run_commands), 3)
+        self.assertEqual(
+            [command[command.index("--idempotency-key") + 1] for command in run_commands],
+            [KEY, KEY, KEY],
+        )
+        self.assertEqual(self.local_calls, [])
+
+    def test_proven_rejection_retry_keeps_the_callers_deadline(self) -> None:
+        self.submit_elapsed = 30.0
+        self.submissions = [CommandResult(0, receipt("not_accepted"), "")] * 3
+
+        with self.assertRaises(WeftExecutionAmbiguous):
+            self.run_dispatch(timeout=30.0)
+
+        run_commands = [command for command, _, _ in self.calls if command[1] == "run"]
+        self.assertEqual(len(run_commands), 1)
+        self.assertEqual(self.local_calls, [])
+
     def test_description_mention_cannot_establish_dispatch_ownership(self) -> None:
         self.submissions = [CommandResult(1, "not json", "")]
         self.jobs = listing(
@@ -634,6 +700,22 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(WeftExecutionAmbiguous):
             self.run_dispatch()
         self.assertFalse(any(command[1] == "status" for command, _, _ in self.calls))
+        self.assertEqual(self.local_calls, [])
+
+    def test_writer_unknown_submission_does_not_resubmit(self) -> None:
+        self.submissions = [subprocess.TimeoutExpired(["weft", "run"], 30)]
+        self.jobs = listing()
+
+        with self.assertRaises(WeftExecutionAmbiguous):
+            self.runner(
+                omp_command(str(self.root), writer=True, selector="openai-codex/gpt-6-astra"),
+                self.root,
+                30.0,
+            )
+
+        run_commands = [command for command, _, _ in self.calls if command[1] == "run"]
+        self.assertEqual(len(run_commands), 1)
+        self.assertEqual(run_commands[0][run_commands[0].index("--idempotency-key") + 1], KEY)
         self.assertEqual(self.local_calls, [])
 
     def test_invalid_rejection_never_authorizes_retry_or_fallback(self) -> None:
@@ -650,7 +732,7 @@ class AdmissionTests(unittest.TestCase):
                 self.payloads.clear()
                 self.calls.clear()
                 self.local_calls.clear()
-                self.submissions = [CommandResult(1, raw, "unmodified refusal evidence")] * 3
+                self.submissions = [CommandResult(1, raw, "unmodified refusal evidence")]
                 with self.assertRaises(WeftExecutionAmbiguous):
                     self.run_dispatch()
                 self.assertEqual(len(self.payloads), 1)
@@ -731,8 +813,8 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(len(self.local_calls), 1)
 
     def test_admission_sequences_obey_no_double_execution(self) -> None:
-        # Exhaust the bounded event model. R retries; A owns remotely; U is unknown.
-        # The oracle is the first non-rejection, independently of production state.
+        # R is proven not_accepted, A owns remotely, U is ambiguous. The oracle
+        # is independent of producer state; this runner uses the SDK default.
         counts = {"local": 0, "remote": 0, "unknown": 0}
         for events in itertools.product("RAU", repeat=3):
             with self.subTest(events=events):
@@ -752,9 +834,15 @@ class AdmissionTests(unittest.TestCase):
                     )
                     for event in events
                 ]
-                first = next((i for i, event in enumerate(events) if event != "R"), 3)
+                accepted_at = next((i for i, event in enumerate(events) if event == "A"), None)
+                first_ambiguous = events.index("U") if "U" in events else None
                 expected = (
-                    "local" if first == 3 else "remote" if events[first] == "A" else "unknown"
+                    "remote"
+                    if accepted_at is not None
+                    and (first_ambiguous is None or accepted_at < first_ambiguous)
+                    else "unknown"
+                    if first_ambiguous is not None
+                    else "local"
                 )
                 counts[expected] += 1
                 if expected == "unknown":
@@ -767,7 +855,14 @@ class AdmissionTests(unittest.TestCase):
                     else:
                         self.assertEqual(result.stdout, "local answer")
                 self.assertEqual(len(self.local_calls), int(expected == "local"))
-                self.assertEqual(len(self.payloads), min(first + 1, 3))
+                attempts_used = (
+                    accepted_at + 1
+                    if expected == "remote" and accepted_at is not None
+                    else first_ambiguous + 1
+                    if first_ambiguous is not None
+                    else 3
+                )
+                self.assertEqual(len(self.payloads), attempts_used)
                 keys = {
                     command[command.index("--idempotency-key") + 1]
                     for command, _, _ in self.calls
@@ -1058,15 +1153,11 @@ class JobAttributionTests(unittest.TestCase):
 
 
 class UnreadableReceiptProbeTests(AdmissionTests):
-    """An unreadable receipt whose probe found nothing records that it found nothing.
+    """An unreadable receipt with no attributable job remains ambiguous.
 
-    Consumers must not retry an unobserved outcome — re-dispatching one risks
-    running a review that already ran. But this path probes Weft for a job
-    attributable to the call and only raises when the probe comes back empty,
-    which is a proven absence rather than an unknown. Leaving that out of the
-    record made the two indistinguishable, and agent-review then held a
-    request `running` for four hours over a cycle that had completed
-    (cycle ff82c4337350).
+    Generic execution callers do not resubmit after an ambiguous outcome.
+    Read-only Review opts into bounded retries with the same idempotency key;
+    this preserves the SDK's writer behavior.
     """
 
     def test_a_probed_absence_is_recorded_as_such(self) -> None:

@@ -157,8 +157,97 @@ def metadata_pattern() -> str:
     return f"/({pattern}|{legacy})(/|$)"
 
 
-def runtime_paths(python_executable: Path, home: Path) -> tuple[set[Path], set[Path]]:
-    roots = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()}
+RUNTIME_TOOLS = ("node", "bun", "uv", "python3", "ruff", "deno", "go")
+
+
+def mise_installs_root(home: Path) -> Path:
+    """mise's runtime install tree; only executables beneath it count as mise's."""
+    data = os.environ.get("MISE_DATA_DIR")
+    return (Path(data) if data else home / ".local" / "share" / "mise").resolve() / "installs"
+
+
+def mise_install_dir(executable: Path, installs: Path) -> Path:
+    """The installs/<tool>/<version> directory holding an executable mise resolved."""
+    relative = executable.relative_to(installs)
+    return installs / relative.parts[0] / relative.parts[1]
+
+
+def resolve_runtime_tools(
+    root: Path, home: Path, python_executable: Path, *, search_path: str | None = None
+) -> tuple[dict[str, Path], dict[str, str]]:
+    """Resolve mise-managed tools outside the sandbox; return executable paths and evidence."""
+    search_path = (
+        search_path or f"{home / '.local/bin'}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    )
+    env = {"PATH": search_path, "HOME": str(home)}
+    if os.environ.get("MISE_DATA_DIR"):
+        env["MISE_DATA_DIR"] = os.environ["MISE_DATA_DIR"]
+    mise = shutil.which("mise", path=search_path)
+    resolved: dict[str, Path] = {}
+    sources: dict[str, str] = {}
+    installs = mise_installs_root(home)
+    if mise:
+        for name in RUNTIME_TOOLS:
+            try:
+                result = subprocess.run(
+                    [mise, "which", name],
+                    cwd=root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                candidate = Path(result.stdout.strip())
+                if result.returncode != 0 or not candidate.is_absolute():
+                    continue
+                real = candidate.resolve()
+                # Granting a result means granting its install directory, so a
+                # path outside mise's own install tree (a project setting can
+                # point anywhere) is refused and the tool falls back.
+                if (
+                    real.is_file()
+                    and real.is_relative_to(installs)
+                    and len(real.relative_to(installs).parts) > 2
+                ):
+                    resolved[name] = real
+                    sources[name] = "mise"
+            except (OSError, subprocess.SubprocessError):
+                pass
+    legacy = {
+        # The interpreter running this supervisor, resolved: /usr/bin/python3
+        # is Apple's xcrun shim, which refuses to run until the account has
+        # accepted the Xcode license.
+        "python3": Path(sys.executable).resolve(),
+        "uv": home / ".local/bin/uv",
+        "bun": home / ".bun/bin/bun",
+    }
+    for name in RUNTIME_TOOLS:
+        if name in resolved:
+            continue
+        candidate = legacy.get(name)
+        if candidate is not None and candidate.is_file():
+            resolved[name] = candidate.resolve()
+            sources[name] = "system"
+            continue
+        candidate = shutil.which(name, path=search_path)
+        if candidate:
+            resolved[name] = Path(candidate).resolve()
+            sources[name] = (
+                "homebrew"
+                if str(candidate).startswith(("/opt/homebrew/", "/usr/local/"))
+                else "system"
+            )
+        else:
+            sources[name] = "missing"
+    return resolved, sources
+
+
+def runtime_paths(
+    python_executable: Path, home: Path, installs: set[Path] | None = None
+) -> tuple[set[Path], set[Path]]:
+    installs = installs or set()
+    roots = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(), *installs}
     uv_python = home / ".local" / "share" / "uv" / "python"
     if uv_python.exists():
         roots.add(uv_python.resolve())
@@ -326,16 +415,19 @@ def supervise(
         if select.select([sys.stdin.fileno()], [], [], 0)[0] and not os.read(sys.stdin.fileno(), 1):
             parent_gone = True
             return None
-        roots, executables = runtime_paths(python_executable, home)
+        tools, runtime_sources = resolve_runtime_tools(root, home, python_executable)
+        mise_installs = mise_installs_root(home)
+        installs = {
+            mise_install_dir(tools[name], mise_installs)
+            for name, source in runtime_sources.items()
+            if source == "mise"
+        }
+        roots, executables = runtime_paths(python_executable, home, installs)
+        executables.update(tools.values())
         tool_bin = scratch / ".agent-execution-bin"
         tool_bin.mkdir(mode=0o700)
-        for name, target in (
-            ("python3", Path(sys.executable).resolve()),
-            ("uv", home / ".local" / "bin" / "uv"),
-            ("bun", home / ".bun" / "bin" / "bun"),
-        ):
-            if target.exists():
-                (tool_bin / name).symlink_to(target.resolve())
+        for name, target in tools.items():
+            (tool_bin / name).symlink_to(target)
         profile = sandbox_profile(root, scratch, markers, roots, executables)
         child = subprocess.Popen(
             ["/usr/bin/sandbox-exec", "-p", profile, "/bin/sh", "-c", command],
@@ -409,6 +501,7 @@ def supervise(
             "stderr": stderr_text,
             "truncated": output_truncated or stdout_cut or stderr_cut,
             "marker_seen": marker_seen,
+            "runtime_sources": runtime_sources,
         }
     finally:
         selector.close()

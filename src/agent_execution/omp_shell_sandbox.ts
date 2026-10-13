@@ -16,6 +16,7 @@ export interface ShellResult {
 	stdout: string;
 	stderr: string;
 	truncated: boolean;
+	runtime_sources: Record<string, "mise" | "homebrew" | "system" | "missing">;
 }
 
 interface SupervisorResult extends ShellResult {
@@ -67,6 +68,9 @@ async function runSupervisor(
 				TMPDIR: scratch,
 				XDG_CACHE_HOME: join(scratch, "cache"),
 				UV_CACHE_DIR: join(scratch, "cache", "uv"),
+				// The supervisor resolves runtimes through mise outside the
+				// sandbox; a custom data directory locates the account's installs.
+				...(process.env.MISE_DATA_DIR ? { MISE_DATA_DIR: process.env.MISE_DATA_DIR } : {}),
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 			detached: true,
