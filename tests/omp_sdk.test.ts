@@ -895,3 +895,101 @@ test.if(process.platform === "darwin")("shell tool rejects unbounded timeouts an
 		truncated: false,
 	});
 });
+
+/**
+ * Run the real shell tool's returned details through the Python evidence
+ * validator, exactly as transcript validation consumes tool_execution_end.
+ */
+async function validateShellEvidence(
+	root: string,
+	args: { command: string },
+	details: Record<string, unknown>,
+): Promise<void> {
+	const parent = await mkdtemp(join(tmpdir(), "omp-evidence-"));
+	temporary.push(parent);
+	const payload = join(parent, "payload.json");
+	await writeFile(
+		payload,
+		JSON.stringify({ arguments: args, details, root }),
+	);
+	const check = Bun.spawnSync({
+		cmd: [
+			"uv",
+			"run",
+			"python",
+			"-c",
+			[
+				"import json, sys",
+				"from pathlib import Path",
+				"from agent_execution.omp_execution import _validate_shell_evidence",
+				"payload = json.loads(Path(sys.argv[1]).read_text())",
+				'_validate_shell_evidence(payload["arguments"], payload["details"], Path(payload["root"]))',
+			].join("\n"),
+			payload,
+		],
+		cwd: join(import.meta.dir, ".."),
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	expect(
+		check.exitCode,
+		`Python evidence validation failed:\n${new TextDecoder().decode(check.stderr)}`,
+	).toBe(0);
+}
+
+test.if(process.platform === "darwin")(
+	"real shell tool evidence, with and without SDK truncation meta, passes the Python validator",
+	async () => {
+		const root = await snapshot();
+		const sdk = await sdkModule();
+		const sdkRoot =
+			process.env.AGENT_EXECUTION_OMP_SDK_ROOT ??
+			join(homedir(), ".local/share/agent-execution/omp-sdk", SDK_VERSION);
+		// Same runtime-selected pinned SDK as sdkModule, for its tool wrapper.
+		const { wrapToolWithMetaNotice } = await import(
+			pathToFileURL(
+				join(sdkRoot, "node_modules/@oh-my-pi/pi-coding-agent/src/tools/output-meta.ts"),
+			).href
+		);
+		const shell = wrapToolWithMetaNotice(
+			shellTool(sdk.z, root, "/usr/bin/python3"),
+		) as unknown as {
+			// The wrapper's execute is an own, unbound property; it must be
+			// called as a method so `this` reaches the SDK's wrapper.
+			execute(
+				id: string,
+				args: { command: string; timeout?: number },
+				signal?: AbortSignal,
+				onUpdate?: unknown,
+				context?: unknown,
+			): Promise<{ details: Record<string, unknown> }>;
+		};
+		// The wrapper spills large outputs through the session artifact store;
+		// a stub store is enough to exercise the real spill/truncation path.
+		const context = { sessionManager: { saveArtifact: async () => "0" } };
+
+		const small = await shell.execute(
+			"shell-small",
+			{ command: "printf ok", timeout: 10 },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(small.details.runtime_sources).toBeDefined();
+		await validateShellEvidence(root, { command: "printf ok" }, small.details);
+
+		// Above the wrapper's 50 KiB spill threshold, the SDK attaches
+		// details.meta.truncation alongside the supervisor's runtime_sources.
+		const largeCommand = "seq 1 20000";
+		const large = await shell.execute(
+			"shell-large",
+			{ command: largeCommand, timeout: 60 },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(large.details.runtime_sources).toBeDefined();
+		expect(large.details.meta).toBeDefined();
+		await validateShellEvidence(root, { command: largeCommand }, large.details);
+	},
+);

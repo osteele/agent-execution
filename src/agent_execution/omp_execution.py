@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from agent_execution.budget import BudgetClock, RenewableBudget
     from agent_execution.processes import BudgetedCompletedProcess, ProcessIdentity
 
+from agent_execution.omp_shell_supervisor import RUNTIME_TOOLS
+
 OMP_SDK_VERSION = "18.4.4"
 #: Earlier pins whose stored transcripts must stay retrievable. A bump moves the
 #: outgoing pin here; dropping one makes its completed results unreadable.
@@ -555,8 +557,17 @@ def _validate_shell_evidence(
         "stderr",
         "truncated",
     }
-    if set(details) != required:
+    # Optional keys each get their own strict shape check below; anything else
+    # foreign is rejected. Stored transcripts from pre-ax20 workers lack both.
+    extra = set(details) - required - {"meta", "runtime_sources"}
+    if extra:
         raise ValueError("OMP shell evidence fields are incomplete or unexpected")
+    if required - set(details):
+        raise ValueError("OMP shell evidence fields are incomplete or unexpected")
+    if "meta" in details:
+        _validate_shell_meta(details["meta"])
+    if "runtime_sources" in details:
+        _validate_runtime_sources(details["runtime_sources"])
     # The root is canonical on the executor; requester-side symlinks are irrelevant.
     if details.get("paths") != [str(root)]:
         raise ValueError("OMP shell evidence must name exactly the snapshot root")
@@ -571,6 +582,41 @@ def _validate_shell_evidence(
         raise ValueError("OMP shell output evidence must be strings")
     if not isinstance(details.get("truncated"), bool):
         raise ValueError("OMP shell truncated evidence must be a boolean")
+
+
+def _validate_shell_meta(meta: object) -> None:
+    """Admit the pinned SDK's abbreviation record (@oh-my-pi/pi-coding-agent
+    spillLargeResultToArtifact) of the output text it served to the model;
+    agent-execution's own shell tool never produces it."""
+    meta_object = _object(meta, "shell evidence meta")
+    if set(meta_object) != {"truncation"}:
+        raise ValueError("OMP shell evidence meta must hold only truncation")
+    truncation = _object(meta_object["truncation"], "shell truncation meta")
+    for field in ("direction", "truncatedBy"):
+        if not isinstance(truncation.get(field), str):
+            raise ValueError(f"OMP shell truncation {field} must be a string")
+    for field in ("totalLines", "totalBytes", "outputLines", "outputBytes"):
+        count = truncation.get(field)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"OMP shell truncation {field} must be a non-negative integer")
+
+
+#: Runtime provenance values the supervisor records for each resolved tool
+#: (omp_shell_sandbox.ts ShellResult); mirrors the producer type there.
+_RUNTIME_SOURCES = frozenset({"mise", "homebrew", "system", "missing"})
+
+
+def _validate_runtime_sources(value: object) -> None:
+    """Admit the supervisor's runtime provenance, keyed by its RUNTIME_TOOLS."""
+    sources = _object(value, "shell runtime_sources")
+    unknown = set(sources) - set(RUNTIME_TOOLS)
+    if unknown:
+        raise ValueError(f"OMP shell runtime_sources name unknown runtimes: {sorted(unknown)}")
+    for name, source in sources.items():
+        if not isinstance(source, str) or source not in _RUNTIME_SOURCES:
+            raise ValueError(
+                f"OMP shell runtime_sources[{name}] must be one of mise, homebrew, system, missing"
+            )
 
 
 def omp_transcript(

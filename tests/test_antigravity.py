@@ -180,6 +180,146 @@ class AntigravityTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "timeout"):
                         omp_transcript(chr(10).join(json.dumps(event) for event in events))
 
+    def test_shell_evidence_admits_sdk_truncation_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            raw = omp_output(
+                cwd=str(root),
+                policy="workspace-write-shell",
+                shell_command="find large-output",
+                shell_meta={
+                    "truncation": {
+                        "direction": "middle",
+                        "truncatedBy": "middle",
+                        "totalLines": 2135,
+                        "totalBytes": 174227,
+                        "outputLines": 453,
+                        "outputBytes": 40788,
+                        "maxBytes": 40960,
+                        "headRange": {"start": 1, "end": 216},
+                        "tailRange": {"start": 1900, "end": 2135},
+                        "elidedLines": 1683,
+                        "elidedBytes": 133462,
+                        "artifactId": "0",
+                    }
+                },
+            )
+            omp_transcript(raw, policy="workspace-write-shell", cwd=str(root))
+
+    def test_shell_evidence_still_rejects_unexpected_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            raw = omp_output(
+                cwd=str(root),
+                policy="workspace-write-shell",
+                shell_command="find large-output",
+                shell_meta={
+                    "truncation": {
+                        "direction": "middle",
+                        "truncatedBy": "middle",
+                        "totalLines": 2135,
+                        "totalBytes": 174227,
+                        "outputLines": 453,
+                        "outputBytes": 40788,
+                    }
+                },
+            )
+            for mutation in (
+                (
+                    "meta carries a non-truncation key",
+                    lambda details: details.update(
+                        {"meta": {**details["meta"], "limits": {"matchLimit": {"reached": True}}}}
+                    ),
+                ),
+                (
+                    "unrelated extra top-level key",
+                    lambda details: details.update({"environment": {"PATH": "/usr/bin"}}),
+                ),
+                (
+                    "truncation is not an object",
+                    lambda details: details["meta"].update({"truncation": "middle"}),
+                ),
+                (
+                    "truncation direction is not a string",
+                    lambda details: details["meta"]["truncation"].update({"direction": 1}),
+                ),
+                (
+                    "truncation count is boolean",
+                    lambda details: details["meta"]["truncation"].update({"totalLines": True}),
+                ),
+            ):
+                with self.subTest(mutation=mutation[0]):
+                    events = [json.loads(line) for line in raw.splitlines()]
+                    shell_end = next(
+                        event for event in events if event.get("type") == "tool_execution_end"
+                    )
+                    mutation[1](shell_end["result"]["details"])
+                    with self.assertRaises(ValueError):
+                        omp_transcript(chr(10).join(json.dumps(event) for event in events))
+
+    def test_shell_evidence_admits_runtime_sources(self) -> None:
+        truncation_meta: dict[str, object] = {
+            "truncation": {
+                "direction": "middle",
+                "truncatedBy": "middle",
+                "totalLines": 2135,
+                "totalBytes": 174227,
+                "outputLines": 453,
+                "outputBytes": 40788,
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+
+            def raw_with(
+                *,
+                shell_meta: dict[str, object] | None = None,
+                shell_runtime_sources: dict[str, str] | None = None,
+            ) -> str:
+                return omp_output(
+                    cwd=str(root),
+                    policy="workspace-write-shell",
+                    shell_command="find large-output",
+                    shell_meta=shell_meta,
+                    shell_runtime_sources=shell_runtime_sources,
+                )
+
+            # Post-ax20 workers record runtime provenance; pre-ax20 stored
+            # transcripts lack the key entirely, and both must validate.
+            omp_transcript(
+                raw_with(shell_runtime_sources={"python3": "system", "ruff": "mise"}),
+                policy="workspace-write-shell",
+                cwd=str(root),
+            )
+            omp_transcript(
+                raw_with(shell_meta=truncation_meta, shell_runtime_sources={"bun": "homebrew"}),
+                policy="workspace-write-shell",
+                cwd=str(root),
+            )
+            raw = raw_with(shell_runtime_sources={"python3": "system"})
+            for mutation in (
+                (
+                    "runtime_sources names an unknown tool",
+                    lambda details: details.update({"runtime_sources": {"make": "system"}}),
+                ),
+                (
+                    "runtime_sources value is not a known source",
+                    lambda details: details.update({"runtime_sources": {"python3": "compiled"}}),
+                ),
+                (
+                    "runtime_sources is not an object",
+                    lambda details: details.update({"runtime_sources": "mise"}),
+                ),
+            ):
+                with self.subTest(mutation=mutation[0]):
+                    events = [json.loads(line) for line in raw.splitlines()]
+                    shell_end = next(
+                        event for event in events if event.get("type") == "tool_execution_end"
+                    )
+                    mutation[1](shell_end["result"]["details"])
+                    with self.assertRaises(ValueError):
+                        omp_transcript(chr(10).join(json.dumps(event) for event in events))
+
     def test_remote_shell_evidence_does_not_follow_requester_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory).resolve()
