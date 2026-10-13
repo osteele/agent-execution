@@ -394,7 +394,8 @@ use OAuth-only credentials. The Zhipu coding-plan route can use `ZAI_API_KEY`.
 Read-only Review selectors are checked independently of the writer roster.
 The `native` Claude surface observes the configured wrapper, profile, and
 working directory. Its sign-in probe cannot establish wrapper generation routing
-or billing. Those facts remain unobserved and do not affect OMP observations.
+or billing. Successful and refused generation outcomes update the exact
+`native-claude:unobserved` subject without claiming a measured billing basis.
 The `worker` surface instead resolves and launches the physical Claude binary
 with an isolated native route. Both `claude` and `claude-packet` support Weft.
 Native Codex worker execution is retired.
@@ -413,10 +414,11 @@ Python consumers use `agent_execution.execution_status`:
 - `validate_status(value, *, expected_execution_sha256=None)` validates an
   envelope at a consumer boundary.
 - `record_generation(subject, *, succeeded, condition=None)` records an actual
-  provider outcome against its verified prelaunch subject. It rejects another
-  executor/build and an unverified native route. Workers call it automatically;
-  local preflight, packet-size, and evidence-validation failures are not failed
-  generation observations.
+  provider outcome against its exact prelaunch subject, including local native
+  Claude's `native-claude:unobserved` route. Both successes and refusals update
+  that route's generation fact; another executor/build is rejected. Workers call
+  it automatically; local preflight, packet-size, and evidence-validation
+  failures are not generation observations.
 
 Remote freshness uses the executor's clock domain and the full monotonic SSH
 round-trip duration. `probe_remote_status` advances the snapshot evaluation
