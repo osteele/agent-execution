@@ -597,13 +597,15 @@ class ExecutionStatusTests(unittest.TestCase):
         self.assertEqual(row["facts"]["authentication"]["state"], "unknown")
         self.assertEqual(row["facts"]["capability"]["state"], "unknown")
         self.assertEqual(row["credential_basis"]["basis"], "unobserved")
-        with self.assertRaisesRegex(ValueError, "verified launch route"):
-            execution_status.record_generation(row["subject"], succeeded=False, condition="auth")
-        cached = native_status(cached=True)
-        self.assertEqual(cached["rows"][0]["facts"]["generation"]["state"], "unknown")
         execution_status.record_generation(row["subject"], succeeded=True)
         cached = native_status(cached=True)
         self.assertEqual(cached["rows"][0]["facts"]["generation"]["state"], "available")
+        # A later refusal for the same unverified-route subject must supersede
+        # its prior success; otherwise the success TTL masks real failures.
+        execution_status.record_generation(row["subject"], succeeded=False, condition="auth")
+        cached = native_status(cached=True)
+        self.assertEqual(cached["rows"][0]["facts"]["generation"]["state"], "unavailable")
+        self.assertEqual(cached["rows"][0]["subject"]["billing_pool"], "native-claude:unobserved")
         self.assertNotIn("PRIVATE-", json.dumps(document))
         for path in (self.root / "observations").rglob("*.json"):
             self.assertNotIn("PRIVATE-", path.read_text())

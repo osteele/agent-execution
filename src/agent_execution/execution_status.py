@@ -927,18 +927,19 @@ def record_generation(
         raise ValueError("invalid provider generation outcome")
     if subject["selector"] is None:
         raise ValueError("generation observation requires an exact selector")
+    unverified_native_local = (
+        subject["transport"] == "local"
+        and subject["surface"] == "native"
+        and subject["billing_pool"] == "native-claude:unobserved"
+    )
+    # Success and refusal both update this exact unverified native subject;
+    # its full execution identity and billing pool keep it separate from
+    # verified worker routes and other local contexts.
     if (
         subject["harness"] == "claude"
         and subject["effective_route"] is None
-        and not (
-            subject["transport"] == "local"
-            and subject["surface"] == "native"
-            and succeeded
-            and condition is None
-        )
+        and not unverified_native_local
     ):
-        # A successful native local launch is itself evidence for this exact
-        # route-unobserved subject. Refusals still require a verified route.
         raise ValueError("native generation observation requires a verified launch route")
     if (
         subject["host"] != socket.gethostname()
