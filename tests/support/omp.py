@@ -23,6 +23,8 @@ def omp_events(
     final: str = "final response",
     read_path: str | None = None,
     shell_command: str | None = None,
+    shell_meta: dict[str, object] | None = None,
+    shell_runtime_sources: dict[str, str] | None = None,
 ) -> list[dict]:
     provider, model = selector.split("/", 1)
     events = [
@@ -98,6 +100,19 @@ def omp_events(
     if shell_command is not None:
         args = {"command": shell_command}
         content = [{"type": "text", "text": "command completed"}]
+        details: dict[str, object] = {
+            "paths": [cwd],
+            "command": shell_command,
+            "exit_code": 0,
+            "timed_out": False,
+            "stdout": "output",
+            "stderr": "",
+            "truncated": False,
+        }
+        if shell_meta is not None:
+            details["meta"] = shell_meta
+        if shell_runtime_sources is not None:
+            details["runtime_sources"] = shell_runtime_sources
         events.extend(
             [
                 {
@@ -131,15 +146,7 @@ def omp_events(
                     "toolName": "execution_shell",
                     "result": {
                         "content": content,
-                        "details": {
-                            "paths": [cwd],
-                            "command": shell_command,
-                            "exit_code": 0,
-                            "timed_out": False,
-                            "stdout": "output",
-                            "stderr": "",
-                            "truncated": False,
-                        },
+                        "details": details,
                     },
                     "isError": False,
                 },
@@ -183,6 +190,8 @@ def omp_output(
     final: str = "final response",
     read_path: str | None = None,
     shell_command: str | None = None,
+    shell_meta: dict[str, object] | None = None,
+    shell_runtime_sources: dict[str, str] | None = None,
 ) -> str:
     return "\n".join(
         json.dumps(event)
@@ -194,6 +203,8 @@ def omp_output(
             final=final,
             read_path=read_path,
             shell_command=shell_command,
+            shell_meta=shell_meta,
+            shell_runtime_sources=shell_runtime_sources,
         )
     )
 
