@@ -10,12 +10,18 @@ from __future__ import annotations
 import json
 import subprocess
 import unittest
+from pathlib import Path
 from typing import cast
 from unittest import mock
 
-from agent_execution.omp_execution import probe_omp_writers
+from agent_execution.omp_execution import (
+    probe_omp_writers,
+    validate_omp_command,
+    validate_writer_probe_request,
+)
+from tests.support.omp import omp_command
 
-SELECTOR = "openai-codex/gpt-6.1-sol"
+SELECTOR = "openai-codex/gpt-6-luna"
 OTHER = "kimi-code/k3"
 #: The external process boundary, patched where it is defined: the probe
 #: imports it from this module at call time.
@@ -44,6 +50,29 @@ def completed(
     stdout: str, returncode: int = 0, stderr: str = ""
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(["bun"], returncode, stdout, stderr)
+
+
+class WriterSelectorAdmissionTests(unittest.TestCase):
+    def test_unavailable_sdk_writer_is_rejected_at_both_policy_boundaries(self) -> None:
+        cwd = Path.cwd()
+        for shell in (False, True):
+            with self.subTest(shell=shell):
+                accepted = omp_command(
+                    str(cwd), selector=SELECTOR, writer=not shell, shell_writer=shell
+                )
+                self.assertEqual(validate_omp_command(accepted, cwd).selector, SELECTOR)
+                unavailable = omp_command(
+                    str(cwd),
+                    selector="openai-codex/gpt-6.1-sol",
+                    writer=not shell,
+                    shell_writer=shell,
+                )
+                with self.assertRaisesRegex(ValueError, "writer OMP selector must be registered"):
+                    validate_omp_command(unavailable, cwd)
+
+    def test_unavailable_sdk_writer_probe_is_rejected_before_launch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported OMP writer selector"):
+            validate_writer_probe_request(["openai-codex/gpt-6.1-sol"], 30)
 
 
 class WriterReadinessTests(unittest.TestCase):

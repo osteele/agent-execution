@@ -272,7 +272,7 @@ therefore reserves a 4h17m Weft slot.
 - Both workspace-write policies admit the writer identities in
   [`OMP_WRITER_SELECTORS`](src/agent_execution/omp_execution.py):
   `anthropic/claude-opus-5-5`, `zhipu-coding-plan/glm-5.3-flash`, `kimi-code/k3`,
-  `openai-codex/gpt-6-{sol,luna,astra}`, `openai-codex/gpt-6.1-sol`,
+  `openai-codex/gpt-6-{sol,luna,astra}`,
   `google-antigravity/gemini-3.1-pro`, and `google-antigravity/claude-opus-4-6`.
   `gpt-6-sol` is the ordinary OpenAI default; Luna supports focused work, and
   Astra is reserved for explicit largest-model escalation. GLM is the economical

@@ -108,7 +108,6 @@ OMP_WRITER_SELECTORS = frozenset(
         GROUNDED_OMP_SELECTORS_BY_PROVIDER["openai-codex"],
         "openai-codex/gpt-6-luna",
         "openai-codex/gpt-6-astra",
-        "openai-codex/gpt-6.1-sol",
         GROUNDED_OMP_SELECTORS_BY_PROVIDER["google-antigravity"],
         "google-antigravity/claude-opus-4-6",
     }
